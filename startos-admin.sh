@@ -147,24 +147,26 @@ install_cron_job() {
     encoded_line=$(printf '%s' "$cron_line" | base64 -w 0)
 
     print_success "Cron job staged. Entering persistence mode now."
-    print_warn "Your SSH session will disconnect when the server restarts."
-    print_warn "Reconnect after startup completes to verify with: crontab -l"
     echo ""
 
     # Feed commands into chroot-and-upgrade via heredoc.
     # $encoded_line is expanded by the outer shell (base64 = no special chars).
-    # Inside the chroot: decode, append to existing crontab, install.
-    # NOTE: If we return from this call, something went wrong — server should restart.
+    # The trailing `echo` after base64 -d adds the newline crontab requires.
     local chroot_exit=0
     sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || chroot_exit=$?
-(crontab -l 2>/dev/null; printf '%s' "$encoded_line" | base64 -d) | crontab -
+{ crontab -l 2>/dev/null; printf '%s' "$encoded_line" | base64 -d; echo; } | crontab -
 exit
 EOF
 
-    # Only reached if chroot-and-upgrade returned without triggering a restart
-    print_error "chroot-and-upgrade exited (code $chroot_exit) without restarting."
-    print_warn "The cron job may not have been installed. Verify with: crontab -l"
-    pause
+    if [[ $chroot_exit -eq 0 ]]; then
+        print_success "Cron job installed persistently."
+        print_warn "The server will restart shortly — your SSH session will disconnect."
+        print_warn "After reconnecting, verify with: crontab -l"
+    else
+        print_error "chroot-and-upgrade failed (exit $chroot_exit). Cron job was not installed."
+        print_warn "Verify current crontab with: crontab -l"
+        pause
+    fi
 }
 
 # ─────────────────────────────────────────────
@@ -324,7 +326,27 @@ menu_memory_usage() {
         pause; return
     fi
 
-    echo "$stats_output"
+    # Reformat: strip table borders, drop Container ID column, colorize by usage %
+    echo "$stats_output" | awk '
+    BEGIN { FS="|" }
+    /^\+/ { next }
+    /^\|/ {
+        n = $2; gsub(/^[ \t]+|[ \t]+$/, "", n)
+        u = $4; gsub(/^[ \t]+|[ \t]+$/, "", u)
+        l = $5; gsub(/^[ \t]+|[ \t]+$/, "", l)
+        p = $6; gsub(/^[ \t]+|[ \t]+$/, "", p)
+        if (n == "Name") {
+            printf "\033[1m  %-22s %-12s %-14s %s\033[0m\n", n, u, l, p
+            printf "  %-22s %-12s %-14s %s\n", "──────────────────────", "──────────", "────────────", "────────"
+        } else {
+            pct = p + 0
+            if (pct >= 80)      color = "\033[1;31m"
+            else if (pct >= 50) color = "\033[33m"
+            else                color = "\033[0m"
+            printf "%s  %-22s %-12s %-14s %s\033[0m\n", color, n, u, l, p
+        }
+    }'
+    echo ""
     pause
 }
 
