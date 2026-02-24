@@ -17,6 +17,30 @@ DIM="\e[2m"
 NC="\e[0m"
 
 # ─────────────────────────────────────────────
+# Navigation — "exit" / "back" support
+# ─────────────────────────────────────────────
+
+_BACK=0
+
+# _read VARNAME "prompt" — wrapper around read -rp.
+# Typing "exit" at any prompt exits the script immediately.
+# Typing "back" at any prompt sets _BACK=1 and returns 1.
+# Callers propagate with:  _read VAR "prompt" || return 1
+_read() {
+    local -n _out="$1"; shift
+    read -rp "$@" _out
+    if [[ "${_out,,}" == "exit" ]]; then exit 0; fi
+    if [[ "${_out,,}" == "back" ]]; then _BACK=1; return 1; fi
+    return 0
+}
+
+# Print the standard navigation hint at the start of a wizard.
+_nav_tip() {
+    echo -e "  ${DIM}(type 'back' to return to main menu, or 'exit' to quit)${NC}"
+    echo ""
+}
+
+# ─────────────────────────────────────────────
 # Helper Functions
 # ─────────────────────────────────────────────
 
@@ -51,18 +75,23 @@ print_section() {
 
 pause() {
     echo ""
-    read -rp "$(echo -e "${DIM}  Press Enter to continue...${NC}")"
+    local _p_reply
+    read -rp "$(echo -e "${DIM}  Press Enter to continue (or type 'exit' to quit)...${NC}")" _p_reply
+    if [[ "${_p_reply,,}" == "exit" ]]; then exit 0; fi
 }
 
-# Returns 0 for yes, 1 for no
+# Returns 0 for yes, 1 for no/back. Sets _BACK=1 and returns 1 on "back". Exits on "exit".
 confirm() {
     local prompt="${1:-Are you sure?}"
     while true; do
-        read -rp "$(echo -e "${YELLOW}${BOLD}[?]${NC} ${prompt} [y/N]: ")" yn
-        case "${yn,,}" in
+        local reply
+        read -rp "$(echo -e "${YELLOW}${BOLD}[?]${NC} ${prompt} [y/N]: ")" reply
+        case "${reply,,}" in
+            exit) exit 0 ;;
+            back) _BACK=1; return 1 ;;
             y|yes) return 0 ;;
             n|no|"") return 1 ;;
-            *) print_warn "Please enter y or n." ;;
+            *) print_warn "Please enter y or n (or 'back'/'exit')." ;;
         esac
     done
 }
@@ -135,6 +164,7 @@ install_cron_job() {
     echo ""
 
     if ! confirm "Proceed? (server will restart automatically)"; then
+        [[ $_BACK -eq 1 ]] && return 1
         print_info "Cancelled."
         return 1
     fi
@@ -177,6 +207,7 @@ menu_create_notification() {
     print_header
     print_section "Create StartOS Notification"
     echo ""
+    _nav_tip
 
     # ── Step 1: Select service ───────────────────────────────────────────────
     print_info "Fetching installed services..."
@@ -201,7 +232,7 @@ menu_create_notification() {
 
     local notif_service=""
     while true; do
-        read -rp "  Choice [1-${i}]: " svc_choice
+        _read svc_choice "  Choice [1-${i}]: " || return 1
         if [[ "$svc_choice" =~ ^[0-9]+$ ]]; then
             if [[ "$svc_choice" -ge 1 && "$svc_choice" -lt "$i" ]]; then
                 notif_service="${packages[$((svc_choice - 1))]}"
@@ -223,7 +254,7 @@ menu_create_notification() {
     echo ""
     local notif_level="info"
     while true; do
-        read -rp "  Choice [1-3, default 1]: " level_choice
+        _read level_choice "  Choice [1-3, default 1]: " || return 1
         case "${level_choice:-1}" in
             1) notif_level="info";    break ;;
             2) notif_level="warning"; break ;;
@@ -234,13 +265,13 @@ menu_create_notification() {
 
     # ── Step 3: Title & message ──────────────────────────────────────────────
     echo ""
-    read -rp "  Notification title: " notif_title
+    _read notif_title "  Notification title: " || return 1
     if [[ -z "$notif_title" ]]; then
         print_error "Title cannot be empty."
         pause; return
     fi
 
-    read -rp "  Notification message: " notif_body
+    _read notif_body "  Notification message: " || return 1
     if [[ -z "$notif_body" ]]; then
         print_error "Message cannot be empty."
         pause; return
@@ -351,7 +382,133 @@ menu_memory_usage() {
 }
 
 # ─────────────────────────────────────────────
-# Feature 4: Schedule Backups
+# Feature 4: Display Current Cron Jobs
+# ─────────────────────────────────────────────
+
+menu_show_crontab() {
+    while true; do
+        print_header
+        print_section "Current Cron Jobs (root)"
+        echo ""
+
+        local cron_output exit_code=0
+        cron_output=$(sudo crontab -u root -l 2>&1) || exit_code=$?
+
+        if [[ $exit_code -ne 0 ]]; then
+            if echo "$cron_output" | grep -qi "no crontab for"; then
+                print_info "No cron jobs are currently scheduled."
+            else
+                print_error "Failed to read root crontab (exit $exit_code)."
+                echo -e "${RED}${cron_output}${NC}"
+            fi
+            pause; return
+        fi
+
+        if [[ -z "$cron_output" ]]; then
+            print_info "No cron jobs are currently scheduled."
+            pause; return
+        fi
+
+        # Display crontab — comments dimmed, executable lines numbered for deletion
+        local -a cron_lines=()
+        local -a cron_line_nums=()
+        local linenum=0
+        while IFS= read -r line; do
+            linenum=$(( linenum + 1 ))
+            if [[ "$line" =~ ^# ]]; then
+                echo -e "  ${DIM}${line}${NC}"
+            elif [[ -n "$line" ]]; then
+                cron_lines+=("$line")
+                cron_line_nums+=("$linenum")
+                echo -e "  ${CYAN}${BOLD}${#cron_lines[@]})${NC} ${CYAN}${line}${NC}"
+            fi
+        done <<< "$cron_output"
+
+        echo ""
+
+        if [[ ${#cron_lines[@]} -eq 0 ]]; then
+            pause; return
+        fi
+
+        echo -e "  ${DIM}Enter a number to delete that job, press Enter to go back, or type 'back'/'exit'.${NC}"
+        echo ""
+        _read del_choice "  Choice: " || return 1
+
+        if [[ -z "$del_choice" || "$del_choice" == "0" ]]; then
+            return
+        fi
+
+        if ! [[ "$del_choice" =~ ^[0-9]+$ ]] || \
+           [[ "$del_choice" -lt 1 ]] || \
+           [[ "$del_choice" -gt ${#cron_lines[@]} ]]; then
+            print_warn "Enter a number between 1 and ${#cron_lines[@]}, or 0 to go back."
+            sleep 1
+            continue
+        fi
+
+        local target_linenum="${cron_line_nums[$((del_choice - 1))]}"
+        local target_line="${cron_lines[$((del_choice - 1))]}"
+
+        # If the preceding line is a comment (our tag format), include it in the deletion
+        local prev_linenum=$(( target_linenum - 1 ))
+        local prev_line=""
+        [[ $prev_linenum -gt 0 ]] && prev_line=$(echo "$cron_output" | sed -n "${prev_linenum}p")
+
+        local remove_lines="$target_linenum"
+        [[ "$prev_line" =~ ^# ]] && remove_lines="${prev_linenum},${target_linenum}"
+
+        echo ""
+        print_warn "This will delete:"
+        [[ "$prev_line" =~ ^# ]] && echo -e "  ${DIM}${prev_line}${NC}"
+        echo -e "  ${CYAN}${target_line}${NC}"
+        echo ""
+
+        if ! confirm "Delete this cron job?"; then
+            [[ $_BACK -eq 1 ]] && return 1
+            print_info "Cancelled."
+            sleep 1
+            continue
+        fi
+
+        echo ""
+        echo -e "  ${RED}${BOLD}┌─────────────────────────────────────────────────┐${NC}"
+        echo -e "  ${RED}${BOLD}│  WARNING: SERVER WILL AUTOMATICALLY RESTART     │${NC}"
+        echo -e "  ${RED}${BOLD}│  after the cron job is deleted.                 │${NC}"
+        echo -e "  ${RED}${BOLD}│  Save any work and close open connections.      │${NC}"
+        echo -e "  ${RED}${BOLD}└─────────────────────────────────────────────────┘${NC}"
+        echo ""
+
+        if ! confirm "Proceed? (server will restart automatically)"; then
+            [[ $_BACK -eq 1 ]] && return 1
+            print_info "Cancelled."
+            sleep 1
+            continue
+        fi
+
+        print_success "Deletion staged. Entering persistence mode now."
+        echo ""
+
+        # $remove_lines is e.g. "5" or "4,5" — expanded by outer bash, safe in heredoc.
+        # The awk program skips lines whose NR is in the skip set.
+        local chroot_exit=0
+        sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || chroot_exit=$?
+{ crontab -l 2>/dev/null || true; } | awk -v lines="$remove_lines" 'BEGIN{n=split(lines,a,","); for(i=1;i<=n;i++) skip[a[i]]=1} !(NR in skip){print}' | crontab -
+exit
+EOF
+
+        if [[ $chroot_exit -eq 0 ]]; then
+            print_success "Cron job deleted."
+            print_warn "The server will restart shortly — your SSH session will disconnect."
+        else
+            print_error "chroot-and-upgrade failed (exit $chroot_exit). Cron job was not deleted."
+            pause
+        fi
+        return
+    done
+}
+
+# ─────────────────────────────────────────────
+# Feature 5: Schedule Backups
 # ─────────────────────────────────────────────
 
 # Returns a cron schedule string, sets global CRON_SCHEDULE
@@ -365,13 +522,13 @@ pick_cron_schedule() {
     echo ""
 
     while true; do
-        read -rp "  Choice [1-4]: " sched_choice
+        _read sched_choice "  Choice [1-4]: " || return 1
         case "$sched_choice" in
             1) CRON_SCHEDULE="0 0 * * *";  return 0 ;;
             2) CRON_SCHEDULE="0 3 * * *";  return 0 ;;
             3) CRON_SCHEDULE="0 0 * * 0";  return 0 ;;
             4)
-                read -rp "  Enter cron expression (e.g. 0 2 * * 1-5): " CRON_SCHEDULE
+                _read CRON_SCHEDULE "  Enter cron expression (e.g. 0 2 * * 1-5): " || return 1
                 if [[ -z "$CRON_SCHEDULE" ]]; then
                     print_warn "Cron expression cannot be empty."
                 else
@@ -387,6 +544,7 @@ menu_schedule_backup() {
     print_header
     print_section "Schedule Backups"
     echo ""
+    _nav_tip
 
     # ── Step 1: Select backup target ────────────────────────────────────────
     print_info "Fetching backup targets..."
@@ -415,7 +573,7 @@ menu_schedule_backup() {
 
     local backup_target=""
     while true; do
-        read -rp "  Choice [1-$((i-1))]: " tgt_choice
+        _read tgt_choice "  Choice [1-$((i-1))]: " || return 1
         if [[ "$tgt_choice" =~ ^[0-9]+$ ]] && \
            [[ "$tgt_choice" -ge 1 ]] && [[ "$tgt_choice" -lt "$i" ]]; then
             backup_target="${targets[$((tgt_choice - 1))]}"
@@ -429,10 +587,13 @@ menu_schedule_backup() {
     # ── Step 2: Password ─────────────────────────────────────────────────────
     echo ""
     print_warn "Enter your StartOS primary password (used for backup encryption)."
+    echo -e "  ${DIM}(type 'back' + Enter to return to main menu, or 'exit' + Enter to quit)${NC}"
     local backup_password=""
     while true; do
         read -rsp "  Password: " backup_password
         echo ""
+        if [[ "${backup_password,,}" == "exit" ]]; then exit 0; fi
+        if [[ "${backup_password,,}" == "back" ]]; then _BACK=1; return 1; fi
         if [[ -z "$backup_password" ]]; then
             print_warn "Password cannot be empty."
         else
@@ -472,7 +633,7 @@ menu_schedule_backup() {
     local selected_packages=()
     local pkg_ids_arg=""
     while true; do
-        read -rp "  Selection (e.g. 1,3 or 0 for all): " pkg_selection
+        _read pkg_selection "  Selection (e.g. 1,3 or 0 for all): " || return 1
         if [[ "$pkg_selection" == "0" ]]; then
             # No --package-ids flag = back up everything
             pkg_ids_arg=""
@@ -507,7 +668,7 @@ menu_schedule_backup() {
 
     # ── Step 4: Schedule ─────────────────────────────────────────────────────
     local CRON_SCHEDULE
-    pick_cron_schedule
+    pick_cron_schedule || return 1
 
     # ── Step 5: Post-backup notification ────────────────────────────────────
     echo ""
@@ -520,21 +681,21 @@ menu_schedule_backup() {
 
     local notif_mode="" curl_url="" notif_svc="" notif_level="" notif_title="" notif_body=""
     while true; do
-        read -rp "  Choice [1-4]: " notif_choice
+        _read notif_choice "  Choice [1-4]: " || return 1
         case "$notif_choice" in
             1)
-                read -rp "  Notification URL: " curl_url
+                _read curl_url "  Notification URL: " || return 1
                 [[ -z "$curl_url" ]] && { print_warn "URL cannot be empty."; continue; }
                 notif_mode="1"; break
                 ;;
             2)
-                _pick_notif_startos notif_svc notif_level notif_title notif_body
+                _pick_notif_startos notif_svc notif_level notif_title notif_body || return 1
                 notif_mode="2"; break
                 ;;
             3)
-                read -rp "  Notification URL: " curl_url
+                _read curl_url "  Notification URL: " || return 1
                 [[ -z "$curl_url" ]] && { print_warn "URL cannot be empty."; continue; }
-                _pick_notif_startos notif_svc notif_level notif_title notif_body
+                _pick_notif_startos notif_svc notif_level notif_title notif_body || return 1
                 notif_mode="3"; break
                 ;;
             4) notif_mode="4"; break ;;
@@ -572,11 +733,12 @@ menu_schedule_backup() {
     echo ""
 
     if ! confirm "Install this cron job?"; then
+        [[ $_BACK -eq 1 ]] && return 1
         print_info "Cancelled."
         pause; return
     fi
 
-    install_cron_job "$full_line"
+    install_cron_job "$full_line" || return 1
     # NOTE: server restarts after this — nothing below executes
 }
 
@@ -602,7 +764,7 @@ _pick_notif_startos() {
     echo ""
 
     while true; do
-        read -rp "  Choice [1-${_i}]: " _sc
+        _read _sc "  Choice [1-${_i}]: " || return 1
         if [[ "$_sc" =~ ^[0-9]+$ ]]; then
             if [[ "$_sc" -ge 1 && "$_sc" -lt "$_i" ]]; then
                 _svc="${_pkgs[$((  _sc - 1))]}"
@@ -621,7 +783,7 @@ _pick_notif_startos() {
     echo -e "    ${BOLD}1)${NC} ${CYAN}info${NC}  ${BOLD}2)${NC} ${YELLOW}warning${NC}  ${BOLD}3)${NC} ${RED}error${NC}"
     echo ""
     while true; do
-        read -rp "  Choice [1-3, default 1]: " _lc
+        _read _lc "  Choice [1-3, default 1]: " || return 1
         case "${_lc:-1}" in
             1) _lvl="info";    break ;;
             2) _lvl="warning"; break ;;
@@ -631,8 +793,8 @@ _pick_notif_startos() {
     done
 
     echo ""
-    read -rp "  Notification title: " _title
-    read -rp "  Notification message: " _body
+    _read _title "  Notification title: " || return 1
+    _read _body "  Notification message: " || return 1
 }
 
 # ─────────────────────────────────────────────
@@ -643,8 +805,9 @@ menu_schedule_stay_alive() {
     print_header
     print_section "Schedule Stay-Alive Curl"
     echo ""
+    _nav_tip
 
-    read -rp "  URL to curl: " stay_url
+    _read stay_url "  URL to curl: " || return 1
     if [[ -z "$stay_url" ]]; then
         print_error "URL cannot be empty."
         pause; return
@@ -661,14 +824,14 @@ menu_schedule_stay_alive() {
 
     local CRON_SCHEDULE
     while true; do
-        read -rp "  Choice [1-5]: " freq_choice
+        _read freq_choice "  Choice [1-5]: " || return 1
         case "$freq_choice" in
             1) CRON_SCHEDULE="*/5 * * * *";  break ;;
             2) CRON_SCHEDULE="*/15 * * * *"; break ;;
             3) CRON_SCHEDULE="*/30 * * * *"; break ;;
             4) CRON_SCHEDULE="0 * * * *";    break ;;
             5)
-                read -rp "  Enter cron expression: " CRON_SCHEDULE
+                _read CRON_SCHEDULE "  Enter cron expression: " || return 1
                 [[ -n "$CRON_SCHEDULE" ]] && break
                 print_warn "Expression cannot be empty."
                 ;;
@@ -688,12 +851,532 @@ menu_schedule_stay_alive() {
     echo ""
 
     if ! confirm "Install this cron job?"; then
+        [[ $_BACK -eq 1 ]] && return 1
         print_info "Cancelled."
         pause; return
     fi
 
-    install_cron_job "$cron_line"
+    install_cron_job "$cron_line" || return 1
     # NOTE: server restarts after this — nothing below executes
+}
+
+# ─────────────────────────────────────────────
+# Feature 7: Manage Notification Forwarders
+# ─────────────────────────────────────────────
+
+# Prompt for polling frequency, sets $CRON_SCHEDULE
+_pick_poll_frequency() {
+    echo ""
+    echo -e "  ${BOLD}Select check frequency:${NC}"
+    echo -e "    ${BOLD}1)${NC} Every 5 minutes    ${DIM}(*/5 * * * *)${NC}"
+    echo -e "    ${BOLD}2)${NC} Every 15 minutes   ${DIM}(*/15 * * * *)${NC}"
+    echo -e "    ${BOLD}3)${NC} Every 30 minutes   ${DIM}(*/30 * * * *)${NC}"
+    echo -e "    ${BOLD}4)${NC} Hourly             ${DIM}(0 * * * *)${NC}"
+    echo -e "    ${BOLD}5)${NC} Custom cron expression"
+    echo ""
+    while true; do
+        _read freq "  Choice [1-5]: " || return 1
+        case "$freq" in
+            1) CRON_SCHEDULE="*/5 * * * *";  return 0 ;;
+            2) CRON_SCHEDULE="*/15 * * * *"; return 0 ;;
+            3) CRON_SCHEDULE="*/30 * * * *"; return 0 ;;
+            4) CRON_SCHEDULE="0 * * * *";    return 0 ;;
+            5)
+                _read CRON_SCHEDULE "  Enter cron expression: " || return 1
+                [[ -n "$CRON_SCHEDULE" ]] && return 0
+                print_warn "Expression cannot be empty."
+                ;;
+            *) print_warn "Enter 1 through 5." ;;
+        esac
+    done
+}
+
+# Display installed pollers with their embedded config.
+# Returns 1 (with message) if none are installed.
+_poller_list_display() {
+    local all_scripts=(/usr/local/bin/startos-notif-poller-*)
+    if [[ ! -e "${all_scripts[0]}" ]]; then
+        print_info "No notification pollers installed."
+        return 1
+    fi
+
+    local i=1
+    for script in "${all_scripts[@]}"; do
+        local pname="${script##*/startos-notif-poller-}"
+        local url levels keyword schedule
+        url=$(grep      '^WEBHOOK_URL=' "$script" 2>/dev/null | cut -d'"' -f2)
+        levels=$(grep   '^LEVELS='      "$script" 2>/dev/null | cut -d'"' -f2)
+        keyword=$(grep  '^KEYWORD='     "$script" 2>/dev/null | cut -d'"' -f2)
+        schedule=$(sudo crontab -u root -l 2>/dev/null \
+            | grep -A1 "^# startos-notif-poller-${pname}$" 2>/dev/null \
+            | tail -1 | awk '{print $1,$2,$3,$4,$5}')
+        echo -e "  ${CYAN}${BOLD}${i}) ${pname}${NC}"
+        echo -e "     ${DIM}URL:      ${NC}${url}"
+        echo -e "     ${DIM}Levels:   ${NC}${levels}"
+        echo -e "     ${DIM}Keyword:  ${NC}${keyword:-(none)}"
+        echo -e "     ${DIM}Schedule: ${NC}${schedule:-(not found in crontab)}"
+        echo ""
+        (( i++ ))
+    done
+    return 0
+}
+
+# Wizard for installing or updating a named poller
+_poller_install_flow() {
+    print_header
+    print_section "Install / Update Notification Poller"
+    echo ""
+    _nav_tip
+
+    # Step 0: Poller name
+    local poller_name=""
+    while true; do
+        _read poller_name "  Poller name (e.g. backup-errors): " || return 1
+        if [[ -z "$poller_name" ]]; then
+            print_warn "Name cannot be empty."
+        elif ! [[ "$poller_name" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]*$ ]]; then
+            print_warn "Use only letters, numbers, and hyphens."
+        else
+            break
+        fi
+    done
+
+    if [[ -f "/usr/local/bin/startos-notif-poller-${poller_name}" ]]; then
+        print_warn "A poller named '${poller_name}' already exists — this will update it."
+        if ! confirm "Continue and overwrite?"; then
+            [[ $_BACK -eq 1 ]] && return 1
+            print_info "Cancelled."
+            pause; return
+        fi
+    fi
+
+    # Step 1: Webhook URL
+    echo ""
+    local webhook_url=""
+    while true; do
+        _read webhook_url "  Webhook URL: " || return 1
+        [[ -n "$webhook_url" ]] && break
+        print_warn "URL cannot be empty."
+    done
+
+    # Step 2: Level filter
+    echo ""
+    echo -e "  ${BOLD}Filter by notification level:${NC}"
+    echo -e "    ${BOLD}1)${NC} All levels"
+    echo -e "    ${BOLD}2)${NC} Warning and above  ${DIM}(warning, error)${NC}"
+    echo -e "    ${BOLD}3)${NC} Error only"
+    echo -e "    ${BOLD}4)${NC} Custom selection"
+    echo ""
+
+    local levels="all"
+    while true; do
+        _read lvl_choice "  Choice [1-4]: " || return 1
+        case "$lvl_choice" in
+            1) levels="all";           break ;;
+            2) levels="warning,error"; break ;;
+            3) levels="error";         break ;;
+            4)
+                local custom_levels=()
+                echo ""
+                for lvl_name in info success warning error; do
+                    local yn_input
+                    _read yn_input "  Include ${lvl_name}? [y/N]: " || return 1
+                    [[ "${yn_input,,}" =~ ^y ]] && custom_levels+=("$lvl_name")
+                done
+                if [[ ${#custom_levels[@]} -eq 0 ]]; then
+                    print_warn "No levels selected — defaulting to all."
+                    levels="all"
+                else
+                    levels=$(IFS=','; echo "${custom_levels[*]}")
+                fi
+                break
+                ;;
+            *) print_warn "Enter 1, 2, 3, or 4." ;;
+        esac
+    done
+
+    # Step 3: Keyword filter (optional)
+    echo ""
+    local keyword=""
+    _read keyword "  Keyword filter — forward only if title/message contains (blank = none): " || return 1
+
+    # Step 4: Frequency
+    local CRON_SCHEDULE
+    _pick_poll_frequency || return 1
+
+    # Step 5: Preview
+    echo ""
+    print_section "Review Notification Poller"
+    echo ""
+    echo -e "  ${BOLD}Name:${NC}     ${poller_name}"
+    echo -e "  ${BOLD}URL:${NC}      ${webhook_url}"
+    echo -e "  ${BOLD}Levels:${NC}   ${levels}"
+    echo -e "  ${BOLD}Keyword:${NC}  ${keyword:-(none)}"
+    echo -e "  ${BOLD}Schedule:${NC} ${CRON_SCHEDULE}"
+    echo ""
+    echo -e "  ${DIM}Script:  /usr/local/bin/startos-notif-poller-${poller_name}${NC}"
+    echo -e "  ${DIM}State:   /media/startos/data/startos-admin-poller-state-${poller_name}${NC}"
+    echo -e "  ${DIM}Log:     /var/log/startos-notif-poller-${poller_name}.log${NC}"
+    echo ""
+
+    if ! confirm "Install this poller?"; then
+        [[ $_BACK -eq 1 ]] && return 1
+        print_info "Cancelled."
+        pause; return
+    fi
+
+    # Seed the state file with the current highest notification ID.
+    # This prevents forwarding all historical notifications on first run.
+    print_info "Seeding notification state..."
+    local seed_id=0
+    local notif_list
+    if notif_list=$(start-cli notification list 2>/dev/null) && command -v jq &>/dev/null; then
+        seed_id=$(echo "$notif_list" | jq -r 'if length > 0 then .[0].id else 0 end' 2>/dev/null) || seed_id=0
+    fi
+    echo "$seed_id" > "/media/startos/data/startos-admin-poller-state-${poller_name}"
+    print_success "State seeded at notification ID ${seed_id} — only future notifications will be forwarded."
+
+    install_notif_poller "$poller_name" "$webhook_url" "$levels" "$keyword" "$CRON_SCHEDULE" || return 1
+    # NOTE: server restarts after this — nothing below executes
+}
+
+# Install a named poller script + tagged crontab entry via chroot-and-upgrade.
+# Re-running with the same name removes the old crontab entry before adding the new one.
+install_notif_poller() {
+    local name="$1" url="$2" levels="$3" keyword="$4" schedule="$5"
+
+    # Config block — values are expanded NOW (at install time) and embedded in the script.
+    # Single-quoted heredoc for the body keeps all runtime $VARs and $() calls literal.
+    local config_block
+    config_block="#!/bin/bash
+# StartOS Notification Forwarder — generated by startos-admin.sh
+# Poller: ${name}
+# Re-run startos-admin.sh option 7 to update this configuration.
+WEBHOOK_URL=\"${url}\"
+LEVELS=\"${levels}\"
+KEYWORD=\"${keyword}\"
+STATE_FILE=\"/media/startos/data/startos-admin-poller-state-${name}\"
+"
+
+    local body_template
+    body_template=$(cat << 'POLLER_BODY_END'
+LAST_ID=0
+[ -f "$STATE_FILE" ] && LAST_ID=$(cat "$STATE_FILE" | tr -d '[:space:]')
+
+NOTIFS=$(start-cli notification list 2>/dev/null) || exit 0
+[ -z "$NOTIFS" ] && exit 0
+
+MAX_ID=$LAST_ID
+
+if ! command -v jq >/dev/null 2>&1; then
+    echo "$(date): jq not found — cannot process notifications" >&2
+    exit 1
+fi
+
+while IFS= read -r notif; do
+    id=$(echo "$notif"    | jq -r '.id')
+    level=$(echo "$notif" | jq -r '.level')
+    title=$(echo "$notif" | jq -r '.title')
+    msg=$(echo "$notif"   | jq -r '.message')
+    pkg=$(echo "$notif"   | jq -r '.packageId // "null"')
+    ts=$(echo "$notif"    | jq -r '.createdAt')
+
+    [ "$id" -le "$LAST_ID" ] && continue
+
+    if [ "$LEVELS" != "all" ] && ! echo ",$LEVELS," | grep -q ",$level,"; then
+        continue
+    fi
+
+    if [ -n "$KEYWORD" ] && ! echo "$title $msg" | grep -qi "$KEYWORD"; then
+        continue
+    fi
+
+    echo "$(date): forwarding id=$id level=$level title=$title"
+    curl -s --max-time 10 -X POST "$WEBHOOK_URL" \
+        -H "Content-Type: application/json" \
+        -d "{\"id\":$id,\"title\":$(printf '%s' "$title" | jq -R .),\"message\":$(printf '%s' "$msg" | jq -R .),\"level\":\"$level\",\"package\":\"$pkg\",\"timestamp\":\"$ts\"}"
+
+    [ "$id" -gt "$MAX_ID" ] && MAX_ID=$id
+done < <(echo "$NOTIFS" | jq -c --argjson last "$LAST_ID" '[.[] | select(.id > $last)] | .[]')
+
+echo "$MAX_ID" > "$STATE_FILE"
+POLLER_BODY_END
+)
+
+    local script_content="${config_block}${body_template}"
+    local encoded_script encoded_comment encoded_cron
+    encoded_script=$(printf '%s' "$script_content" | base64 -w 0)
+
+    local cron_comment="# startos-notif-poller-${name}"
+    local cron_line="${schedule} /usr/local/bin/startos-notif-poller-${name} >> /var/log/startos-notif-poller-${name}.log 2>&1"
+    encoded_comment=$(printf '%s' "$cron_comment" | base64 -w 0)
+    encoded_cron=$(printf '%s' "$cron_line" | base64 -w 0)
+
+    echo ""
+    echo -e "  ${RED}${BOLD}┌─────────────────────────────────────────────────┐${NC}"
+    echo -e "  ${RED}${BOLD}│  WARNING: SERVER WILL AUTOMATICALLY RESTART     │${NC}"
+    echo -e "  ${RED}${BOLD}│  after the poller is installed.                 │${NC}"
+    echo -e "  ${RED}${BOLD}│  Save any work and close open connections.      │${NC}"
+    echo -e "  ${RED}${BOLD}└─────────────────────────────────────────────────┘${NC}"
+    echo ""
+
+    if ! confirm "Proceed? (server will restart automatically)"; then
+        [[ $_BACK -eq 1 ]] && return 1
+        print_info "Cancelled."
+        return 1
+    fi
+
+    print_success "Poller staged. Entering persistence mode now."
+    echo ""
+
+    # Remove any existing entry for this poller name, then write the new script
+    # and add the tagged comment + cron line. All in one chroot session.
+    # \$0 in the heredoc → $0 for awk (the outer bash escapes \$ → $).
+    local chroot_exit=0
+    sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || chroot_exit=$?
+{ crontab -l 2>/dev/null || true; } | awk -v t="# startos-notif-poller-${name}" '\$0==t{skip=1;next} skip{skip=0;next} {print}' | crontab -
+printf '%s' "$encoded_script" | base64 -d > /usr/local/bin/startos-notif-poller-${name}
+chmod +x /usr/local/bin/startos-notif-poller-${name}
+{ crontab -l 2>/dev/null; printf '%s' "$encoded_comment" | base64 -d; echo; printf '%s' "$encoded_cron" | base64 -d; echo; } | crontab -
+exit
+EOF
+
+    if [[ $chroot_exit -eq 0 ]]; then
+        print_success "Poller '${name}' installed persistently."
+        print_warn "The server will restart shortly — your SSH session will disconnect."
+        print_warn "After reconnecting, test with: /usr/local/bin/startos-notif-poller-${name}"
+    else
+        print_error "chroot-and-upgrade failed (exit $chroot_exit). Poller was not installed."
+        pause
+    fi
+}
+
+# Wizard for removing a named poller
+_poller_remove_flow() {
+    print_header
+    print_section "Remove Notification Poller"
+    echo ""
+
+    local all_scripts=(/usr/local/bin/startos-notif-poller-*)
+    if [[ ! -e "${all_scripts[0]}" ]]; then
+        print_info "No notification pollers installed."
+        pause; return
+    fi
+
+    local script_names=()
+    for s in "${all_scripts[@]}"; do
+        script_names+=("${s##*/startos-notif-poller-}")
+    done
+
+    echo -e "  ${BOLD}Select poller to remove:${NC}"
+    local i=1
+    for pname in "${script_names[@]}"; do
+        echo -e "    ${BOLD}${i})${NC} ${pname}"
+        (( i++ ))
+    done
+    echo ""
+
+    local remove_name=""
+    while true; do
+        _read rchoice "  Choice [1-$((i-1))]: " || return 1
+        if [[ "$rchoice" =~ ^[0-9]+$ ]] && \
+           [[ "$rchoice" -ge 1 ]] && [[ "$rchoice" -lt "$i" ]]; then
+            remove_name="${script_names[$((rchoice - 1))]}"
+            break
+        fi
+        print_warn "Enter a number between 1 and $((i-1))."
+    done
+
+    echo ""
+    print_warn "This will permanently remove poller '${remove_name}', its script, state file, and crontab entry."
+    if ! confirm "Remove '${remove_name}'?"; then
+        [[ $_BACK -eq 1 ]] && return 1
+        print_info "Cancelled."
+        pause; return
+    fi
+
+    # Remove state file — lives in the data volume, accessible outside chroot
+    local state_file="/media/startos/data/startos-admin-poller-state-${remove_name}"
+    if [[ -f "$state_file" ]]; then
+        rm -f "$state_file"
+        print_success "Removed state file."
+    fi
+
+    echo ""
+    echo -e "  ${RED}${BOLD}┌─────────────────────────────────────────────────┐${NC}"
+    echo -e "  ${RED}${BOLD}│  WARNING: SERVER WILL AUTOMATICALLY RESTART     │${NC}"
+    echo -e "  ${RED}${BOLD}│  after the poller is removed.                   │${NC}"
+    echo -e "  ${RED}${BOLD}│  Save any work and close open connections.      │${NC}"
+    echo -e "  ${RED}${BOLD}└─────────────────────────────────────────────────┘${NC}"
+    echo ""
+
+    if ! confirm "Proceed? (server will restart automatically)"; then
+        [[ $_BACK -eq 1 ]] && return 1
+        print_info "Cancelled."
+        return 1
+    fi
+
+    print_success "Removal staged. Entering persistence mode now."
+    echo ""
+
+    local chroot_exit=0
+    sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || chroot_exit=$?
+{ crontab -l 2>/dev/null || true; } | awk -v t="# startos-notif-poller-${remove_name}" '\$0==t{skip=1;next} skip{skip=0;next} {print}' | crontab -
+rm -f /usr/local/bin/startos-notif-poller-${remove_name}
+exit
+EOF
+
+    if [[ $chroot_exit -eq 0 ]]; then
+        print_success "Poller '${remove_name}' removed."
+        print_warn "The server will restart shortly — your SSH session will disconnect."
+    else
+        print_error "chroot-and-upgrade failed (exit $chroot_exit). Poller may not have been fully removed."
+        pause
+    fi
+}
+
+# Top-level submenu for notification forwarder management
+menu_manage_notif_pollers() {
+    while true; do
+        print_header
+        print_section "Manage Notification Forwarders"
+        echo ""
+        echo -e "    ${CYAN}${BOLD}1)${NC} Install / update a notification poller"
+        echo -e "    ${CYAN}${BOLD}2)${NC} List installed pollers"
+        echo -e "    ${CYAN}${BOLD}3)${NC} Remove a poller"
+        echo ""
+        echo -e "    ${DIM}0) Back${NC}"
+        echo ""
+        _read sub_choice "  $(echo -e "${BOLD}Choice:${NC} ")" || return 1
+        case "$sub_choice" in
+            1) _poller_install_flow || return 1 ;;
+            2)
+                print_header
+                print_section "Installed Notification Pollers"
+                echo ""
+                _poller_list_display || true
+                pause
+                ;;
+            3) _poller_remove_flow || return 1 ;;
+            0) return ;;
+            *) print_warn "Enter 0-3." ; sleep 1 ;;
+        esac
+    done
+}
+
+# ─────────────────────────────────────────────
+# Documentation
+# ─────────────────────────────────────────────
+
+menu_documentation() {
+    while true; do
+        print_header
+        print_section "Documentation"
+        echo ""
+        echo -e "    ${CYAN}${BOLD}1)${NC} Create a StartOS notification"
+        echo -e "    ${CYAN}${BOLD}2)${NC} Display disk used by services"
+        echo -e "    ${CYAN}${BOLD}3)${NC} Display memory used by services"
+        echo -e "    ${CYAN}${BOLD}4)${NC} Display current cron jobs"
+        echo -e "    ${CYAN}${BOLD}5)${NC} Schedule backups"
+        echo -e "    ${CYAN}${BOLD}6)${NC} Schedule stay-alive curl"
+        echo -e "    ${CYAN}${BOLD}7)${NC} Manage notification forwarders"
+        echo ""
+        echo -e "    ${DIM}0) Back${NC}"
+        echo ""
+        _read doc_choice "  $(echo -e "${BOLD}Choice:${NC} ")" || return 1
+        case "$doc_choice" in
+            1)
+                print_header
+                print_section "Create a StartOS Notification"
+                echo ""
+                echo -e "  This allows you to create a one-time notification with whatever information"
+                echo -e "  you would like to provide. The notification will show up just like any other"
+                echo -e "  notification in the notification section of the StartOS user interface."
+                echo ""
+                echo -e "  ${BOLD}You can specify:${NC}"
+                echo ""
+                echo -e "    ${CYAN}•${NC} What service it comes from  ${DIM}(or leave blank)${NC}"
+                echo -e "    ${CYAN}•${NC} The message priority  ${DIM}(info, warning, error)${NC}"
+                echo -e "    ${CYAN}•${NC} Message title"
+                echo -e "    ${CYAN}•${NC} Message body"
+                echo ""
+                pause ;;
+            2)
+                print_header
+                print_section "Display Disk Used by Services"
+                echo ""
+                echo -e "  This will show you how much disk space is used by each of the different"
+                echo -e "  services installed on your StartOS server."
+                echo ""
+                pause ;;
+            3)
+                print_header
+                print_section "Display Memory Used by Services"
+                echo ""
+                echo -e "  This will show the current memory usage, as well as the percentage of total"
+                echo -e "  memory used by each of your services."
+                echo ""
+                pause ;;
+            4)
+                print_header
+                print_section "Display Current Cron Jobs"
+                echo ""
+                echo -e "  This shows all the cron jobs currently scheduled on your server."
+                echo -e "  It also gives you the option to delete any of these jobs if they"
+                echo -e "  are no longer needed."
+                echo ""
+                echo -e "  ${YELLOW}You should only keep jobs you are actively using.${NC}"
+                echo ""
+                pause ;;
+            5)
+                print_header
+                print_section "Schedule Backups"
+                echo ""
+                echo -e "  This allows you to add a cron entry that will automatically kick off backups."
+                echo ""
+                echo -e "  ${BOLD}You can specify:${NC}"
+                echo ""
+                echo -e "    ${CYAN}•${NC} ${BOLD}Backup target${NC} — where to send the backup. You must have already"
+                echo -e "      created the target in the StartOS UI and manually tested it first."
+                echo ""
+                echo -e "    ${CYAN}•${NC} ${BOLD}Services to back up${NC} — select specific services or all of them."
+                echo ""
+                echo -e "    ${CYAN}•${NC} ${BOLD}Schedule${NC} — how frequently and at what time backups run, using cron"
+                echo -e "      syntax. Use ${CYAN}https://crontab.guru/${NC} to verify your expression."
+                echo ""
+                echo -e "    ${CYAN}•${NC} ${BOLD}Post-backup notification${NC} — optionally browse to a URL (useful for"
+                echo -e "      services like NTFY) and/or create a StartOS notification. Since StartOS"
+                echo -e "      already notifies you when a backup completes, combining this with the"
+                echo -e "      kick-off notification gives you elapsed time for each backup run."
+                echo ""
+                pause ;;
+            6)
+                print_header
+                print_section "Schedule Stay-Alive Curl"
+                echo ""
+                echo -e "  This causes your StartOS server to browse to a URL on a regular schedule —"
+                echo -e "  for example, a monitoring service like ${CYAN}https://healthchecks.io/${NC}."
+                echo ""
+                echo -e "  That service can be configured to alert you if it stops receiving the"
+                echo -e "  request within a defined time window. Hence the name: ${BOLD}Stay Alive${NC}."
+                echo ""
+                echo -e "  ${YELLOW}Why this matters:${NC} If your StartOS server goes offline — whether because"
+                echo -e "  your internet connection fails or the server itself fails — nothing on your"
+                echo -e "  server can notify you that it has failed. You need an external service to"
+                echo -e "  detect the silence and send that alert."
+                echo ""
+                pause ;;
+            7)
+                print_header
+                print_section "Manage Notification Forwarders"
+                echo ""
+                echo -e "  [Documentation coming soon]"
+                echo ""
+                pause ;;
+            0) return ;;
+            *) print_warn "Enter 0-7." ; sleep 1 ;;
+        esac
+    done
 }
 
 # ─────────────────────────────────────────────
@@ -705,23 +1388,29 @@ main_menu() {
         print_header
         echo -e "  ${BOLD}Select an action:${NC}"
         echo ""
-        echo -e "    ${CYAN}${BOLD}1)${NC} Create a StartOS notification"
-        echo -e "    ${CYAN}${BOLD}2)${NC} Display disk used by services"
-        echo -e "    ${CYAN}${BOLD}3)${NC} Display memory used by services"
-        echo -e "    ${CYAN}${BOLD}4)${NC} Schedule backups"
-        echo -e "    ${CYAN}${BOLD}5)${NC} Schedule stay-alive curl"
+        echo -e "    ${CYAN}${BOLD}1)${NC} Documentation"
+        echo -e "    ${CYAN}${BOLD}2)${NC} Create a StartOS notification"
+        echo -e "    ${CYAN}${BOLD}3)${NC} Display disk used by services"
+        echo -e "    ${CYAN}${BOLD}4)${NC} Display memory used by services"
+        echo -e "    ${CYAN}${BOLD}5)${NC} Display current cron jobs"
+        echo -e "    ${CYAN}${BOLD}6)${NC} Schedule backups"
+        echo -e "    ${CYAN}${BOLD}7)${NC} Schedule stay-alive curl"
+        echo -e "    ${CYAN}${BOLD}8)${NC} Manage notification forwarders"
         echo ""
         echo -e "    ${DIM}0) Exit${NC}"
         echo ""
 
-        read -rp "  $(echo -e "${BOLD}Choice:${NC} ")" choice
+        _read choice "  $(echo -e "${BOLD}Choice:${NC} ")" || { _BACK=0; continue; }
 
         case "$choice" in
-            1) menu_create_notification ;;
-            2) menu_disk_usage ;;
-            3) menu_memory_usage ;;
-            4) menu_schedule_backup ;;
-            5) menu_schedule_stay_alive ;;
+            1) menu_documentation          || { _BACK=0; continue; } ;;
+            2) menu_create_notification    || { _BACK=0; continue; } ;;
+            3) menu_disk_usage ;;
+            4) menu_memory_usage ;;
+            5) menu_show_crontab           || { _BACK=0; continue; } ;;
+            6) menu_schedule_backup        || { _BACK=0; continue; } ;;
+            7) menu_schedule_stay_alive    || { _BACK=0; continue; } ;;
+            8) menu_manage_notif_pollers   || { _BACK=0; continue; } ;;
             0)
                 echo ""
                 print_info "Goodbye."
@@ -729,7 +1418,7 @@ main_menu() {
                 exit 0
                 ;;
             *)
-                print_warn "Invalid choice. Enter 0-5."
+                print_warn "Invalid choice. Enter 0-8."
                 sleep 1
                 ;;
         esac
