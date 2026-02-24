@@ -80,6 +80,33 @@ run_cmd() {
     return $exit_code
 }
 
+# Extract package IDs from start-cli package list JSON output.
+# Uses jq if available, falls back to grep+sed.
+parse_package_ids() {
+    local json="$1"
+    if command -v jq &>/dev/null; then
+        echo "$json" | jq -r '.[].id'
+    else
+        echo "$json" | grep '"id":' | sed 's/.*"id": *"\([^"]*\)".*/\1/'
+    fi
+}
+
+# Extract backup targets from start-cli backup target list JSON output.
+# Outputs one line per target: "id  (hostname/path)"
+# The ID is always the first whitespace-delimited field on each line.
+parse_backup_targets() {
+    local json="$1"
+    if command -v jq &>/dev/null; then
+        echo "$json" | jq -r '
+            to_entries[] |
+            "\(.key)  (\(.value.hostname // .value.type // "unknown")\(.value.path // ""))"
+        '
+    else
+        # Top-level keys sit at exactly 2-space indent: '  "cifs-0": {'
+        echo "$json" | grep -E '^  "[^"]+": \{' | sed 's/  "\([^"]*\)": {.*/\1/'
+    fi
+}
+
 # ─────────────────────────────────────────────
 # Cron Installation (Persistence via chroot-and-upgrade)
 # ─────────────────────────────────────────────
@@ -153,7 +180,7 @@ menu_create_notification() {
         pause; return
     fi
 
-    mapfile -t packages <<< "$(echo "$pkg_list" | grep -v '^$')"
+    mapfile -t packages <<< "$(parse_package_ids "$pkg_list")"
 
     echo ""
     echo -e "  ${BOLD}Select service for notification:${NC}"
@@ -290,7 +317,7 @@ menu_memory_usage() {
         pause; return
     fi
 
-    mapfile -t packages <<< "$(echo "$pkg_list" | grep -v '^$')"
+    mapfile -t packages <<< "$(parse_package_ids "$pkg_list")"
 
     if [[ ${#packages[@]} -eq 0 ]]; then
         print_warn "No packages found."
@@ -380,7 +407,7 @@ menu_schedule_backup() {
         pause; return
     fi
 
-    mapfile -t targets <<< "$(echo "$raw_targets" | grep -v '^$')"
+    mapfile -t targets <<< "$(parse_backup_targets "$raw_targets")"
 
     if [[ ${#targets[@]} -eq 0 ]]; then
         print_warn "No backup targets found. Add a target in the StartOS UI first."
@@ -433,7 +460,7 @@ menu_schedule_backup() {
         pause; return
     fi
 
-    mapfile -t packages <<< "$(echo "$pkg_list" | grep -v '^$')"
+    mapfile -t packages <<< "$(parse_package_ids "$pkg_list")"
 
     if [[ ${#packages[@]} -eq 0 ]]; then
         print_warn "No packages found."
@@ -572,7 +599,7 @@ _pick_notif_startos() {
     print_info "Fetching installed services for notification..."
     local _pkg_list
     _pkg_list=$(start-cli package list 2>/dev/null) || true
-    mapfile -t _pkgs <<< "$(echo "$_pkg_list" | grep -v '^$')"
+    mapfile -t _pkgs <<< "$(parse_package_ids "$_pkg_list")"
 
     echo ""
     echo -e "  ${BOLD}Notification service:${NC}"
