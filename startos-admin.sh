@@ -139,11 +139,12 @@ install_cron_job() {
         return 1
     fi
 
-    # Write merged crontab to a temp file.
-    # /tmp is accessible from within the chroot environment.
-    local tmp_crontab
-    tmp_crontab=$(mktemp /tmp/startos-crontab-XXXXXX)
-    ( crontab -u root -l 2>/dev/null; echo "$cron_line" ) > "$tmp_crontab"
+    # Base64-encode the cron line so it can be safely embedded in the heredoc
+    # without quoting issues (passwords, double quotes, special chars).
+    # The encoded string is alphanumeric-only — safe in any shell context.
+    # This also avoids needing a temp file accessible inside the chroot.
+    local encoded_line
+    encoded_line=$(printf '%s' "$cron_line" | base64 -w 0)
 
     print_success "Cron job staged. Entering persistence mode now."
     print_warn "Your SSH session will disconnect when the server restarts."
@@ -151,15 +152,19 @@ install_cron_job() {
     echo ""
 
     # Feed commands into chroot-and-upgrade via heredoc.
-    # $tmp_crontab is expanded here (in the outer shell) so the chroot shell
-    # receives the literal path, e.g. /tmp/startos-crontab-aB3xYz.
-    # The temp file is deleted inside the chroot after crontab reads it.
-    # NOTE: Nothing after this heredoc will execute — the server restarts.
-    sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF
-crontab $tmp_crontab
-rm -f $tmp_crontab
+    # $encoded_line is expanded by the outer shell (base64 = no special chars).
+    # Inside the chroot: decode, append to existing crontab, install.
+    # NOTE: If we return from this call, something went wrong — server should restart.
+    local chroot_exit=0
+    sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || chroot_exit=$?
+(crontab -l 2>/dev/null; printf '%s' "$encoded_line" | base64 -d) | crontab -
 exit
 EOF
+
+    # Only reached if chroot-and-upgrade returned without triggering a restart
+    print_error "chroot-and-upgrade exited (code $chroot_exit) without restarting."
+    print_warn "The cron job may not have been installed. Verify with: crontab -l"
+    pause
 }
 
 # ─────────────────────────────────────────────
@@ -307,56 +312,19 @@ menu_memory_usage() {
     print_header
     print_section "Memory Used by Service"
     echo ""
-    print_info "Fetching installed services..."
+    print_info "Running: start-cli package stats"
     echo ""
 
-    local pkg_list
-    if ! pkg_list=$(start-cli package list 2>&1); then
-        print_error "Failed to list packages. Is start-cli authenticated?"
-        echo -e "${RED}${pkg_list}${NC}"
+    local stats_output exit_code=0
+    stats_output=$(start-cli package stats 2>&1) || exit_code=$?
+
+    if [[ $exit_code -ne 0 ]]; then
+        print_error "Command failed (exit $exit_code)."
+        echo -e "${RED}${stats_output}${NC}"
         pause; return
     fi
 
-    mapfile -t packages <<< "$(parse_package_ids "$pkg_list")"
-
-    if [[ ${#packages[@]} -eq 0 ]]; then
-        print_warn "No packages found."
-        pause; return
-    fi
-
-    echo -e "  ${BOLD}Installed services:${NC}"
-    local i=1
-    for pkg in "${packages[@]}"; do
-        echo -e "    ${BOLD}${i})${NC} ${pkg}"
-        (( i++ ))
-    done
-    echo -e "    ${BOLD}0)${NC} All services"
-    echo ""
-
-    local choice
-    while true; do
-        read -rp "  Select service [0-$((${#packages[@]}))]: " choice
-        if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -le "${#packages[@]}" ]]; then
-            break
-        fi
-        print_warn "Enter a number between 0 and ${#packages[@]}."
-    done
-
-    echo ""
-
-    if [[ "$choice" -eq 0 ]]; then
-        # All services
-        for pkg in "${packages[@]}"; do
-            print_section "Stats: $pkg"
-            start-cli package stats "$pkg" 2>&1 || print_error "Failed to get stats for $pkg"
-            echo ""
-        done
-    else
-        local selected_pkg="${packages[$((choice - 1))]}"
-        print_section "Stats: $selected_pkg"
-        start-cli package stats "$selected_pkg" 2>&1 || print_error "Failed to get stats for $selected_pkg"
-    fi
-
+    echo "$stats_output"
     pause
 }
 
@@ -716,8 +684,8 @@ main_menu() {
         echo -e "  ${BOLD}Select an action:${NC}"
         echo ""
         echo -e "    ${CYAN}${BOLD}1)${NC} Create a StartOS notification"
-        echo -e "    ${CYAN}${BOLD}2)${NC} Display disk used by service"
-        echo -e "    ${CYAN}${BOLD}3)${NC} Display memory used by service"
+        echo -e "    ${CYAN}${BOLD}2)${NC} Display disk used by services"
+        echo -e "    ${CYAN}${BOLD}3)${NC} Display memory used by services"
         echo -e "    ${CYAN}${BOLD}4)${NC} Schedule backups"
         echo -e "    ${CYAN}${BOLD}5)${NC} Schedule stay-alive curl"
         echo ""
