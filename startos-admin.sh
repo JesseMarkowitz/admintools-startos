@@ -302,9 +302,33 @@ menu_create_notification() {
 
 menu_disk_usage() {
     print_header
-    print_section "Disk Usage by Service"
+    print_section "Disk Usage"
     echo ""
-    print_info "Running: sudo du -hd 1 /media/startos/data/package-data/volumes/"
+
+    # ── Disk summary ─────────────────────────────────────────────────────────
+    print_info "Fetching disk summary..."
+    local df_output df_exit=0
+    df_output=$(df -h /media/startos/data/package-data/volumes/ 2>&1) || df_exit=$?
+
+    if [[ $df_exit -eq 0 ]]; then
+        local df_size df_used df_avail df_pct
+        df_size=$(echo  "$df_output" | awk 'NR==2 {print $2}')
+        df_used=$(echo  "$df_output" | awk 'NR==2 {print $3}')
+        df_avail=$(echo "$df_output" | awk 'NR==2 {print $4}')
+        df_pct=$(echo   "$df_output" | awk 'NR==2 {print $5}' | tr -d '%')
+
+        local pct_color="$GREEN"
+        [[ "$df_pct" -ge 60 ]] 2>/dev/null && pct_color="$YELLOW"
+        [[ "$df_pct" -ge 80 ]] 2>/dev/null && pct_color="$RED"
+
+        echo -e "  ${BOLD}Total:${NC}     ${df_size}"
+        echo -e "  ${BOLD}Used:${NC}      ${pct_color}${df_used} (${df_pct}%)${NC}"
+        echo -e "  ${BOLD}Available:${NC} ${df_avail}"
+        echo ""
+    fi
+
+    # ── Per-service breakdown ─────────────────────────────────────────────────
+    print_section "Usage by Service"
     echo ""
 
     local raw_output
@@ -1033,7 +1057,7 @@ _poller_install_flow() {
     if notif_list=$(start-cli notification list 2>/dev/null) && command -v jq &>/dev/null; then
         seed_id=$(echo "$notif_list" | jq -r 'if length > 0 then .[0].id else 0 end' 2>/dev/null) || seed_id=0
     fi
-    echo "$seed_id" > "/media/startos/data/startos-admin-poller-state-${poller_name}"
+    echo "$seed_id" | sudo tee "/media/startos/data/startos-admin-poller-state-${poller_name}" > /dev/null
     print_success "State seeded at notification ID ${seed_id} — only future notifications will be forwarded."
 
     install_notif_poller "$poller_name" "$webhook_url" "$levels" "$keyword" "$CRON_SCHEDULE" || return 1
