@@ -2,7 +2,7 @@
 # startos-admin.sh — Interactive admin menu for StartOS servers
 # Usage: chmod +x startos-admin.sh && ./startos-admin.sh
 
-VERSION="2"   # integer — increment on each release
+VERSION="3"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -1418,7 +1418,7 @@ check_for_update() {
     # Fetch with short timeout — fail silently if offline or unreachable
     remote_script=$(curl -fsSL --max-time 5 "$raw_url" 2>/dev/null) || return 0
 
-    remote_version=$(echo "$remote_script" | grep '^VERSION=' | head -1 | tr -d '"' | cut -d= -f2)
+    remote_version=$(echo "$remote_script" | grep '^VERSION=' | head -1 | tr -d '"' | cut -d= -f2 | awk '{print $1}')
     [[ -z "$remote_version" ]] && return 0
 
     # Compare as integers; skip if already current
