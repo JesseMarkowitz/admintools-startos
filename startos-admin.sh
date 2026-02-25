@@ -2,7 +2,7 @@
 # startos-admin.sh — Interactive admin menu for StartOS servers
 # Usage: chmod +x startos-admin.sh && ./startos-admin.sh
 
-VERSION="4"   # integer — increment on each release
+VERSION="5"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -1328,13 +1328,37 @@ _db_network() {
     print_section "Network"
     echo ""
 
-    print_section "Tor Addresses"
+    # ── Addresses (mirrors the GUI Addresses table) ──────────────────────────
+    print_section "Addresses"
     echo ""
-    echo "$db" | jq -r '.value.serverInfo.network.onions[]? // empty' | while read -r onion; do
-        echo -e "  ${CYAN}•${NC} $onion"
+    echo "$db" | jq -r '
+        [.value.serverInfo.network.hostnameInfo // {} | to_entries[] | .value[] |
+            {
+                type:    (.hostname.kind // "unknown"),
+                access:  (if .public then "public" else "private" end),
+                gateway: (.gateway.name // "unknown"),
+                url:     ("https://" + .hostname.value)
+            }
+        ] | unique_by(.url) | .[] |
+        "\(.type)\t\(.access)\t\(.gateway)\t\(.url)"
+    ' 2>/dev/null | while IFS=$'\t' read -r type access gateway url; do
+        printf "  %-10s  %-8s  %-24s  %s\n" "$type" "$access" "$gateway" "$url"
     done
     echo ""
 
+    # ── Tor Addresses ────────────────────────────────────────────────────────
+    local onions
+    onions=$(echo "$db" | jq -r '.value.serverInfo.network.onions[]? // empty' 2>/dev/null)
+    if [[ -n "$onions" ]]; then
+        print_section "Tor Addresses"
+        echo ""
+        while IFS= read -r onion; do
+            echo -e "  ${CYAN}•${NC} $onion"
+        done <<< "$onions"
+        echo ""
+    fi
+
+    # ── WiFi ─────────────────────────────────────────────────────────────────
     print_section "WiFi"
     echo ""
     local wifi_enabled wifi_ssid
@@ -1344,16 +1368,36 @@ _db_network() {
     echo -e "  ${BOLD}Network:${NC}  $wifi_ssid"
     echo ""
 
+    # ── Gateways ─────────────────────────────────────────────────────────────
     print_section "Gateways"
     echo ""
-    echo "$db" | jq -r '.value.serverInfo.network.gateways // {} | to_entries[] |
-        "  \(.key):  IP \(.value.ip // "?")  WAN \(.value.wan.ipv4 // "n/a")"' 2>/dev/null
+    printf "  %-26s  %-22s  %-18s  %s\n" "Name" "Type" "LAN IP" "WAN IP"
+    printf "  %-26s  %-22s  %-18s  %s\n" "──────────────────────────" "──────────────────────" "──────────────────" "───────────────"
+    echo "$db" | jq -r '
+        .value.serverInfo.network.gateways // {} | to_entries[] |
+        select(.value.ipInfo.deviceType != "loopback") |
+        (.value.ipInfo.subnets // [] | map(select(test("^[0-9]"))) | first // "?" | split("/")[0]) as $lanip |
+        (if ($lanip | test("^(10\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|192\\.168\\.)")) then "private" else "public" end) as $access |
+        "\(.value.ipInfo.name // .key)\t\(.value.ipInfo.deviceType // "unknown") (\($access))\t\($lanip)\t\(.value.ipInfo.wanIp // "n/a")"
+    ' 2>/dev/null | while IFS=$'\t' read -r name dtype lanip wan; do
+        printf "  %-26s  %-22s  %-18s  %s\n" "$name" "$dtype" "$lanip" "$wan"
+    done
     echo ""
 
+    # ── DNS ──────────────────────────────────────────────────────────────────
     print_section "DNS Servers"
     echo ""
-    echo "$db" | jq -r '(.value.serverInfo.dns.staticServers[]?, .value.serverInfo.dns.dhcpServers[]?) // empty' \
-        2>/dev/null | sort -u | while read -r dns; do
+    local dns_strategy
+    dns_strategy=$(echo "$db" | jq -r '
+        if (.value.serverInfo.dns.staticServers | (. != null and length > 0)) then "Static"
+        else "DHCP" end
+    ' 2>/dev/null)
+    echo -e "  ${BOLD}Strategy:${NC}  $dns_strategy"
+    echo ""
+    echo "$db" | jq -r '
+        [(.value.serverInfo.dns.staticServers // [])[], (.value.serverInfo.dns.dhcpServers // [])[]] |
+        unique[]
+    ' 2>/dev/null | while read -r dns; do
         echo -e "  ${CYAN}•${NC} $dns"
     done
     echo ""
