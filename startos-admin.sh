@@ -2,6 +2,8 @@
 # startos-admin.sh — Interactive admin menu for StartOS servers
 # Usage: chmod +x startos-admin.sh && ./startos-admin.sh
 
+VERSION="2"   # integer — increment on each release
+
 set -euo pipefail
 
 # ─────────────────────────────────────────────
@@ -48,7 +50,7 @@ print_header() {
     clear
     echo -e "${CYAN}${BOLD}"
     echo "  ╔══════════════════════════════════════════╗"
-    echo "  ║         StartOS Admin Menu               ║"
+    echo "  ║      StartOS Admin Menu  v${VERSION}              ║"
     echo "  ╚══════════════════════════════════════════╝"
     echo -e "${NC}"
 }
@@ -1115,10 +1117,12 @@ while IFS= read -r notif; do
         continue
     fi
 
+    ts_fmt=$(echo "$ts" | sed 's/T/ /; s/\..*//' | tr '-' '.')
+    level_cap=$(echo "$level" | awk '{print toupper(substr($0,1,1)) tolower(substr($0,2))}')
     echo "$(date): forwarding id=$id level=$level title=$title"
-    curl -s --max-time 10 -X POST "$WEBHOOK_URL" \
-        -H "Content-Type: application/json" \
-        -d "{\"id\":$id,\"title\":$(printf '%s' "$title" | jq -R .),\"message\":$(printf '%s' "$msg" | jq -R .),\"level\":\"$level\",\"package\":\"$pkg\",\"timestamp\":\"$ts\"}"
+    curl -s --max-time 10 \
+        -d "${ts_fmt}  [${level_cap}]  ${pkg}  |  ${title} — ${msg}" \
+        "$WEBHOOK_URL"
 
     [ "$id" -gt "$MAX_ID" ] && MAX_ID=$id
 done < <(echo "$NOTIFS" | jq -c --argjson last "$LAST_ID" '[.[] | select(.id > $last)] | .[]')
@@ -1404,10 +1408,59 @@ menu_documentation() {
 }
 
 # ─────────────────────────────────────────────
+# Auto-Update Check
+# ─────────────────────────────────────────────
+
+check_for_update() {
+    local raw_url="https://raw.githubusercontent.com/JesseMarkowitz/admintools-startos/refs/heads/main/startos-admin.sh"
+    local remote_version remote_script
+
+    # Fetch with short timeout — fail silently if offline or unreachable
+    remote_script=$(curl -fsSL --max-time 5 "$raw_url" 2>/dev/null) || return 0
+
+    remote_version=$(echo "$remote_script" | grep '^VERSION=' | head -1 | tr -d '"' | cut -d= -f2)
+    [[ -z "$remote_version" ]] && return 0
+
+    # Compare as integers; skip if already current
+    if [[ "$remote_version" -le "$VERSION" ]] 2>/dev/null; then
+        return 0
+    fi
+
+    echo ""
+    print_info "A newer version is available: v${remote_version}  (you have v${VERSION})"
+    echo ""
+    if ! confirm "Download and install v${remote_version} persistently to /usr/local/bin/startos-admin?"; then
+        [[ $_BACK -eq 1 ]] && { _BACK=0; return 0; }
+        return 0
+    fi
+
+    print_warn "The server will restart after installation (same as all chroot operations)."
+    echo ""
+
+    local encoded
+    encoded=$(printf '%s' "$remote_script" | base64 -w 0)
+
+    local chroot_exit=0
+    sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || chroot_exit=$?
+printf '%s' "$encoded" | base64 -d > /usr/local/bin/startos-admin
+chmod +x /usr/local/bin/startos-admin
+exit
+EOF
+
+    if [[ $chroot_exit -eq 0 ]]; then
+        print_success "Updated to v${remote_version}. Server restarting — reconnect and run: startos-admin"
+    else
+        print_error "Update failed (exit $chroot_exit)."
+        pause
+    fi
+}
+
+# ─────────────────────────────────────────────
 # Main Menu
 # ─────────────────────────────────────────────
 
 main_menu() {
+    check_for_update
     while true; do
         print_header
         echo -e "  ${BOLD}Select an action:${NC}"
