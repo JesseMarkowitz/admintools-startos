@@ -2,7 +2,7 @@
 # startos-admin.sh — Interactive admin menu for StartOS servers
 # Usage: chmod +x startos-admin.sh && ./startos-admin.sh
 
-VERSION="3"   # integer — increment on each release
+VERSION="4"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -1117,7 +1117,7 @@ while IFS= read -r notif; do
         continue
     fi
 
-    ts_fmt=$(echo "$ts" | sed 's/T/ /; s/\..*//' | tr '-' '.')
+    ts_fmt=$(date -d "$ts" '+%Y.%m.%d %H:%M:%S' 2>/dev/null || echo "$ts" | sed 's/T/ /; s/\..*//' | tr '-' '.')
     level_cap=$(echo "$level" | awk '{print toupper(substr($0,1,1)) tolower(substr($0,2))}')
     echo "$(date): forwarding id=$id level=$level title=$title"
     curl -s --max-time 10 \
@@ -1293,6 +1293,219 @@ menu_manage_notif_pollers() {
 }
 
 # ─────────────────────────────────────────────
+# System Database Viewer
+# ─────────────────────────────────────────────
+
+_db_server_info() {
+    local db="$1"
+    print_header
+    print_section "Server Info"
+    echo ""
+
+    local hostname version arch platform last_backup
+    hostname=$(echo "$db"    | jq -r '.value.serverInfo.hostname    // "unknown"')
+    version=$(echo "$db"     | jq -r '.value.serverInfo.version     // "unknown"')
+    arch=$(echo "$db"        | jq -r '.value.serverInfo.arch        // "unknown"')
+    platform=$(echo "$db"    | jq -r '.value.serverInfo.platform    // "unknown"')
+    last_backup=$(echo "$db" | jq -r '.value.serverInfo.lastBackup  // "never"')
+
+    if [[ "$last_backup" != "never" ]]; then
+        last_backup=$(date -d "$last_backup" '+%Y.%m.%d %H:%M:%S' 2>/dev/null || echo "$last_backup")
+    fi
+
+    echo -e "  ${BOLD}Hostname:${NC}      $hostname"
+    echo -e "  ${BOLD}StartOS:${NC}       $version"
+    echo -e "  ${BOLD}Architecture:${NC}  $arch"
+    echo -e "  ${BOLD}Platform:${NC}      $platform"
+    echo -e "  ${BOLD}Last Backup:${NC}   $last_backup"
+    echo ""
+    pause
+}
+
+_db_network() {
+    local db="$1"
+    print_header
+    print_section "Network"
+    echo ""
+
+    print_section "Tor Addresses"
+    echo ""
+    echo "$db" | jq -r '.value.serverInfo.network.onions[]? // empty' | while read -r onion; do
+        echo -e "  ${CYAN}•${NC} $onion"
+    done
+    echo ""
+
+    print_section "WiFi"
+    echo ""
+    local wifi_enabled wifi_ssid
+    wifi_enabled=$(echo "$db" | jq -r '.value.serverInfo.network.wifi.enabled  // "unknown"')
+    wifi_ssid=$(echo "$db"    | jq -r '.value.serverInfo.network.wifi.selected // "none"')
+    echo -e "  ${BOLD}Enabled:${NC}  $wifi_enabled"
+    echo -e "  ${BOLD}Network:${NC}  $wifi_ssid"
+    echo ""
+
+    print_section "Gateways"
+    echo ""
+    echo "$db" | jq -r '.value.serverInfo.network.gateways // {} | to_entries[] |
+        "  \(.key):  IP \(.value.ip // "?")  WAN \(.value.wan.ipv4 // "n/a")"' 2>/dev/null
+    echo ""
+
+    print_section "DNS Servers"
+    echo ""
+    echo "$db" | jq -r '(.value.serverInfo.dns.staticServers[]?, .value.serverInfo.dns.dhcpServers[]?) // empty' \
+        2>/dev/null | sort -u | while read -r dns; do
+        echo -e "  ${CYAN}•${NC} $dns"
+    done
+    echo ""
+
+    pause
+}
+
+_db_svc_status() {
+    local db="$1"
+    print_header
+    print_section "Service Status"
+    echo ""
+
+    local svc_list
+    svc_list=$(echo "$db" | jq -r '.value.packageData | keys[]')
+
+    while IFS= read -r svc; do
+        local desired
+        desired=$(echo "$db" | jq -r \
+            ".value.packageData[\"$svc\"].statusInfo.desired | to_entries[0].value // \"unknown\"")
+
+        local state_color="$RED"
+        [[ "$desired" == "running" ]] && state_color="$GREEN"
+
+        echo -e "  ${BOLD}${svc}${NC}  ${state_color}${desired}${NC}"
+
+        echo "$db" | jq -r ".value.packageData[\"$svc\"].statusInfo.health // {} | to_entries[] |
+            \"\(.value.name): \(.value.result) — \(.value.message // \"\")\"" 2>/dev/null \
+        | while IFS= read -r hline; do
+            local hcolor="$DIM"
+            echo "$hline" | grep -q ": success" && hcolor="$GREEN"
+            echo "$hline" | grep -q ": loading" && hcolor="$YELLOW"
+            echo "$hline" | grep -qE ": failure|: error" && hcolor="$RED"
+            echo -e "    ${hcolor}${hline}${NC}"
+        done
+
+        echo ""
+    done <<< "$svc_list"
+
+    pause
+}
+
+_db_svc_detail() {
+    local db="$1"
+    print_header
+    print_section "Service Detail"
+    echo ""
+    _nav_tip
+
+    local svc_list
+    mapfile -t svc_list < <(echo "$db" | jq -r '.value.packageData | keys[]')
+
+    local i=1
+    for svc in "${svc_list[@]}"; do
+        echo -e "    ${CYAN}${BOLD}${i})${NC} ${svc}"
+        (( i++ )) || true
+    done
+    echo ""
+
+    local svc_choice
+    _read svc_choice "  $(echo -e "${BOLD}Choice:${NC} ")" || return 1
+
+    if ! [[ "$svc_choice" =~ ^[0-9]+$ ]] || \
+       [[ "$svc_choice" -lt 1 ]] || [[ "$svc_choice" -gt "${#svc_list[@]}" ]]; then
+        print_warn "Invalid choice."; sleep 1; return 0
+    fi
+
+    local pkg="${svc_list[$((svc_choice - 1))]}"
+
+    print_header
+    print_section "Service: $pkg"
+    echo ""
+
+    local desired started last_bk registry
+    desired=$(echo "$db"  | jq -r ".value.packageData[\"$pkg\"].statusInfo.desired | to_entries[0].value // \"unknown\"")
+    started=$(echo "$db"  | jq -r ".value.packageData[\"$pkg\"].statusInfo.started // \"unknown\"")
+    last_bk=$(echo "$db"  | jq -r ".value.packageData[\"$pkg\"].lastBackup          // \"never\"")
+    registry=$(echo "$db" | jq -r ".value.packageData[\"$pkg\"].registry             // \"unknown\"")
+
+    [[ "$started" != "unknown" ]] && started=$(date -d "$started" '+%Y.%m.%d %H:%M:%S' 2>/dev/null || echo "$started")
+    [[ "$last_bk" != "never"   ]] && last_bk=$(date -d "$last_bk" '+%Y.%m.%d %H:%M:%S' 2>/dev/null || echo "$last_bk")
+
+    local state_color="$RED"
+    [[ "$desired" == "running" ]] && state_color="$GREEN"
+
+    echo -e "  ${BOLD}Status:${NC}       ${state_color}${desired}${NC}"
+    echo -e "  ${BOLD}Started:${NC}      $started"
+    echo -e "  ${BOLD}Last Backup:${NC}  $last_bk"
+    echo -e "  ${BOLD}Registry:${NC}     $registry"
+    echo ""
+
+    print_section "Health Checks"
+    echo ""
+    echo "$db" | jq -r ".value.packageData[\"$pkg\"].statusInfo.health // {} | to_entries[] |
+        \"\(.value.name)\n  result:  \(.value.result)\n  detail:  \(.value.message // \"\")\"" 2>/dev/null \
+    | while IFS= read -r line; do
+        echo -e "  $line"
+    done
+    echo ""
+
+    print_section "Dependencies"
+    echo ""
+    local deps
+    deps=$(echo "$db" | jq -r ".value.packageData[\"$pkg\"].currentDependencies | keys[]?" 2>/dev/null)
+    if [[ -z "$deps" ]]; then
+        echo -e "  ${DIM}None${NC}"
+    else
+        while IFS= read -r dep; do
+            echo -e "  ${CYAN}•${NC} $dep"
+        done <<< "$deps"
+    fi
+    echo ""
+
+    pause
+}
+
+menu_db_dump() {
+    print_header
+    print_section "System Database"
+    echo ""
+    print_info "Fetching database dump..."
+    local db_json
+    db_json=$(start-cli db dump 2>/dev/null) || {
+        print_error "Failed to run 'start-cli db dump'."
+        pause; return
+    }
+    [[ -z "$db_json" ]] && { print_error "Empty response."; pause; return; }
+
+    while true; do
+        print_header
+        print_section "System Database"
+        echo ""
+        echo -e "    ${CYAN}${BOLD}1)${NC} Server Info"
+        echo -e "    ${CYAN}${BOLD}2)${NC} Network"
+        echo -e "    ${CYAN}${BOLD}3)${NC} Service Status"
+        echo -e "    ${CYAN}${BOLD}4)${NC} Service Detail"
+        echo ""
+        echo -e "    ${DIM}0) Back${NC}"
+        echo ""
+        _read db_choice "  $(echo -e "${BOLD}Choice:${NC} ")" || return 1
+        case "$db_choice" in
+            1) _db_server_info "$db_json" ;;
+            2) _db_network     "$db_json" ;;
+            3) _db_svc_status  "$db_json" ;;
+            4) _db_svc_detail  "$db_json" || return 1 ;;
+            0) return ;;
+            *) print_warn "Enter 0-4." ; sleep 1 ;;
+        esac
+    done
+}
+
+# ─────────────────────────────────────────────
 # Documentation
 # ─────────────────────────────────────────────
 
@@ -1308,6 +1521,7 @@ menu_documentation() {
         echo -e "    ${CYAN}${BOLD}5)${NC} Schedule backups"
         echo -e "    ${CYAN}${BOLD}6)${NC} Schedule stay-alive curl"
         echo -e "    ${CYAN}${BOLD}7)${NC} Manage notification forwarders"
+        echo -e "    ${CYAN}${BOLD}8)${NC} System Database"
         echo ""
         echo -e "    ${DIM}0) Back${NC}"
         echo ""
@@ -1333,8 +1547,9 @@ menu_documentation() {
                 print_header
                 print_section "Display Disk Used by Services"
                 echo ""
-                echo -e "  This will show you how much disk space is used by each of the different"
-                echo -e "  services installed on your StartOS server."
+                echo -e "  This will show you the total, used, and available disk space on your server,"
+                echo -e "  followed by a breakdown of how much disk space is used by each of the"
+                echo -e "  different services installed on your StartOS server."
                 echo ""
                 pause ;;
             3)
@@ -1350,6 +1565,8 @@ menu_documentation() {
                 print_section "Display Current Cron Jobs"
                 echo ""
                 echo -e "  This shows all the cron jobs currently scheduled on your server."
+                echo -e "  You can use ${CYAN}https://crontab.guru/${NC} to translate the numbers into natural"
+                echo -e "  language of when the job will run."
                 echo -e "  It also gives you the option to delete any of these jobs if they"
                 echo -e "  are no longer needed."
                 echo ""
@@ -1401,8 +1618,23 @@ menu_documentation() {
                 echo -e "  [Documentation coming soon]"
                 echo ""
                 pause ;;
+            8)
+                print_header
+                print_section "System Database"
+                echo ""
+                echo -e "  This fetches a full dump of the StartOS system database and lets you"
+                echo -e "  browse it by category."
+                echo ""
+                echo -e "  ${BOLD}Available views:${NC}"
+                echo ""
+                echo -e "    ${CYAN}•${NC} ${BOLD}Server Info${NC}    — hostname, OS version, architecture, last backup"
+                echo -e "    ${CYAN}•${NC} ${BOLD}Network${NC}        — Tor addresses, WiFi, gateway IPs, DNS servers"
+                echo -e "    ${CYAN}•${NC} ${BOLD}Service Status${NC} — all services with running/stopped state and health checks"
+                echo -e "    ${CYAN}•${NC} ${BOLD}Service Detail${NC} — full detail for a single service"
+                echo ""
+                pause ;;
             0) return ;;
-            *) print_warn "Enter 0-7." ; sleep 1 ;;
+            *) print_warn "Enter 0-8." ; sleep 1 ;;
         esac
     done
 }
@@ -1473,6 +1705,7 @@ main_menu() {
         echo -e "    ${CYAN}${BOLD}6)${NC} Schedule backups"
         echo -e "    ${CYAN}${BOLD}7)${NC} Schedule stay-alive curl"
         echo -e "    ${CYAN}${BOLD}8)${NC} Manage notification forwarders"
+        echo -e "    ${CYAN}${BOLD}9)${NC} System Database"
         echo ""
         echo -e "    ${DIM}0) Exit${NC}"
         echo ""
@@ -1488,6 +1721,7 @@ main_menu() {
             6) menu_schedule_backup        || { _BACK=0; continue; } ;;
             7) menu_schedule_stay_alive    || { _BACK=0; continue; } ;;
             8) menu_manage_notif_pollers   || { _BACK=0; continue; } ;;
+            9) menu_db_dump                || { _BACK=0; continue; } ;;
             0)
                 echo ""
                 print_info "Goodbye."
@@ -1495,7 +1729,7 @@ main_menu() {
                 exit 0
                 ;;
             *)
-                print_warn "Invalid choice. Enter 0-8."
+                print_warn "Invalid choice. Enter 0-9."
                 sleep 1
                 ;;
         esac
