@@ -2,7 +2,7 @@
 # startos-admin.sh — Interactive admin menu for StartOS servers
 # Usage: chmod +x startos-admin.sh && ./startos-admin.sh
 
-VERSION="5"   # integer — increment on each release
+VERSION="6"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -1691,6 +1691,37 @@ check_for_update() {
     local raw_url="https://raw.githubusercontent.com/JesseMarkowitz/admintools-startos/refs/heads/main/startos-admin.sh"
     local remote_version remote_script
 
+    # ── First-run: not yet installed persistently ────────────────────────────
+    local _script_path
+    _script_path=$(realpath "$0" 2>/dev/null || echo "$0")
+    if [[ "$_script_path" != "/usr/local/bin/startos-admin" ]]; then
+        echo ""
+        print_info "This script is not yet installed persistently."
+        print_info "Installing to /usr/local/bin/startos-admin lets you run 'startos-admin' from anywhere."
+        echo ""
+        if confirm "Install persistently to /usr/local/bin/startos-admin now?"; then
+            print_warn "The server will restart after installation."
+            echo ""
+            local _encoded
+            _encoded=$(base64 -w 0 < "$_script_path")
+            local _chroot_exit=0
+            sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || _chroot_exit=$?
+printf '%s' "$_encoded" | base64 -d > /usr/local/bin/startos-admin
+chmod +x /usr/local/bin/startos-admin
+exit
+EOF
+            if [[ $_chroot_exit -eq 0 ]]; then
+                print_success "Installed. Server restarting — reconnect and run: startos-admin"
+            else
+                print_error "Installation failed (exit $_chroot_exit)."
+                pause
+            fi
+        fi
+        [[ $_BACK -eq 1 ]] && { _BACK=0; }
+        return 0  # skip version check when not running from persistent install
+    fi
+
+    # ── Normal update check (only runs when already persistent) ─────────────
     # Fetch with short timeout — fail silently if offline or unreachable
     remote_script=$(curl -fsSL --max-time 5 "$raw_url" 2>/dev/null) || return 0
 
