@@ -2,7 +2,7 @@
 # startos-admin.sh — Interactive admin menu for StartOS servers
 # Usage: chmod +x startos-admin.sh && ./startos-admin.sh
 
-VERSION="9"   # integer — increment on each release
+VERSION="11"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -408,13 +408,13 @@ menu_memory_usage() {
 }
 
 # ─────────────────────────────────────────────
-# Feature 4: Display Current Cron Jobs
+# Feature 4: Manage Cron Jobs
 # ─────────────────────────────────────────────
 
-menu_show_crontab() {
+_cron_view_delete() {
     while true; do
         print_header
-        print_section "Current Cron Jobs (root)"
+        print_section "View / Delete Cron Jobs"
         echo ""
 
         local cron_output exit_code=0
@@ -456,7 +456,7 @@ menu_show_crontab() {
             pause; return
         fi
 
-        echo -e "  ${DIM}Enter a number to delete that job, press Enter to go back, or type 'back'/'exit'.${NC}"
+        echo -e "  ${DIM}Enter number(s) to delete (comma-separated or 'all'), 0 or Enter to go back.${NC}"
         echo ""
         _read del_choice "  Choice: " || return 1
 
@@ -464,32 +464,56 @@ menu_show_crontab() {
             return
         fi
 
-        if ! [[ "$del_choice" =~ ^[0-9]+$ ]] || \
-           [[ "$del_choice" -lt 1 ]] || \
-           [[ "$del_choice" -gt ${#cron_lines[@]} ]]; then
-            print_warn "Enter a number between 1 and ${#cron_lines[@]}, or 0 to go back."
-            sleep 1
-            continue
+        # Parse selection into array of 0-based indices into cron_lines
+        local -a selected_indices=()
+        if [[ "$del_choice" == "all" ]]; then
+            local j
+            for (( j=0; j<${#cron_lines[@]}; j++ )); do
+                selected_indices+=("$j")
+            done
+        else
+            local valid=true
+            IFS=',' read -ra parts <<< "$del_choice"
+            for part in "${parts[@]}"; do
+                part="${part// /}"
+                if [[ "$part" =~ ^[0-9]+$ ]] && \
+                   [[ "$part" -ge 1 ]] && [[ "$part" -le "${#cron_lines[@]}" ]]; then
+                    selected_indices+=("$((part - 1))")
+                else
+                    valid=false; break
+                fi
+            done
+            if ! $valid || [[ "${#selected_indices[@]}" -eq 0 ]]; then
+                print_warn "Enter valid number(s) between 1 and ${#cron_lines[@]}, comma-separated, 'all', or 0 to go back."
+                sleep 1
+                continue
+            fi
         fi
 
-        local target_linenum="${cron_line_nums[$((del_choice - 1))]}"
-        local target_line="${cron_lines[$((del_choice - 1))]}"
-
-        # If the preceding line is a comment (our tag format), include it in the deletion
-        local prev_linenum=$(( target_linenum - 1 ))
-        local prev_line=""
-        [[ $prev_linenum -gt 0 ]] && prev_line=$(echo "$cron_output" | sed -n "${prev_linenum}p")
-
-        local remove_lines="$target_linenum"
-        [[ "$prev_line" =~ ^# ]] && remove_lines="${prev_linenum},${target_linenum}"
-
+        # For each selected job, collect its crontab line number (and preceding comment if any)
+        local -a remove_linenums=()
         echo ""
         print_warn "This will delete:"
-        [[ "$prev_line" =~ ^# ]] && echo -e "  ${DIM}${prev_line}${NC}"
-        echo -e "  ${CYAN}${target_line}${NC}"
+        for idx in "${selected_indices[@]}"; do
+            local target_linenum="${cron_line_nums[$idx]}"
+            local target_line="${cron_lines[$idx]}"
+            local prev_linenum=$(( target_linenum - 1 ))
+            local prev_line=""
+            [[ $prev_linenum -gt 0 ]] && prev_line=$(echo "$cron_output" | sed -n "${prev_linenum}p")
+            if [[ "$prev_line" =~ ^# ]]; then
+                remove_linenums+=("$prev_linenum")
+                echo -e "  ${DIM}${prev_line}${NC}"
+            fi
+            remove_linenums+=("$target_linenum")
+            echo -e "  ${CYAN}${target_line}${NC}"
+        done
         echo ""
 
-        if ! confirm "Delete this cron job?"; then
+        # Sort and deduplicate line numbers, then join with commas for awk
+        local remove_lines
+        remove_lines=$(printf '%s\n' "${remove_linenums[@]}" | sort -nu | paste -sd,)
+
+        if ! confirm "Delete the selected cron job(s)?"; then
             [[ $_BACK -eq 1 ]] && return 1
             print_info "Cancelled."
             sleep 1
@@ -499,7 +523,7 @@ menu_show_crontab() {
         echo ""
         echo -e "  ${RED}${BOLD}┌─────────────────────────────────────────────────┐${NC}"
         echo -e "  ${RED}${BOLD}│  WARNING: SERVER WILL AUTOMATICALLY RESTART     │${NC}"
-        echo -e "  ${RED}${BOLD}│  after the cron job is deleted.                 │${NC}"
+        echo -e "  ${RED}${BOLD}│  after the cron job(s) are deleted.             │${NC}"
         echo -e "  ${RED}${BOLD}│  Save any work and close open connections.      │${NC}"
         echo -e "  ${RED}${BOLD}└─────────────────────────────────────────────────┘${NC}"
         echo ""
@@ -514,8 +538,8 @@ menu_show_crontab() {
         print_success "Deletion staged. Entering persistence mode now."
         echo ""
 
-        # $remove_lines is e.g. "5" or "4,5" — expanded by outer bash, safe in heredoc.
-        # The awk program skips lines whose NR is in the skip set.
+        # $remove_lines is e.g. "5" or "2,3,5,6" — expanded by outer bash, safe in heredoc.
+        # The awk program skips all lines whose NR is in the skip set.
         local chroot_exit=0
         sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || chroot_exit=$?
 { crontab -l 2>/dev/null || true; } | awk -v lines="$remove_lines" 'BEGIN{n=split(lines,a,","); for(i=1;i<=n;i++) skip[a[i]]=1} !(NR in skip){print}' | crontab -
@@ -523,13 +547,170 @@ exit
 EOF
 
         if [[ $chroot_exit -eq 0 ]]; then
-            print_success "Cron job deleted."
+            print_success "Cron job(s) deleted."
             print_warn "The server will restart shortly — your SSH session will disconnect."
         else
-            print_error "chroot-and-upgrade failed (exit $chroot_exit). Cron job was not deleted."
+            print_error "chroot-and-upgrade failed (exit $chroot_exit). Cron job(s) were not deleted."
             pause
         fi
         return
+    done
+}
+
+# Validate a 5-field cron expression. Returns 0 if valid, 1 with message if not.
+_validate_cron_expr() {
+    local expr="$1"
+    local -a fields
+    read -ra fields <<< "$expr"
+
+    if [[ "${#fields[@]}" -ne 5 ]]; then
+        print_warn "Cron expression must have exactly 5 fields: minute hour day-of-month month day-of-week"
+        return 1
+    fi
+
+    local -a names=("minute(0-59)" "hour(0-23)" "day-of-month(1-31)" "month(1-12)" "day-of-week(0-7)")
+    local -a mins=(0 0 1 1 0)
+    local -a maxs=(59 23 31 12 7)
+
+    local f
+    for f in 0 1 2 3 4; do
+        local field="${fields[$f]}"
+        if ! [[ "$field" =~ ^[0-9*,/\-]+$ ]]; then
+            print_warn "Field $((f+1)) (${names[$f]}): invalid characters in '${field}'. Allowed: digits * / - ,"
+            return 1
+        fi
+        if [[ "$field" =~ ^[0-9]+$ ]]; then
+            if [[ "$field" -lt "${mins[$f]}" ]] || [[ "$field" -gt "${maxs[$f]}" ]]; then
+                print_warn "Field $((f+1)) (${names[$f]}): $field is out of range (${mins[$f]}–${maxs[$f]})."
+                return 1
+            fi
+        fi
+    done
+    return 0
+}
+
+# Interactive flow to add a custom cron job (schedule + command + optional post-actions).
+_cron_add_flow() {
+    print_header
+    print_section "Add a Cron Job"
+    echo ""
+    _nav_tip
+
+    # ── Step 1: Schedule ─────────────────────────────────────────────────────
+    echo -e "  ${BOLD}Step 1 of 3 — Schedule${NC}"
+    echo -e "  ${DIM}Fields: minute(0-59)  hour(0-23)  day-of-month(1-31)  month(1-12)  day-of-week(0-7)${NC}"
+    echo -e "  ${DIM}Use * for 'every', / for step (e.g. */5), - for range, , for list.${NC}"
+    echo -e "  ${DIM}Example: 0 3 * * *   (daily at 3 AM)${NC}"
+    echo -e "  ${DIM}Use ${CYAN}https://crontab.guru/${NC}${DIM} to build or verify your expression.${NC}"
+    echo ""
+    local cron_schedule=""
+    while true; do
+        _read cron_schedule "  Schedule: " || return 1
+        [[ -z "$cron_schedule" ]] && { print_warn "Schedule cannot be empty."; continue; }
+        _validate_cron_expr "$cron_schedule" && break
+    done
+
+    # ── Step 2: Command ──────────────────────────────────────────────────────
+    echo ""
+    echo -e "  ${BOLD}Step 2 of 3 — Command${NC}"
+    echo ""
+    local cron_cmd=""
+    while true; do
+        _read cron_cmd "  Command: " || return 1
+        [[ -z "$cron_cmd" ]] && { print_warn "Command cannot be empty."; continue; }
+        local syntax_err
+        if ! syntax_err=$(bash -nc "$cron_cmd" 2>&1); then
+            print_warn "Possible syntax error: $syntax_err"
+            if confirm "Use this command anyway?"; then
+                [[ $_BACK -eq 1 ]] && return 1
+                break
+            else
+                [[ $_BACK -eq 1 ]] && return 1
+                continue
+            fi
+        fi
+        break
+    done
+
+    # ── Step 3: Post-command actions ─────────────────────────────────────────
+    echo ""
+    echo -e "  ${BOLD}Step 3 of 3 — Post-command actions:${NC}"
+    echo -e "    ${BOLD}1)${NC} curl to a URL"
+    echo -e "    ${BOLD}2)${NC} StartOS notification"
+    echo -e "    ${BOLD}3)${NC} Both"
+    echo -e "    ${BOLD}4)${NC} None"
+    echo ""
+    local notif_mode="" curl_url="" notif_svc="" notif_level="" notif_title="" notif_body=""
+    while true; do
+        _read notif_choice "  Choice [1-4]: " || return 1
+        case "$notif_choice" in
+            1)
+                _read curl_url "  Notification URL: " || return 1
+                [[ -z "$curl_url" ]] && { print_warn "URL cannot be empty."; continue; }
+                notif_mode="1"; break ;;
+            2)
+                _pick_notif_startos notif_svc notif_level notif_title notif_body || return 1
+                notif_mode="2"; break ;;
+            3)
+                _read curl_url "  Notification URL: " || return 1
+                [[ -z "$curl_url" ]] && { print_warn "URL cannot be empty."; continue; }
+                _pick_notif_startos notif_svc notif_level notif_title notif_body || return 1
+                notif_mode="3"; break ;;
+            4) notif_mode="4"; break ;;
+            *) print_warn "Enter 1, 2, 3, or 4." ;;
+        esac
+    done
+
+    local notif_cmd=""
+    case "$notif_mode" in
+        1) notif_cmd="curl -fsS --max-time 10 \"${curl_url}\" >/dev/null 2>&1" ;;
+        2) notif_cmd="start-cli notification create ${notif_svc} ${notif_level} \"${notif_title}\" \"${notif_body}\"" ;;
+        3) notif_cmd="curl -fsS --max-time 10 \"${curl_url}\" >/dev/null 2>&1 && start-cli notification create ${notif_svc} ${notif_level} \"${notif_title}\" \"${notif_body}\"" ;;
+    esac
+
+    local full_line="$cron_schedule $cron_cmd"
+    [[ -n "$notif_cmd" ]] && full_line+=" && $notif_cmd"
+
+    # ── Preview + confirm ────────────────────────────────────────────────────
+    echo ""
+    print_section "Review Cron Job"
+    echo ""
+    echo -e "  ${BOLD}Schedule:${NC}  $cron_schedule"
+    echo -e "  ${BOLD}Command:${NC}   $cron_cmd"
+    [[ -n "$notif_cmd" ]] && echo -e "  ${BOLD}Notify:${NC}    $notif_cmd"
+    echo ""
+    echo -e "  ${DIM}Cron line to install:${NC}"
+    echo -e "  ${DIM}${full_line}${NC}"
+    echo ""
+
+    if ! confirm "Install this cron job?"; then
+        [[ $_BACK -eq 1 ]] && return 1
+        print_info "Cancelled."
+        pause; return
+    fi
+
+    install_cron_job "$full_line" || return 1
+    # NOTE: server restarts after this — nothing below executes
+}
+
+# Top-level submenu for cron job management
+menu_manage_crontab() {
+    while true; do
+        print_header
+        print_section "Manage Cron Jobs"
+        echo ""
+        echo -e "    ${CYAN}${BOLD}1)${NC} View / delete cron jobs"
+        echo -e "    ${CYAN}${BOLD}2)${NC} Add a cron job"
+        echo ""
+        echo -e "    ${DIM}0) Back${NC}"
+        echo ""
+        _read sub_choice "  $(echo -e "${BOLD}Choice:${NC} ")" || return 1
+        case "$sub_choice" in
+            1) _cron_view_delete || return 1 ;;
+            2) _cron_add_flow    || return 1 ;;
+            0) return ;;
+            *) print_warn "Enter 0-2." ; sleep 1 ;;
+        esac
     done
 }
 
@@ -1654,7 +1835,7 @@ menu_documentation() {
         echo -e "    ${CYAN}${BOLD}1)${NC} Create a StartOS notification"
         echo -e "    ${CYAN}${BOLD}2)${NC} Display disk used by services"
         echo -e "    ${CYAN}${BOLD}3)${NC} Display memory used by services"
-        echo -e "    ${CYAN}${BOLD}4)${NC} Display current cron jobs"
+        echo -e "    ${CYAN}${BOLD}4)${NC} Manage cron jobs"
         echo -e "    ${CYAN}${BOLD}5)${NC} Schedule backups"
         echo -e "    ${CYAN}${BOLD}6)${NC} Schedule stay-alive curl"
         echo -e "    ${CYAN}${BOLD}7)${NC} Manage notification forwarders"
@@ -1699,15 +1880,27 @@ menu_documentation() {
                 pause ;;
             4)
                 print_header
-                print_section "Display Current Cron Jobs"
+                print_section "Manage Cron Jobs"
                 echo ""
-                echo -e "  This shows all the cron jobs currently scheduled on your server."
-                echo -e "  You can use ${CYAN}https://crontab.guru/${NC} to translate the numbers into natural"
-                echo -e "  language of when the job will run."
-                echo -e "  It also gives you the option to delete any of these jobs if they"
-                echo -e "  are no longer needed."
+                echo -e "  ${BOLD}View / delete:${NC} Shows all cron jobs currently scheduled on your server."
+                echo -e "  Comments are dimmed; executable lines are numbered for deletion."
+                echo -e "  Use ${CYAN}https://crontab.guru/${NC} to translate expressions into plain language."
                 echo ""
                 echo -e "  ${YELLOW}You should only keep jobs you are actively using.${NC}"
+                echo ""
+                echo -e "  ${BOLD}Add a cron job:${NC} Schedule any command to run on a recurring schedule."
+                echo ""
+                echo -e "  ${BOLD}You can specify:${NC}"
+                echo ""
+                echo -e "    ${CYAN}•${NC} ${BOLD}Schedule${NC} — a 5-field cron expression (minute hour day-of-month month"
+                echo -e "      day-of-week). Validated for field count, allowed characters, and value"
+                echo -e "      ranges before install. Use ${CYAN}https://crontab.guru/${NC} to build expressions."
+                echo ""
+                echo -e "    ${CYAN}•${NC} ${BOLD}Command${NC} — the shell command to run. A basic syntax check is performed;"
+                echo -e "      you can proceed anyway if the check flags a false positive."
+                echo ""
+                echo -e "    ${CYAN}•${NC} ${BOLD}Post-command actions${NC} — optionally curl to a URL and/or create a"
+                echo -e "      StartOS notification after the command completes."
                 echo ""
                 pause ;;
             5)
@@ -1889,7 +2082,7 @@ main_menu() {
         echo -e "    ${CYAN}${BOLD}2)${NC} Create a StartOS notification"
         echo -e "    ${CYAN}${BOLD}3)${NC} Display disk used by services"
         echo -e "    ${CYAN}${BOLD}4)${NC} Display memory used by services"
-        echo -e "    ${CYAN}${BOLD}5)${NC} Display current cron jobs"
+        echo -e "    ${CYAN}${BOLD}5)${NC} Manage cron jobs"
         echo -e "    ${CYAN}${BOLD}6)${NC} Schedule backups"
         echo -e "    ${CYAN}${BOLD}7)${NC} Schedule stay-alive curl"
         echo -e "    ${CYAN}${BOLD}8)${NC} Manage notification forwarders"
@@ -1905,7 +2098,7 @@ main_menu() {
             2) menu_create_notification    || { _BACK=0; continue; } ;;
             3) menu_disk_usage ;;
             4) menu_memory_usage ;;
-            5) menu_show_crontab           || { _BACK=0; continue; } ;;
+            5) menu_manage_crontab         || { _BACK=0; continue; } ;;
             6) menu_schedule_backup        || { _BACK=0; continue; } ;;
             7) menu_schedule_stay_alive    || { _BACK=0; continue; } ;;
             8) menu_manage_notif_pollers   || { _BACK=0; continue; } ;;
