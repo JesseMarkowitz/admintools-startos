@@ -2,7 +2,7 @@
 # startos-admin.sh — Interactive admin menu for StartOS servers
 # Usage: chmod +x startos-admin.sh && ./startos-admin.sh
 
-VERSION="6"   # integer — increment on each release
+VERSION="7"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -1700,7 +1700,17 @@ check_for_update() {
         print_info "Installing to /usr/local/bin/startos-admin lets you run 'startos-admin' from anywhere."
         echo ""
         if confirm "Install persistently to /usr/local/bin/startos-admin now?"; then
-            print_warn "The server will restart after installation."
+            echo ""
+            echo -e "  ${RED}${BOLD}┌─────────────────────────────────────────────────┐${NC}"
+            echo -e "  ${RED}${BOLD}│  WARNING: SERVER WILL AUTOMATICALLY RESTART     │${NC}"
+            echo -e "  ${RED}${BOLD}│  after the script is installed.                 │${NC}"
+            echo -e "  ${RED}${BOLD}│  Save any work and close open connections.      │${NC}"
+            echo -e "  ${RED}${BOLD}└─────────────────────────────────────────────────┘${NC}"
+            echo ""
+            if ! confirm "Proceed? (server will restart automatically)"; then
+                [[ $_BACK -eq 1 ]] && { _BACK=0; }
+                return 0
+            fi
             echo ""
             local _encoded
             _encoded=$(base64 -w 0 < "$_script_path")
@@ -1741,7 +1751,17 @@ EOF
         return 0
     fi
 
-    print_warn "The server will restart after installation (same as all chroot operations)."
+    echo ""
+    echo -e "  ${RED}${BOLD}┌─────────────────────────────────────────────────┐${NC}"
+    echo -e "  ${RED}${BOLD}│  WARNING: SERVER WILL AUTOMATICALLY RESTART     │${NC}"
+    echo -e "  ${RED}${BOLD}│  after the update is installed.                 │${NC}"
+    echo -e "  ${RED}${BOLD}│  Save any work and close open connections.      │${NC}"
+    echo -e "  ${RED}${BOLD}└─────────────────────────────────────────────────┘${NC}"
+    echo ""
+    if ! confirm "Proceed? (server will restart automatically)"; then
+        [[ $_BACK -eq 1 ]] && { _BACK=0; return 0; }
+        return 0
+    fi
     echo ""
 
     local encoded
