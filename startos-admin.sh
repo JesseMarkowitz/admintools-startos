@@ -2,7 +2,7 @@
 # startos-admin.sh — Interactive admin menu for StartOS servers
 # Usage: chmod +x startos-admin.sh && ./startos-admin.sh
 
-VERSION="7"   # integer — increment on each release
+VERSION="9"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -1089,13 +1089,22 @@ STATE_FILE=\"/media/startos/data/startos-admin-poller-state-${name}\"
 LAST_ID=0
 [ -f "$STATE_FILE" ] && LAST_ID=$(cat "$STATE_FILE" | tr -d '[:space:]')
 
-NOTIFS=$(start-cli notification list 2>/dev/null) || exit 0
-[ -z "$NOTIFS" ] && exit 0
+echo "$(date '+%Y.%m.%d %H:%M:%S'): run start — LAST_ID=$LAST_ID  levels=$LEVELS  keyword='$KEYWORD'"
+
+NOTIFS=$(start-cli notification list 2>/dev/null) || { echo "$(date '+%Y.%m.%d %H:%M:%S'): ERROR — start-cli notification list failed"; exit 0; }
+if [ -z "$NOTIFS" ]; then
+    echo "$(date '+%Y.%m.%d %H:%M:%S'): no notifications returned — exiting"
+    exit 0
+fi
+
+TOTAL=$(echo "$NOTIFS" | jq 'length' 2>/dev/null || echo "?")
+NEW=$(echo "$NOTIFS" | jq --argjson last "$LAST_ID" '[.[] | select(.id > $last)] | length' 2>/dev/null || echo "?")
+echo "$(date '+%Y.%m.%d %H:%M:%S'): $TOTAL total notifications, $NEW new (id > $LAST_ID)"
 
 MAX_ID=$LAST_ID
 
 if ! command -v jq >/dev/null 2>&1; then
-    echo "$(date): jq not found — cannot process notifications" >&2
+    echo "$(date '+%Y.%m.%d %H:%M:%S'): ERROR — jq not found"
     exit 1
 fi
 
@@ -1107,26 +1116,30 @@ while IFS= read -r notif; do
     pkg=$(echo "$notif"   | jq -r '.packageId // "null"')
     ts=$(echo "$notif"    | jq -r '.createdAt')
 
-    [ "$id" -le "$LAST_ID" ] && continue
+    # Advance MAX_ID for ALL seen notifications, not just forwarded ones
+    [ "$id" -gt "$MAX_ID" ] && MAX_ID=$id
 
     if [ "$LEVELS" != "all" ] && ! echo ",$LEVELS," | grep -q ",$level,"; then
+        echo "$(date '+%Y.%m.%d %H:%M:%S'): skip id=$id level=$level — not in filter '$LEVELS'"
         continue
     fi
 
     if [ -n "$KEYWORD" ] && ! echo "$title $msg" | grep -qi "$KEYWORD"; then
+        echo "$(date '+%Y.%m.%d %H:%M:%S'): skip id=$id level=$level — keyword '$KEYWORD' not found in: $title"
         continue
     fi
 
     ts_fmt=$(date -d "$ts" '+%Y.%m.%d %H:%M:%S' 2>/dev/null || echo "$ts" | sed 's/T/ /; s/\..*//' | tr '-' '.')
     level_cap=$(echo "$level" | awk '{print toupper(substr($0,1,1)) tolower(substr($0,2))}')
-    echo "$(date): forwarding id=$id level=$level title=$title"
+    echo "$(date '+%Y.%m.%d %H:%M:%S'): forward id=$id level=$level pkg=$pkg title=$title"
     curl -s --max-time 10 \
         -d "${ts_fmt}  [${level_cap}]  ${pkg}  |  ${title} — ${msg}" \
         "$WEBHOOK_URL"
+    echo ""
 
-    [ "$id" -gt "$MAX_ID" ] && MAX_ID=$id
 done < <(echo "$NOTIFS" | jq -c --argjson last "$LAST_ID" '[.[] | select(.id > $last)] | .[]')
 
+echo "$(date '+%Y.%m.%d %H:%M:%S'): run complete — saving MAX_ID=$MAX_ID"
 echo "$MAX_ID" > "$STATE_FILE"
 POLLER_BODY_END
 )
@@ -1196,7 +1209,7 @@ _poller_remove_flow() {
         script_names+=("${s##*/startos-notif-poller-}")
     done
 
-    echo -e "  ${BOLD}Select poller to remove:${NC}"
+    echo -e "  ${BOLD}Select poller(s) to remove:${NC}"
     local i=1
     for pname in "${script_names[@]}"; do
         echo -e "    ${BOLD}${i})${NC} ${pname}"
@@ -1204,36 +1217,45 @@ _poller_remove_flow() {
     done
     echo ""
 
-    local remove_name=""
+    local names_to_remove=()
     while true; do
-        _read rchoice "  Choice [1-$((i-1))]: " || return 1
-        if [[ "$rchoice" =~ ^[0-9]+$ ]] && \
-           [[ "$rchoice" -ge 1 ]] && [[ "$rchoice" -lt "$i" ]]; then
-            remove_name="${script_names[$((rchoice - 1))]}"
+        _read rchoice "  Choice(s) [1-$((i-1)), comma-separated, or 'all']: " || return 1
+        if [[ "$rchoice" == "all" ]]; then
+            names_to_remove=("${script_names[@]}")
             break
         fi
-        print_warn "Enter a number between 1 and $((i-1))."
+        local valid=true
+        local selections=()
+        IFS=',' read -ra parts <<< "$rchoice"
+        for part in "${parts[@]}"; do
+            part="${part// /}"
+            if [[ "$part" =~ ^[0-9]+$ ]] && [[ "$part" -ge 1 ]] && [[ "$part" -lt "$i" ]]; then
+                selections+=("${script_names[$((part - 1))]}")
+            else
+                valid=false; break
+            fi
+        done
+        if $valid && [[ "${#selections[@]}" -gt 0 ]]; then
+            names_to_remove=("${selections[@]}")
+            break
+        fi
+        print_warn "Enter valid number(s) between 1 and $((i-1)), comma-separated, or 'all'."
     done
 
     echo ""
-    print_warn "This will permanently remove poller '${remove_name}', its script, state file, and crontab entry."
-    if ! confirm "Remove '${remove_name}'?"; then
+    local names_display
+    names_display=$(printf "'%s' " "${names_to_remove[@]}")
+    print_warn "This will permanently remove pollers: ${names_display}"
+    if ! confirm "Remove the selected poller(s)?"; then
         [[ $_BACK -eq 1 ]] && return 1
         print_info "Cancelled."
         pause; return
     fi
 
-    # Remove state file — lives in the data volume, accessible outside chroot
-    local state_file="/media/startos/data/startos-admin-poller-state-${remove_name}"
-    if [[ -f "$state_file" ]]; then
-        rm -f "$state_file"
-        print_success "Removed state file."
-    fi
-
     echo ""
     echo -e "  ${RED}${BOLD}┌─────────────────────────────────────────────────┐${NC}"
     echo -e "  ${RED}${BOLD}│  WARNING: SERVER WILL AUTOMATICALLY RESTART     │${NC}"
-    echo -e "  ${RED}${BOLD}│  after the poller is removed.                   │${NC}"
+    echo -e "  ${RED}${BOLD}│  after the poller(s) are removed.               │${NC}"
     echo -e "  ${RED}${BOLD}│  Save any work and close open connections.      │${NC}"
     echo -e "  ${RED}${BOLD}└─────────────────────────────────────────────────┘${NC}"
     echo ""
@@ -1244,23 +1266,92 @@ _poller_remove_flow() {
         return 1
     fi
 
+    # Remove state files AFTER 2nd confirm — root-owned, not accessible inside chroot
+    for rname in "${names_to_remove[@]}"; do
+        local state_file="/media/startos/data/startos-admin-poller-state-${rname}"
+        if [[ -f "$state_file" ]]; then
+            print_info "Removing state file: $state_file"
+            sudo rm -f "$state_file"
+        fi
+    done
+
+    # Build chroot commands with names already substituted (avoids $0 escaping in heredoc)
+    local chroot_body=""
+    for rname in "${names_to_remove[@]}"; do
+        chroot_body+="crontab -l 2>/dev/null | grep -v 'startos-notif-poller-${rname}' | crontab -
+rm -f /usr/local/bin/startos-notif-poller-${rname}
+"
+    done
+
     print_success "Removal staged. Entering persistence mode now."
     echo ""
 
     local chroot_exit=0
     sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || chroot_exit=$?
-{ crontab -l 2>/dev/null || true; } | awk -v t="# startos-notif-poller-${remove_name}" '\$0==t{skip=1;next} skip{skip=0;next} {print}' | crontab -
-rm -f /usr/local/bin/startos-notif-poller-${remove_name}
-exit
+${chroot_body}exit
 EOF
 
     if [[ $chroot_exit -eq 0 ]]; then
-        print_success "Poller '${remove_name}' removed."
+        print_success "Removed: ${names_display}"
         print_warn "The server will restart shortly — your SSH session will disconnect."
     else
-        print_error "chroot-and-upgrade failed (exit $chroot_exit). Poller may not have been fully removed."
+        print_error "chroot-and-upgrade failed (exit $chroot_exit). Poller(s) may not have been fully removed."
         pause
     fi
+}
+
+# Display the last 50 lines of a poller's log file.
+_poller_view_log() {
+    print_header
+    print_section "View Poller Log"
+    echo ""
+
+    local all_scripts=(/usr/local/bin/startos-notif-poller-*)
+    if [[ ! -e "${all_scripts[0]}" ]]; then
+        print_info "No notification pollers installed."
+        pause; return
+    fi
+
+    local script_names=()
+    for script in "${all_scripts[@]}"; do
+        script_names+=("${script##*/startos-notif-poller-}")
+    done
+
+    local i=1
+    for pname in "${script_names[@]}"; do
+        echo -e "    ${BOLD}${i})${NC} ${pname}"
+        (( i++ ))
+    done
+    echo ""
+
+    local log_choice
+    while true; do
+        _read log_choice "  Choice [1-$((i-1))]: " || return 1
+        if [[ "$log_choice" =~ ^[0-9]+$ ]] && \
+           [[ "$log_choice" -ge 1 ]] && [[ "$log_choice" -lt "$i" ]]; then
+            break
+        fi
+        print_warn "Enter a number between 1 and $((i-1))."
+    done
+
+    local log_name="${script_names[$((log_choice - 1))]}"
+    local log_file="/var/log/startos-notif-poller-${log_name}.log"
+
+    print_header
+    print_section "Poller Log: ${log_name}"
+    echo ""
+
+    if [[ ! -f "$log_file" ]]; then
+        print_info "Log file not found: $log_file"
+        print_info "The poller may not have run yet."
+    else
+        echo -e "  ${DIM}(last 50 lines of $log_file)${NC}"
+        echo ""
+        tail -50 "$log_file"
+    fi
+
+    echo ""
+    pause
 }
 
 # Top-level submenu for notification forwarder management
@@ -1272,6 +1363,7 @@ menu_manage_notif_pollers() {
         echo -e "    ${CYAN}${BOLD}1)${NC} Install / update a notification poller"
         echo -e "    ${CYAN}${BOLD}2)${NC} List installed pollers"
         echo -e "    ${CYAN}${BOLD}3)${NC} Remove a poller"
+        echo -e "    ${CYAN}${BOLD}4)${NC} View poller log"
         echo ""
         echo -e "    ${DIM}0) Back${NC}"
         echo ""
@@ -1286,8 +1378,9 @@ menu_manage_notif_pollers() {
                 pause
                 ;;
             3) _poller_remove_flow || return 1 ;;
+            4) _poller_view_log || return 1 ;;
             0) return ;;
-            *) print_warn "Enter 0-3." ; sleep 1 ;;
+            *) print_warn "Enter 0-4." ; sleep 1 ;;
         esac
     done
 }
