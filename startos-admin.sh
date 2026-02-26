@@ -2,7 +2,7 @@
 # startos-admin.sh — Interactive admin menu for StartOS servers
 # Usage: chmod +x startos-admin.sh && ./startos-admin.sh
 
-VERSION="11"   # integer — increment on each release
+VERSION="13"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -149,6 +149,7 @@ parse_backup_targets() {
 #   3. Exits the chroot session (which triggers the automatic server restart)
 install_cron_job() {
     local cron_line="$1"
+    local action_label="${2:-startos-admin}"
 
     # Duplicate check
     if crontab -u root -l 2>/dev/null | grep -qF "$cron_line"; then
@@ -171,22 +172,24 @@ install_cron_job() {
         return 1
     fi
 
-    # Base64-encode the cron line so it can be safely embedded in the heredoc
-    # without quoting issues (passwords, double quotes, special chars).
-    # The encoded string is alphanumeric-only — safe in any shell context.
-    # This also avoids needing a temp file accessible inside the chroot.
-    local encoded_line
+    # Build comment line, then base64-encode both comment and cron line so they
+    # can be safely embedded in the heredoc (no quoting issues with special chars).
+    local install_ts
+    install_ts=$(date '+%Y.%m.%d %H:%M:%S')
+    local comment_line="# startos-admin v${VERSION} | Added: ${install_ts} | Action: ${action_label}"
+    local encoded_comment encoded_line
+    encoded_comment=$(printf '%s' "$comment_line" | base64 -w 0)
     encoded_line=$(printf '%s' "$cron_line" | base64 -w 0)
 
     print_success "Cron job staged. Entering persistence mode now."
     echo ""
 
     # Feed commands into chroot-and-upgrade via heredoc.
-    # $encoded_line is expanded by the outer shell (base64 = no special chars).
-    # The trailing `echo` after base64 -d adds the newline crontab requires.
+    # Encoded values are alphanumeric-only — safe in any shell context.
+    # The trailing `echo` after each base64 -d adds the required newline.
     local chroot_exit=0
     sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || chroot_exit=$?
-{ crontab -l 2>/dev/null; printf '%s' "$encoded_line" | base64 -d; echo; } | crontab -
+{ crontab -l 2>/dev/null; printf '%s' "$encoded_comment" | base64 -d; echo; printf '%s' "$encoded_line" | base64 -d; echo; } | crontab -
 exit
 EOF
 
@@ -251,17 +254,19 @@ menu_create_notification() {
     echo ""
     echo -e "  ${BOLD}Select severity level:${NC}"
     echo -e "    ${BOLD}1)${NC} ${CYAN}info${NC}    — informational"
-    echo -e "    ${BOLD}2)${NC} ${YELLOW}warning${NC} — requires attention"
-    echo -e "    ${BOLD}3)${NC} ${RED}error${NC}   — something went wrong"
+    echo -e "    ${BOLD}2)${NC} ${GREEN}success${NC} — completed successfully"
+    echo -e "    ${BOLD}3)${NC} ${YELLOW}warning${NC} — requires attention"
+    echo -e "    ${BOLD}4)${NC} ${RED}error${NC}   — something went wrong"
     echo ""
     local notif_level="info"
     while true; do
-        _read level_choice "  Choice [1-3, default 1]: " || return 1
+        _read level_choice "  Choice [1-4, default 1]: " || return 1
         case "${level_choice:-1}" in
             1) notif_level="info";    break ;;
-            2) notif_level="warning"; break ;;
-            3) notif_level="error";   break ;;
-            *) print_warn "Enter 1, 2, or 3." ;;
+            2) notif_level="success"; break ;;
+            3) notif_level="warning"; break ;;
+            4) notif_level="error";   break ;;
+            *) print_warn "Enter 1, 2, 3, or 4." ;;
         esac
     done
 
@@ -689,7 +694,7 @@ _cron_add_flow() {
         pause; return
     fi
 
-    install_cron_job "$full_line" || return 1
+    install_cron_job "$full_line" "Add Cron Job" || return 1
     # NOTE: server restarts after this — nothing below executes
 }
 
@@ -945,7 +950,7 @@ menu_schedule_backup() {
         pause; return
     fi
 
-    install_cron_job "$full_line" || return 1
+    install_cron_job "$full_line" "Schedule Backups" || return 1
     # NOTE: server restarts after this — nothing below executes
 }
 
@@ -987,15 +992,16 @@ _pick_notif_startos() {
     # Level
     echo ""
     echo -e "  ${BOLD}Notification level:${NC}"
-    echo -e "    ${BOLD}1)${NC} ${CYAN}info${NC}  ${BOLD}2)${NC} ${YELLOW}warning${NC}  ${BOLD}3)${NC} ${RED}error${NC}"
+    echo -e "    ${BOLD}1)${NC} ${CYAN}info${NC}  ${BOLD}2)${NC} ${GREEN}success${NC}  ${BOLD}3)${NC} ${YELLOW}warning${NC}  ${BOLD}4)${NC} ${RED}error${NC}"
     echo ""
     while true; do
-        _read _lc "  Choice [1-3, default 1]: " || return 1
+        _read _lc "  Choice [1-4, default 1]: " || return 1
         case "${_lc:-1}" in
             1) _lvl="info";    break ;;
-            2) _lvl="warning"; break ;;
-            3) _lvl="error";   break ;;
-            *) print_warn "Enter 1, 2, or 3." ;;
+            2) _lvl="success"; break ;;
+            3) _lvl="warning"; break ;;
+            4) _lvl="error";   break ;;
+            *) print_warn "Enter 1, 2, 3, or 4." ;;
         esac
     done
 
@@ -1063,7 +1069,7 @@ menu_schedule_stay_alive() {
         pause; return
     fi
 
-    install_cron_job "$cron_line" || return 1
+    install_cron_job "$cron_line" "Schedule Stay-Alive Curl" || return 1
     # NOTE: server restarts after this — nothing below executes
 }
 
@@ -1329,7 +1335,9 @@ POLLER_BODY_END
     local encoded_script encoded_comment encoded_cron
     encoded_script=$(printf '%s' "$script_content" | base64 -w 0)
 
-    local cron_comment="# startos-notif-poller-${name}"
+    local install_ts
+    install_ts=$(date '+%Y.%m.%d %H:%M:%S')
+    local cron_comment="# startos-notif-poller-${name} | Added: ${install_ts} | v${VERSION} | Action: Manage Notification Forwarders | Webhook: ${url} | Levels: ${levels} | Keyword: ${keyword:-none}"
     local cron_line="${schedule} /usr/local/bin/startos-notif-poller-${name} >> /var/log/startos-notif-poller-${name}.log 2>&1"
     encoded_comment=$(printf '%s' "$cron_comment" | base64 -w 0)
     encoded_cron=$(printf '%s' "$cron_line" | base64 -w 0)
@@ -1356,7 +1364,7 @@ POLLER_BODY_END
     # \$0 in the heredoc → $0 for awk (the outer bash escapes \$ → $).
     local chroot_exit=0
     sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || chroot_exit=$?
-{ crontab -l 2>/dev/null || true; } | awk -v t="# startos-notif-poller-${name}" '\$0==t{skip=1;next} skip{skip=0;next} {print}' | crontab -
+{ crontab -l 2>/dev/null || true; } | awk -v t="# startos-notif-poller-${name}" 'index(\$0,t)==1{skip=1;next} skip{skip=0;next} {print}' | crontab -
 printf '%s' "$encoded_script" | base64 -d > /usr/local/bin/startos-notif-poller-${name}
 chmod +x /usr/local/bin/startos-notif-poller-${name}
 { crontab -l 2>/dev/null; printf '%s' "$encoded_comment" | base64 -d; echo; printf '%s' "$encoded_cron" | base64 -d; echo; } | crontab -
@@ -1856,7 +1864,7 @@ menu_documentation() {
                 echo -e "  ${BOLD}You can specify:${NC}"
                 echo ""
                 echo -e "    ${CYAN}•${NC} What service it comes from  ${DIM}(or leave blank)${NC}"
-                echo -e "    ${CYAN}•${NC} The message priority  ${DIM}(info, warning, error)${NC}"
+                echo -e "    ${CYAN}•${NC} The message priority  ${DIM}(info, success, warning, error)${NC}"
                 echo -e "    ${CYAN}•${NC} Message title"
                 echo -e "    ${CYAN}•${NC} Message body"
                 echo ""
