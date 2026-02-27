@@ -2,7 +2,7 @@
 # startos-admin.sh — Interactive admin menu for StartOS servers
 # Usage: chmod +x startos-admin.sh && ./startos-admin.sh
 
-VERSION="14"   # integer — increment on each release
+VERSION="15"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -1273,6 +1273,9 @@ STATE_FILE=\"/media/startos/data/startos-admin-poller-state-${name}\"
 
     local body_template
     body_template=$(cat << 'POLLER_BODY_END'
+# Cron runs with a minimal PATH — ensure standard locations are included
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+
 LAST_ID=0
 [ -f "$STATE_FILE" ] && LAST_ID=$(cat "$STATE_FILE" | tr -d '[:space:]')
 # Ensure LAST_ID is a plain integer (guard against corrupt state file)
@@ -1280,15 +1283,25 @@ LAST_ID=0
 
 echo "$(date '+%Y.%m.%d %H:%M:%S'): run start — LAST_ID=$LAST_ID  levels=$LEVELS  keyword='$KEYWORD'"
 
-NOTIFS=$(start-cli notification list 2>/dev/null) || { echo "$(date '+%Y.%m.%d %H:%M:%S'): ERROR — start-cli notification list failed"; exit 0; }
-if [ -z "$NOTIFS" ]; then
-    echo "$(date '+%Y.%m.%d %H:%M:%S'): no notifications returned — exiting"
-    exit 0
+if ! command -v start-cli >/dev/null 2>&1; then
+    echo "$(date '+%Y.%m.%d %H:%M:%S'): ERROR — start-cli not found in PATH: $PATH"
+    exit 1
 fi
 
 if ! command -v jq >/dev/null 2>&1; then
-    echo "$(date '+%Y.%m.%d %H:%M:%S'): ERROR — jq not found"
+    echo "$(date '+%Y.%m.%d %H:%M:%S'): ERROR — jq not found in PATH: $PATH"
     exit 1
+fi
+
+NOTIFS=$(start-cli notification list 2>&1)
+NOTIFS_EXIT=$?
+if [ $NOTIFS_EXIT -ne 0 ]; then
+    echo "$(date '+%Y.%m.%d %H:%M:%S'): ERROR — start-cli notification list failed (exit $NOTIFS_EXIT): $NOTIFS"
+    exit 0
+fi
+if [ -z "$NOTIFS" ]; then
+    echo "$(date '+%Y.%m.%d %H:%M:%S'): no notifications returned — exiting"
+    exit 0
 fi
 
 # Use (.id | tonumber) so the filter works whether IDs are JSON strings or numbers.
