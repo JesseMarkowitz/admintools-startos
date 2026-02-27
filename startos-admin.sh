@@ -2,7 +2,7 @@
 # startos-admin.sh — Interactive admin menu for StartOS servers
 # Usage: chmod +x startos-admin.sh && ./startos-admin.sh
 
-VERSION="13"   # integer — increment on each release
+VERSION="14"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -1275,6 +1275,8 @@ STATE_FILE=\"/media/startos/data/startos-admin-poller-state-${name}\"
     body_template=$(cat << 'POLLER_BODY_END'
 LAST_ID=0
 [ -f "$STATE_FILE" ] && LAST_ID=$(cat "$STATE_FILE" | tr -d '[:space:]')
+# Ensure LAST_ID is a plain integer (guard against corrupt state file)
+[[ "$LAST_ID" =~ ^[0-9]+$ ]] || LAST_ID=0
 
 echo "$(date '+%Y.%m.%d %H:%M:%S'): run start — LAST_ID=$LAST_ID  levels=$LEVELS  keyword='$KEYWORD'"
 
@@ -1284,19 +1286,22 @@ if [ -z "$NOTIFS" ]; then
     exit 0
 fi
 
-TOTAL=$(echo "$NOTIFS" | jq 'length' 2>/dev/null || echo "?")
-NEW=$(echo "$NOTIFS" | jq --argjson last "$LAST_ID" '[.[] | select(.id > $last)] | length' 2>/dev/null || echo "?")
-echo "$(date '+%Y.%m.%d %H:%M:%S'): $TOTAL total notifications, $NEW new (id > $LAST_ID)"
-
-MAX_ID=$LAST_ID
-
 if ! command -v jq >/dev/null 2>&1; then
     echo "$(date '+%Y.%m.%d %H:%M:%S'): ERROR — jq not found"
     exit 1
 fi
 
+# Use (.id | tonumber) so the filter works whether IDs are JSON strings or numbers.
+# Without tonumber, jq orders strings above numbers, so string IDs always beat $last.
+TOTAL=$(echo "$NOTIFS" | jq 'length' 2>/dev/null || echo "?")
+NEW=$(echo "$NOTIFS" | jq --argjson last "$LAST_ID" '[.[] | select((.id | tonumber) > $last)] | length' 2>/dev/null || echo "?")
+echo "$(date '+%Y.%m.%d %H:%M:%S'): $TOTAL total notifications, $NEW new (id > $LAST_ID)"
+
+MAX_ID=$LAST_ID
+
 while IFS= read -r notif; do
-    id=$(echo "$notif"    | jq -r '.id')
+    # Normalize id to a plain integer string regardless of JSON type
+    id=$(echo "$notif"    | jq -r '.id | tonumber | tostring')
     level=$(echo "$notif" | jq -r '.level')
     title=$(echo "$notif" | jq -r '.title')
     msg=$(echo "$notif"   | jq -r '.message')
@@ -1324,10 +1329,12 @@ while IFS= read -r notif; do
         "$WEBHOOK_URL"
     echo ""
 
-done < <(echo "$NOTIFS" | jq -c --argjson last "$LAST_ID" '[.[] | select(.id > $last)] | .[]')
+done < <(echo "$NOTIFS" | jq -c --argjson last "$LAST_ID" '[.[] | select((.id | tonumber) > $last)] | .[]')
 
 echo "$(date '+%Y.%m.%d %H:%M:%S'): run complete — saving MAX_ID=$MAX_ID"
-echo "$MAX_ID" > "$STATE_FILE"
+if ! echo "$MAX_ID" > "$STATE_FILE" 2>/dev/null; then
+    echo "$(date '+%Y.%m.%d %H:%M:%S'): ERROR — could not write state file: $STATE_FILE (check permissions)"
+fi
 POLLER_BODY_END
 )
 
