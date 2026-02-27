@@ -2,7 +2,7 @@
 # startos-admin.sh — Interactive admin menu for StartOS servers
 # Usage: chmod +x startos-admin.sh && ./startos-admin.sh
 
-VERSION="15"   # integer — increment on each release
+VERSION="16"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -175,7 +175,7 @@ install_cron_job() {
     # Build comment line, then base64-encode both comment and cron line so they
     # can be safely embedded in the heredoc (no quoting issues with special chars).
     local install_ts
-    install_ts=$(date '+%Y.%m.%d %H:%M:%S')
+    install_ts=$(date '+%Y.%m.%d %H:%M:%S %Z')
     local comment_line="# startos-admin v${VERSION} | Added: ${install_ts} | Action: ${action_label}"
     local encoded_comment encoded_line
     encoded_comment=$(printf '%s' "$comment_line" | base64 -w 0)
@@ -1281,26 +1281,26 @@ LAST_ID=0
 # Ensure LAST_ID is a plain integer (guard against corrupt state file)
 [[ "$LAST_ID" =~ ^[0-9]+$ ]] || LAST_ID=0
 
-echo "$(date '+%Y.%m.%d %H:%M:%S'): run start — LAST_ID=$LAST_ID  levels=$LEVELS  keyword='$KEYWORD'"
+echo "$(date '+%Y.%m.%d %H:%M:%S %Z'): run start — LAST_ID=$LAST_ID  levels=$LEVELS  keyword='$KEYWORD'"
 
 if ! command -v start-cli >/dev/null 2>&1; then
-    echo "$(date '+%Y.%m.%d %H:%M:%S'): ERROR — start-cli not found in PATH: $PATH"
+    echo "$(date '+%Y.%m.%d %H:%M:%S %Z'): ERROR — start-cli not found in PATH: $PATH"
     exit 1
 fi
 
 if ! command -v jq >/dev/null 2>&1; then
-    echo "$(date '+%Y.%m.%d %H:%M:%S'): ERROR — jq not found in PATH: $PATH"
+    echo "$(date '+%Y.%m.%d %H:%M:%S %Z'): ERROR — jq not found in PATH: $PATH"
     exit 1
 fi
 
 NOTIFS=$(start-cli notification list 2>&1)
 NOTIFS_EXIT=$?
 if [ $NOTIFS_EXIT -ne 0 ]; then
-    echo "$(date '+%Y.%m.%d %H:%M:%S'): ERROR — start-cli notification list failed (exit $NOTIFS_EXIT): $NOTIFS"
+    echo "$(date '+%Y.%m.%d %H:%M:%S %Z'): ERROR — start-cli notification list failed (exit $NOTIFS_EXIT): $NOTIFS"
     exit 0
 fi
 if [ -z "$NOTIFS" ]; then
-    echo "$(date '+%Y.%m.%d %H:%M:%S'): no notifications returned — exiting"
+    echo "$(date '+%Y.%m.%d %H:%M:%S %Z'): no notifications returned — exiting"
     exit 0
 fi
 
@@ -1308,7 +1308,7 @@ fi
 # Without tonumber, jq orders strings above numbers, so string IDs always beat $last.
 TOTAL=$(echo "$NOTIFS" | jq 'length' 2>/dev/null || echo "?")
 NEW=$(echo "$NOTIFS" | jq --argjson last "$LAST_ID" '[.[] | select((.id | tonumber) > $last)] | length' 2>/dev/null || echo "?")
-echo "$(date '+%Y.%m.%d %H:%M:%S'): $TOTAL total notifications, $NEW new (id > $LAST_ID)"
+echo "$(date '+%Y.%m.%d %H:%M:%S %Z'): $TOTAL total notifications, $NEW new (id > $LAST_ID)"
 
 MAX_ID=$LAST_ID
 
@@ -1325,18 +1325,18 @@ while IFS= read -r notif; do
     [ "$id" -gt "$MAX_ID" ] && MAX_ID=$id
 
     if [ "$LEVELS" != "all" ] && ! echo ",$LEVELS," | grep -q ",$level,"; then
-        echo "$(date '+%Y.%m.%d %H:%M:%S'): skip id=$id level=$level — not in filter '$LEVELS'"
+        echo "$(date '+%Y.%m.%d %H:%M:%S %Z'): skip id=$id level=$level — not in filter '$LEVELS'"
         continue
     fi
 
     if [ -n "$KEYWORD" ] && ! echo "$title $msg" | grep -qi "$KEYWORD"; then
-        echo "$(date '+%Y.%m.%d %H:%M:%S'): skip id=$id level=$level — keyword '$KEYWORD' not found in: $title"
+        echo "$(date '+%Y.%m.%d %H:%M:%S %Z'): skip id=$id level=$level — keyword '$KEYWORD' not found in: $title"
         continue
     fi
 
-    ts_fmt=$(date -d "$ts" '+%Y.%m.%d %H:%M:%S' 2>/dev/null || echo "$ts" | sed 's/T/ /; s/\..*//' | tr '-' '.')
+    ts_fmt=$(date -d "$ts" '+%Y.%m.%d %H:%M:%S %Z' 2>/dev/null || printf '%s UTC' "$(echo "$ts" | sed 's/T/ /; s/\..*//' | tr '-' '.')")
     level_cap=$(echo "$level" | awk '{print toupper(substr($0,1,1)) tolower(substr($0,2))}')
-    echo "$(date '+%Y.%m.%d %H:%M:%S'): forward id=$id level=$level pkg=$pkg title=$title"
+    echo "$(date '+%Y.%m.%d %H:%M:%S %Z'): forward id=$id level=$level pkg=$pkg title=$title"
     curl -s --max-time 10 \
         -d "${ts_fmt}  [${level_cap}]  ${pkg}  |  ${title} — ${msg}" \
         "$WEBHOOK_URL"
@@ -1344,9 +1344,9 @@ while IFS= read -r notif; do
 
 done < <(echo "$NOTIFS" | jq -c --argjson last "$LAST_ID" '[.[] | select((.id | tonumber) > $last)] | .[]')
 
-echo "$(date '+%Y.%m.%d %H:%M:%S'): run complete — saving MAX_ID=$MAX_ID"
+echo "$(date '+%Y.%m.%d %H:%M:%S %Z'): run complete — saving MAX_ID=$MAX_ID"
 if ! echo "$MAX_ID" > "$STATE_FILE" 2>/dev/null; then
-    echo "$(date '+%Y.%m.%d %H:%M:%S'): ERROR — could not write state file: $STATE_FILE (check permissions)"
+    echo "$(date '+%Y.%m.%d %H:%M:%S %Z'): ERROR — could not write state file: $STATE_FILE (check permissions)"
 fi
 POLLER_BODY_END
 )
@@ -1356,7 +1356,7 @@ POLLER_BODY_END
     encoded_script=$(printf '%s' "$script_content" | base64 -w 0)
 
     local install_ts
-    install_ts=$(date '+%Y.%m.%d %H:%M:%S')
+    install_ts=$(date '+%Y.%m.%d %H:%M:%S %Z')
     local cron_comment="# startos-notif-poller-${name} | Added: ${install_ts} | v${VERSION} | Action: Manage Notification Forwarders | Webhook: ${url} | Levels: ${levels} | Keyword: ${keyword:-none}"
     local cron_line="${schedule} /usr/local/bin/startos-notif-poller-${name} >> /var/log/startos-notif-poller-${name}.log 2>&1"
     encoded_comment=$(printf '%s' "$cron_comment" | base64 -w 0)
@@ -1612,7 +1612,7 @@ _db_server_info() {
     last_backup=$(echo "$db" | jq -r '.value.serverInfo.lastBackup  // "never"')
 
     if [[ "$last_backup" != "never" ]]; then
-        last_backup=$(date -d "$last_backup" '+%Y.%m.%d %H:%M:%S' 2>/dev/null || echo "$last_backup")
+        last_backup=$(date -d "$last_backup" '+%Y.%m.%d %H:%M:%S %Z' 2>/dev/null || echo "$last_backup")
     fi
 
     echo -e "  ${BOLD}Hostname:${NC}      $hostname"
@@ -1779,8 +1779,8 @@ _db_svc_detail() {
     last_bk=$(echo "$db"  | jq -r ".value.packageData[\"$pkg\"].lastBackup          // \"never\"")
     registry=$(echo "$db" | jq -r ".value.packageData[\"$pkg\"].registry             // \"unknown\"")
 
-    [[ "$started" != "unknown" ]] && started=$(date -d "$started" '+%Y.%m.%d %H:%M:%S' 2>/dev/null || echo "$started")
-    [[ "$last_bk" != "never"   ]] && last_bk=$(date -d "$last_bk" '+%Y.%m.%d %H:%M:%S' 2>/dev/null || echo "$last_bk")
+    [[ "$started" != "unknown" ]] && started=$(date -d "$started" '+%Y.%m.%d %H:%M:%S %Z' 2>/dev/null || echo "$started")
+    [[ "$last_bk" != "never"   ]] && last_bk=$(date -d "$last_bk" '+%Y.%m.%d %H:%M:%S %Z' 2>/dev/null || echo "$last_bk")
 
     local state_color="$RED"
     [[ "$desired" == "running" ]] && state_color="$GREEN"
