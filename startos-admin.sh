@@ -2,7 +2,7 @@
 # startos-admin.sh — Interactive admin menu for StartOS servers
 # Usage: chmod +x startos-admin.sh && ./startos-admin.sh
 
-VERSION="16"   # integer — increment on each release
+VERSION="17"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -50,7 +50,7 @@ print_header() {
     clear
     echo -e "${CYAN}${BOLD}"
     echo "  ╔══════════════════════════════════════════╗"
-    echo "  ║      StartOS Admin Menu  v${VERSION}              ║"
+    printf "  ║      StartOS Admin Menu  v%-15s║\n" "${VERSION}"
     echo "  ╚══════════════════════════════════════════╝"
     echo -e "${NC}"
 }
