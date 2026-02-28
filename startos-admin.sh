@@ -2,7 +2,7 @@
 # startos-admin.sh — Interactive admin menu for StartOS servers
 # Usage: chmod +x startos-admin.sh && ./startos-admin.sh
 
-VERSION="23"   # integer — increment on each release
+VERSION="24"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -1124,7 +1124,7 @@ _poller_list_display() {
             | grep -A1 "^# startos-notif-poller-${pname}" 2>/dev/null \
             | tail -1 | awk '{print $1,$2,$3,$4,$5}')
 
-        local state_file="/media/startos/data/startos-admin-poller-state-${pname}"
+        local state_file="/var/lib/startos-admin/startos-admin-poller-state-${pname}"
         local state_val
         if [[ -f "$state_file" ]]; then
             state_val=$(cat "$state_file" 2>/dev/null | tr -d '[:space:]')
@@ -1251,7 +1251,7 @@ _poller_install_flow() {
     echo -e "  ${BOLD}Schedule:${NC} ${CRON_SCHEDULE}"
     echo ""
     echo -e "  ${DIM}Script:  /usr/local/bin/startos-notif-poller-${poller_name}${NC}"
-    echo -e "  ${DIM}State:   /media/startos/data/startos-admin-poller-state-${poller_name}${NC}"
+    echo -e "  ${DIM}State:   /var/lib/startos-admin/startos-admin-poller-state-${poller_name}${NC}"
     echo -e "  ${DIM}Log:     /var/log/startos-notif-poller-${poller_name}.log${NC}"
     echo ""
 
@@ -1281,7 +1281,7 @@ POLLER_NAME=\"${name}\"
 WEBHOOK_URL=\"${url}\"
 LEVELS=\"${levels}\"
 KEYWORD=\"${keyword}\"
-STATE_FILE=\"/media/startos/data/startos-admin-poller-state-${name}\"
+STATE_FILE=\"/var/lib/startos-admin/startos-admin-poller-state-${name}\"
 "
 
     local body_template
@@ -1409,6 +1409,7 @@ if [ "$MAX_ID" = "$LAST_ID" ]; then
 else
     echo "$(_ts): DEBUG writing new MAX_ID=$MAX_ID to $STATE_FILE"
 fi
+mkdir -p "$(dirname "$STATE_FILE")"
 if ! echo "$MAX_ID" > "$STATE_FILE"; then
     echo "$(_ts): ERROR — could not write state file: $STATE_FILE (check permissions)"
 else
@@ -1544,7 +1545,7 @@ _poller_remove_flow() {
 
     # Remove state files AFTER 2nd confirm — root-owned, not accessible inside chroot
     for rname in "${names_to_remove[@]}"; do
-        local state_file="/media/startos/data/startos-admin-poller-state-${rname}"
+        local state_file="/var/lib/startos-admin/startos-admin-poller-state-${rname}"
         if [[ -f "$state_file" ]]; then
             print_info "Removing state file: $state_file"
             sudo rm -f "$state_file"
