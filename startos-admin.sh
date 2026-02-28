@@ -2,7 +2,7 @@
 # startos-admin.sh — Interactive admin menu for StartOS servers
 # Usage: chmod +x startos-admin.sh && ./startos-admin.sh
 
-VERSION="21"   # integer — increment on each release
+VERSION="22"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -1261,17 +1261,6 @@ _poller_install_flow() {
         pause; return
     fi
 
-    # Seed the state file with the current highest notification ID.
-    # This prevents forwarding all historical notifications on first run.
-    print_info "Seeding notification state..."
-    local seed_id=0
-    local notif_list
-    if notif_list=$(start-cli notification list 2>/dev/null) && command -v jq &>/dev/null; then
-        seed_id=$(echo "$notif_list" | jq -r 'if length > 0 then .[0].id else 0 end' 2>/dev/null) || seed_id=0
-    fi
-    echo "$seed_id" | sudo tee "/media/startos/data/startos-admin-poller-state-${poller_name}" > /dev/null
-    print_success "State seeded at notification ID ${seed_id} — only future notifications will be forwarded."
-
     install_notif_poller "$poller_name" "$webhook_url" "$levels" "$keyword" "$CRON_SCHEDULE" || return 1
     # NOTE: server restarts after this — nothing below executes
 }
@@ -1303,18 +1292,19 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 _ts() { date '+%Y.%m.%d %H:%M:%S %Z'; }
 
 # ── State file ────────────────────────────────────────────────────────────
+FIRST_RUN=0
 LAST_ID=0
 if [ -f "$STATE_FILE" ]; then
     RAW_STATE=$(cat "$STATE_FILE")
     LAST_ID=$(printf '%s' "$RAW_STATE" | tr -d '[:space:]')
     echo "$(_ts): DEBUG state file exists — raw=[$RAW_STATE] stripped=[$LAST_ID]"
+    if ! [[ "$LAST_ID" =~ ^[0-9]+$ ]]; then
+        echo "$(_ts): WARN LAST_ID='$LAST_ID' is not a plain integer — resetting to 0"
+        LAST_ID=0
+    fi
 else
-    echo "$(_ts): DEBUG state file not found ($STATE_FILE) — will start from LAST_ID=0"
-fi
-# Guard against corrupt/empty state file
-if ! [[ "$LAST_ID" =~ ^[0-9]+$ ]]; then
-    echo "$(_ts): WARN LAST_ID='$LAST_ID' is not a plain integer — resetting to 0"
-    LAST_ID=0
+    echo "$(_ts): DEBUG state file not found ($STATE_FILE) — first run mode"
+    FIRST_RUN=1
 fi
 
 echo "$(_ts): run start — LAST_ID=$LAST_ID  levels=$LEVELS  keyword='$KEYWORD'"
@@ -1339,6 +1329,14 @@ fi
 if [ -z "$NOTIFS" ]; then
     echo "$(_ts): no notifications returned — exiting"
     exit 0
+fi
+
+# ── First run: seed LAST_ID so only the single most recent notification is forwarded ──
+if [ "$FIRST_RUN" -eq 1 ]; then
+    MAX_RAW=$(echo "$NOTIFS" | jq '[.[].id | tonumber] | max // 0' 2>/dev/null || echo "0")
+    LAST_ID=$(( MAX_RAW - 1 ))
+    [ "$LAST_ID" -lt 0 ] && LAST_ID=0
+    echo "$(_ts): INFO first run — most recent notification id=$MAX_RAW, setting LAST_ID=$LAST_ID so only that notification is forwarded"
 fi
 
 # ── Inspect raw API response ──────────────────────────────────────────────
