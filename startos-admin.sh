@@ -2,7 +2,7 @@
 # startos-admin.sh — Interactive admin menu for StartOS servers
 # Usage: chmod +x startos-admin.sh && ./startos-admin.sh
 
-VERSION="19"   # integer — increment on each release
+VERSION="20"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -1123,11 +1123,34 @@ _poller_list_display() {
         schedule=$(sudo crontab -u root -l 2>/dev/null \
             | grep -A1 "^# startos-notif-poller-${pname}$" 2>/dev/null \
             | tail -1 | awk '{print $1,$2,$3,$4,$5}')
+
+        local state_file="/media/startos/data/startos-admin-poller-state-${pname}"
+        local state_val
+        if [[ -f "$state_file" ]]; then
+            state_val=$(cat "$state_file" 2>/dev/null | tr -d '[:space:]')
+            state_val="${state_val:-(empty)}"
+        else
+            state_val="(file not found)"
+        fi
+
+        local log_file="/var/log/startos-notif-poller-${pname}.log"
+        local log_info
+        if [[ -f "$log_file" ]]; then
+            local log_lines
+            log_lines=$(wc -l < "$log_file" 2>/dev/null || echo "?")
+            log_info="${log_file}  (${log_lines} lines)"
+        else
+            log_info="${log_file}  (not found)"
+        fi
+
         echo -e "  ${CYAN}${BOLD}${i}) ${pname}${NC}"
-        echo -e "     ${DIM}URL:      ${NC}${url}"
-        echo -e "     ${DIM}Levels:   ${NC}${levels}"
-        echo -e "     ${DIM}Keyword:  ${NC}${keyword:-(none)}"
-        echo -e "     ${DIM}Schedule: ${NC}${schedule:-(not found in crontab)}"
+        echo -e "     ${DIM}URL:        ${NC}${url}"
+        echo -e "     ${DIM}Levels:     ${NC}${levels}"
+        echo -e "     ${DIM}Keyword:    ${NC}${keyword:-(none)}"
+        echo -e "     ${DIM}Schedule:   ${NC}${schedule:-(not found in crontab)}"
+        echo -e "     ${DIM}State file: ${NC}${state_file}"
+        echo -e "     ${DIM}Last ID:    ${NC}${state_val}"
+        echo -e "     ${DIM}Log:        ${NC}${log_info}"
         echo ""
         (( i++ ))
     done
