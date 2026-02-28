@@ -2,7 +2,7 @@
 # startos-admin.sh — Interactive admin menu for StartOS servers
 # Usage: chmod +x startos-admin.sh && ./startos-admin.sh
 
-VERSION="17"   # integer — increment on each release
+VERSION="18"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -1276,45 +1276,75 @@ STATE_FILE=\"/media/startos/data/startos-admin-poller-state-${name}\"
 # Cron runs with a minimal PATH — ensure standard locations are included
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
-LAST_ID=0
-[ -f "$STATE_FILE" ] && LAST_ID=$(cat "$STATE_FILE" | tr -d '[:space:]')
-# Ensure LAST_ID is a plain integer (guard against corrupt state file)
-[[ "$LAST_ID" =~ ^[0-9]+$ ]] || LAST_ID=0
+_ts() { date '+%Y.%m.%d %H:%M:%S %Z'; }
 
-echo "$(date '+%Y.%m.%d %H:%M:%S %Z'): run start — LAST_ID=$LAST_ID  levels=$LEVELS  keyword='$KEYWORD'"
+# ── State file ────────────────────────────────────────────────────────────
+LAST_ID=0
+if [ -f "$STATE_FILE" ]; then
+    RAW_STATE=$(cat "$STATE_FILE")
+    LAST_ID=$(printf '%s' "$RAW_STATE" | tr -d '[:space:]')
+    echo "$(_ts): DEBUG state file exists — raw=[$RAW_STATE] stripped=[$LAST_ID]"
+else
+    echo "$(_ts): DEBUG state file not found ($STATE_FILE) — will start from LAST_ID=0"
+fi
+# Guard against corrupt/empty state file
+if ! [[ "$LAST_ID" =~ ^[0-9]+$ ]]; then
+    echo "$(_ts): WARN LAST_ID='$LAST_ID' is not a plain integer — resetting to 0"
+    LAST_ID=0
+fi
+
+echo "$(_ts): run start — LAST_ID=$LAST_ID  levels=$LEVELS  keyword='$KEYWORD'"
 
 if ! command -v start-cli >/dev/null 2>&1; then
-    echo "$(date '+%Y.%m.%d %H:%M:%S %Z'): ERROR — start-cli not found in PATH: $PATH"
+    echo "$(_ts): ERROR — start-cli not found in PATH: $PATH"
     exit 1
 fi
 
 if ! command -v jq >/dev/null 2>&1; then
-    echo "$(date '+%Y.%m.%d %H:%M:%S %Z'): ERROR — jq not found in PATH: $PATH"
+    echo "$(_ts): ERROR — jq not found in PATH: $PATH"
     exit 1
 fi
 
+# ── Fetch notifications ───────────────────────────────────────────────────
 NOTIFS=$(start-cli notification list 2>&1)
 NOTIFS_EXIT=$?
 if [ $NOTIFS_EXIT -ne 0 ]; then
-    echo "$(date '+%Y.%m.%d %H:%M:%S %Z'): ERROR — start-cli notification list failed (exit $NOTIFS_EXIT): $NOTIFS"
+    echo "$(_ts): ERROR — start-cli notification list failed (exit $NOTIFS_EXIT): $NOTIFS"
     exit 0
 fi
 if [ -z "$NOTIFS" ]; then
-    echo "$(date '+%Y.%m.%d %H:%M:%S %Z'): no notifications returned — exiting"
+    echo "$(_ts): no notifications returned — exiting"
     exit 0
 fi
 
-# Use (.id | tonumber) so the filter works whether IDs are JSON strings or numbers.
-# Without tonumber, jq orders strings above numbers, so string IDs always beat $last.
+# ── Inspect raw API response ──────────────────────────────────────────────
 TOTAL=$(echo "$NOTIFS" | jq 'length' 2>/dev/null || echo "?")
-NEW=$(echo "$NOTIFS" | jq --argjson last "$LAST_ID" '[.[] | select((.id | tonumber) > $last)] | length' 2>/dev/null || echo "?")
-echo "$(date '+%Y.%m.%d %H:%M:%S %Z'): $TOTAL total notifications, $NEW new (id > $LAST_ID)"
+echo "$(_ts): DEBUG API returned $TOTAL notification(s)"
 
+# Log the type and raw value of every ID in the response
+ID_DUMP=$(echo "$NOTIFS" | jq -r '.[] | "  id=\(.id) type=\(.id|type)"' 2>/dev/null || echo "  (jq failed)")
+echo "$(_ts): DEBUG all notification IDs from API:"
+echo "$ID_DUMP"
+
+# Log which IDs the jq filter considers new (before looping)
+NEW_IDS=$(echo "$NOTIFS" | jq -r --argjson last "$LAST_ID" \
+    '[.[] | select((.id | tonumber) > $last) | .id] | @json' 2>/dev/null || echo "?")
+NEW=$(echo "$NOTIFS" | jq --argjson last "$LAST_ID" \
+    '[.[] | select((.id | tonumber) > $last)] | length' 2>/dev/null || echo "?")
+echo "$(_ts): $TOTAL total, $NEW new (id > $LAST_ID) — new IDs: $NEW_IDS"
+
+# ── Process new notifications ─────────────────────────────────────────────
 MAX_ID=$LAST_ID
 
 while IFS= read -r notif; do
+    # Log the raw JSON for this notification for inspection
+    echo "$(_ts): DEBUG raw notif JSON: $notif"
+
     # Normalize id to a plain integer string regardless of JSON type
-    id=$(echo "$notif"    | jq -r '.id | tonumber | tostring')
+    raw_id=$(echo "$notif" | jq -r '.id')
+    id=$(echo "$notif"     | jq -r '.id | tonumber | tostring')
+    echo "$(_ts): DEBUG raw_id=[$raw_id] normalized id=[$id] current MAX_ID=[$MAX_ID]"
+
     level=$(echo "$notif" | jq -r '.level')
     title=$(echo "$notif" | jq -r '.title')
     msg=$(echo "$notif"   | jq -r '.message')
@@ -1322,31 +1352,46 @@ while IFS= read -r notif; do
     ts=$(echo "$notif"    | jq -r '.createdAt')
 
     # Advance MAX_ID for ALL seen notifications, not just forwarded ones
-    [ "$id" -gt "$MAX_ID" ] && MAX_ID=$id
+    if [ "$id" -gt "$MAX_ID" ]; then
+        echo "$(_ts): DEBUG advancing MAX_ID: $MAX_ID → $id"
+        MAX_ID=$id
+    fi
 
     if [ "$LEVELS" != "all" ] && ! echo ",$LEVELS," | grep -q ",$level,"; then
-        echo "$(date '+%Y.%m.%d %H:%M:%S %Z'): skip id=$id level=$level — not in filter '$LEVELS'"
+        echo "$(_ts): skip id=$id level=$level — not in filter '$LEVELS'"
         continue
     fi
 
     if [ -n "$KEYWORD" ] && ! echo "$title $msg" | grep -qi "$KEYWORD"; then
-        echo "$(date '+%Y.%m.%d %H:%M:%S %Z'): skip id=$id level=$level — keyword '$KEYWORD' not found in: $title"
+        echo "$(_ts): skip id=$id level=$level — keyword '$KEYWORD' not found in: $title"
         continue
     fi
 
     ts_fmt=$(date -d "$ts" '+%Y.%m.%d %H:%M:%S %Z' 2>/dev/null || printf '%s UTC' "$(echo "$ts" | sed 's/T/ /; s/\..*//' | tr '-' '.')")
     level_cap=$(echo "$level" | awk '{print toupper(substr($0,1,1)) tolower(substr($0,2))}')
-    echo "$(date '+%Y.%m.%d %H:%M:%S %Z'): forward id=$id level=$level pkg=$pkg title=$title"
-    curl -s --max-time 10 \
+    echo "$(_ts): forward id=$id level=$level pkg=$pkg title=$title"
+    CURL_OUT=$(curl -s -w "\nHTTP_STATUS:%{http_code}" --max-time 10 \
         -d "${ts_fmt}  [${level_cap}]  ${pkg}  |  ${title} — ${msg}" \
-        "$WEBHOOK_URL"
-    echo ""
+        "$WEBHOOK_URL" 2>&1)
+    CURL_EXIT=$?
+    HTTP_STATUS=$(echo "$CURL_OUT" | grep 'HTTP_STATUS:' | cut -d: -f2)
+    CURL_BODY=$(echo "$CURL_OUT" | grep -v 'HTTP_STATUS:')
+    echo "$(_ts): DEBUG curl exit=$CURL_EXIT http=$HTTP_STATUS response=[$CURL_BODY]"
 
 done < <(echo "$NOTIFS" | jq -c --argjson last "$LAST_ID" '[.[] | select((.id | tonumber) > $last)] | .[]')
 
-echo "$(date '+%Y.%m.%d %H:%M:%S %Z'): run complete — saving MAX_ID=$MAX_ID"
-if ! echo "$MAX_ID" > "$STATE_FILE" 2>/dev/null; then
-    echo "$(date '+%Y.%m.%d %H:%M:%S %Z'): ERROR — could not write state file: $STATE_FILE (check permissions)"
+# ── Persist state ─────────────────────────────────────────────────────────
+echo "$(_ts): run complete — MAX_ID=$MAX_ID (was LAST_ID=$LAST_ID)"
+if [ "$MAX_ID" = "$LAST_ID" ]; then
+    echo "$(_ts): DEBUG no new notifications processed — state file unchanged"
+else
+    echo "$(_ts): DEBUG writing new MAX_ID=$MAX_ID to $STATE_FILE"
+fi
+if ! echo "$MAX_ID" > "$STATE_FILE"; then
+    echo "$(_ts): ERROR — could not write state file: $STATE_FILE (check permissions)"
+else
+    VERIFY=$(cat "$STATE_FILE" | tr -d '[:space:]')
+    echo "$(_ts): DEBUG state file write confirmed — read-back=[$VERIFY]"
 fi
 POLLER_BODY_END
 )
