@@ -2,7 +2,7 @@
 # startos-admin.sh — Interactive admin menu for StartOS servers
 # Usage: chmod +x startos-admin.sh && ./startos-admin.sh
 
-VERSION="18"   # integer — increment on each release
+VERSION="19"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -1371,7 +1371,7 @@ while IFS= read -r notif; do
     level_cap=$(echo "$level" | awk '{print toupper(substr($0,1,1)) tolower(substr($0,2))}')
     echo "$(_ts): forward id=$id level=$level pkg=$pkg title=$title"
     CURL_OUT=$(curl -s -w "\nHTTP_STATUS:%{http_code}" --max-time 10 \
-        -d "${ts_fmt}  [${level_cap}]  ${pkg}  |  ${title} — ${msg}" \
+        -d "${ts_fmt}  [${level_cap}]  #${id}  ${pkg}  |  ${title} — ${msg}" \
         "$WEBHOOK_URL" 2>&1)
     CURL_EXIT=$?
     HTTP_STATUS=$(echo "$CURL_OUT" | grep 'HTTP_STATUS:' | cut -d: -f2)
