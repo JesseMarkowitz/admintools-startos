@@ -2,7 +2,7 @@
 # startos-admin.sh — Interactive admin menu for StartOS servers
 # Usage: chmod +x startos-admin.sh && ./startos-admin.sh
 
-VERSION="22"   # integer — increment on each release
+VERSION="23"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -1121,7 +1121,7 @@ _poller_list_display() {
         levels=$(grep   '^LEVELS='      "$script" 2>/dev/null | cut -d'"' -f2)
         keyword=$(grep  '^KEYWORD='     "$script" 2>/dev/null | cut -d'"' -f2)
         schedule=$(sudo crontab -u root -l 2>/dev/null \
-            | grep -A1 "^# startos-notif-poller-${pname}$" 2>/dev/null \
+            | grep -A1 "^# startos-notif-poller-${pname}" 2>/dev/null \
             | tail -1 | awk '{print $1,$2,$3,$4,$5}')
 
         local state_file="/media/startos/data/startos-admin-poller-state-${pname}"
