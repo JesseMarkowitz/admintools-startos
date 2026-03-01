@@ -2,7 +2,7 @@
 # startos-admin.sh — Interactive admin menu for StartOS servers
 # Usage: chmod +x startos-admin.sh && ./startos-admin.sh
 
-VERSION="30"   # integer — increment on each release
+VERSION="31"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -1090,6 +1090,29 @@ _pick_poll_frequency() {
     done
 }
 
+# Send a sample message to a webhook URL and display the result. Non-blocking.
+# Usage: _test_webhook forwarder-name url
+_test_webhook() {
+    local pname="$1" url="$2"
+    echo ""
+    echo -e "  ${DIM}Sending test message to webhook...${NC}"
+    local ts_test
+    ts_test=$(date '+%Y.%m.%d %H:%M:%S %Z')
+    local test_msg="${ts_test}  [${pname}]  [Info]  #0  test  |  Test — This is a test from startos-admin.sh"
+    local out exit_code http body
+    out=$(curl -s -w "\nHTTP_STATUS:%{http_code}" --max-time 10 -d "$test_msg" "$url" 2>&1)
+    exit_code=$?
+    http=$(echo "$out" | grep 'HTTP_STATUS:' | cut -d: -f2)
+    body=$(echo "$out" | grep -v 'HTTP_STATUS:')
+    if   [[ $exit_code -eq 28 ]]; then print_warn "Timed out after 10s"
+    elif [[ $exit_code -ne 0 ]];  then print_warn "curl failed — exit $exit_code"
+    elif [[ "$http" =~ ^2 ]];     then print_success "OK — HTTP $http"
+    else                               print_warn "HTTP $http (expected 2xx)"
+    fi
+    [[ -n "$body" ]] && echo -e "  ${DIM}Response: ${body}${NC}"
+    echo ""
+}
+
 # Fill an array variable with names of installed forwarders (suffix after prefix).
 # Returns 1 (with message + pause) if none are installed.
 # Usage: _poller_get_names myarray || return 1
@@ -1263,7 +1286,147 @@ _poller_install_flow() {
     echo -e "  All older notifications are skipped to avoid a historical flood."
     echo ""
 
+    local _tw_yn
+    _read _tw_yn "  Test this webhook now? [y/N]: "
+    [[ "${_tw_yn,,}" == "y" ]] && _test_webhook "$poller_name" "$webhook_url"
+
     if ! confirm "Install this forwarder?"; then
+        [[ $_BACK -eq 1 ]] && return 1
+        print_info "Cancelled."
+        pause; return
+    fi
+
+    install_notif_poller "$poller_name" "$webhook_url" "$levels" "$keyword" "$CRON_SCHEDULE" || return 1
+    # NOTE: server restarts after this — nothing below executes
+}
+
+_poller_edit_flow() {
+    print_header
+    print_section "Edit Notification Forwarder"
+    echo ""
+    _nav_tip
+
+    local script_names=()
+    _poller_get_names script_names || return
+
+    local i=1
+    for pname in "${script_names[@]}"; do
+        echo -e "    ${BOLD}${i})${NC} ${pname}"
+        (( i++ ))
+    done
+    echo ""
+
+    local choice
+    while true; do
+        _read choice "  Choice [1-$((i-1))]: " || return 1
+        [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice < i )) && break
+        print_warn "Enter a number between 1 and $((i-1))."
+    done
+    local poller_name="${script_names[$((choice-1))]}"
+    local script_path="${_POLLER_BIN_PREFIX}${poller_name}"
+
+    # Read current config from installed script
+    local cur_url cur_levels cur_keyword cur_schedule
+    cur_url=$(grep      '^WEBHOOK_URL='  "$script_path" 2>/dev/null | cut -d'"' -f2)
+    cur_levels=$(grep   '^LEVELS='       "$script_path" 2>/dev/null | cut -d'"' -f2)
+    cur_keyword=$(grep  '^KEYWORD='      "$script_path" 2>/dev/null | cut -d'"' -f2)
+    cur_schedule=$(sudo crontab -u root -l 2>/dev/null \
+        | grep -A1 "^# startos-notif-poller-${poller_name}" | tail -1 \
+        | awk '{print $1,$2,$3,$4,$5}')
+
+    echo ""
+    print_section "Editing: ${poller_name}"
+    echo -e "  ${DIM}Press Enter to keep current value.${NC}"
+    echo ""
+
+    # Step 1: URL
+    echo -e "  ${DIM}Current URL: ${cur_url}${NC}"
+    local webhook_url
+    _read webhook_url "  New URL [Enter to keep]: " || return 1
+    webhook_url="${webhook_url:-$cur_url}"
+    [[ -z "$webhook_url" ]] && { print_warn "URL cannot be empty."; pause; return; }
+
+    # Step 2: Levels
+    echo ""
+    echo -e "  ${BOLD}Filter by notification level:${NC}"
+    echo -e "    ${BOLD}0)${NC} Keep current  ${DIM}(${cur_levels})${NC}"
+    echo -e "    ${BOLD}1)${NC} All levels"
+    echo -e "    ${BOLD}2)${NC} Warning and above  ${DIM}(warning, error)${NC}"
+    echo -e "    ${BOLD}3)${NC} Error only"
+    echo -e "    ${BOLD}4)${NC} Custom selection"
+    echo ""
+    local levels="$cur_levels"
+    while true; do
+        _read lvl_choice "  Choice [0-4, default 0]: " || return 1
+        case "${lvl_choice:-0}" in
+            0) break ;;
+            1) levels="all";           break ;;
+            2) levels="warning,error"; break ;;
+            3) levels="error";         break ;;
+            4)
+                local custom_levels=()
+                echo ""
+                for lvl_name in info success warning error; do
+                    local yn_input
+                    _read yn_input "  Include ${lvl_name}? [y/N]: " || return 1
+                    [[ "${yn_input,,}" =~ ^y ]] && custom_levels+=("$lvl_name")
+                done
+                if [[ ${#custom_levels[@]} -eq 0 ]]; then
+                    print_warn "No levels selected — keeping current."
+                else
+                    levels=$(IFS=','; echo "${custom_levels[*]}")
+                fi
+                break ;;
+            *) print_warn "Enter 0, 1, 2, 3, or 4." ;;
+        esac
+    done
+
+    # Step 3: Keyword
+    echo ""
+    echo -e "  ${DIM}Current keyword: ${cur_keyword:-(none)}${NC}"
+    echo -e "  ${DIM}Case-insensitive. Searches title and message.${NC}"
+    local keyword="$cur_keyword"
+    if [[ -n "$cur_keyword" ]]; then
+        local kw_clear
+        _read kw_clear "  Clear keyword filter? [y/N]: " || return 1
+        if [[ "${kw_clear,,}" == "y" ]]; then
+            keyword=""
+        else
+            _read keyword "  New keyword [Enter to keep '${cur_keyword}']: " || return 1
+            keyword="${keyword:-$cur_keyword}"
+        fi
+    else
+        _read keyword "  Keyword filter — forward only if title/message contains (blank = none): " || return 1
+    fi
+
+    # Step 4: Schedule
+    echo ""
+    echo -e "  ${DIM}Current schedule: ${cur_schedule:-(not found)}${NC}"
+    local sched_keep
+    _read sched_keep "  Keep current schedule? [Y/n]: " || return 1
+    local CRON_SCHEDULE
+    if [[ "${sched_keep,,}" == "n" ]]; then
+        _pick_poll_frequency || return 1
+    else
+        CRON_SCHEDULE="${cur_schedule}"
+        [[ -z "$CRON_SCHEDULE" ]] && { print_warn "No current schedule found. Must select new."; _pick_poll_frequency || return 1; }
+    fi
+
+    # Step 5: Review + optional test
+    echo ""
+    print_section "Review Changes: ${poller_name}"
+    echo ""
+    echo -e "  ${BOLD}URL:${NC}      ${webhook_url}"
+    echo -e "  ${BOLD}Levels:${NC}   ${levels}"
+    echo -e "  ${BOLD}Keyword:${NC}  ${keyword:-(none)}"
+    echo -e "  ${BOLD}Schedule:${NC} ${CRON_SCHEDULE}"
+    echo ""
+
+    local _tw_yn
+    _read _tw_yn "  Test this webhook now? [y/N]: "
+    [[ "${_tw_yn,,}" == "y" ]] && _test_webhook "$poller_name" "$webhook_url"
+
+    if ! confirm "Apply changes? (server will restart automatically)"; then
         [[ $_BACK -eq 1 ]] && return 1
         print_info "Cancelled."
         pause; return
@@ -1626,33 +1789,125 @@ _poller_view_log() {
     pause
 }
 
+_poller_state_flow() {
+    print_header
+    print_section "Manage Forwarder State"
+    echo ""
+
+    local script_names=()
+    _poller_get_names script_names || return
+
+    local i=1
+    for pname in "${script_names[@]}"; do
+        local sv="(not found)"
+        [[ -f "${_POLLER_STATE_PREFIX}${pname}" ]] && \
+            sv=$(cat "${_POLLER_STATE_PREFIX}${pname}" 2>/dev/null | tr -d '[:space:]') && \
+            sv="${sv:-(empty)}"
+        echo -e "    ${BOLD}${i})${NC} ${pname}  ${DIM}(last ID: ${sv})${NC}"
+        (( i++ ))
+    done
+    echo ""
+
+    local choice
+    while true; do
+        _read choice "  Choice [1-$((i-1))]: " || return 1
+        [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice < i )) && break
+        print_warn "Enter a number between 1 and $((i-1))."
+    done
+    local pname="${script_names[$((choice-1))]}"
+    local state_file="${_POLLER_STATE_PREFIX}${pname}"
+
+    local sv="(file not found)"
+    [[ -f "$state_file" ]] && sv=$(cat "$state_file" 2>/dev/null | tr -d '[:space:]') && sv="${sv:-(empty)}"
+
+    echo ""
+    echo -e "  ${BOLD}Forwarder:${NC}         ${pname}"
+    echo -e "  ${BOLD}State file:${NC}        ${state_file}"
+    echo -e "  ${BOLD}Last forwarded ID:${NC} ${sv}"
+    echo ""
+    echo -e "    ${BOLD}1)${NC} Delete state file  ${DIM}(next run seeds from most recent notification)${NC}"
+    echo -e "    ${BOLD}2)${NC} Set to current max  ${DIM}(skip all existing, forward only future)${NC}"
+    echo -e "    ${BOLD}3)${NC} Set to specific ID"
+    echo -e "    ${DIM}0) Back${NC}"
+    echo ""
+
+    local action
+    while true; do
+        _read action "  Choice [0-3]: " || return 1
+        case "$action" in 0|1|2|3) break ;; *) print_warn "Enter 0, 1, 2, or 3." ;; esac
+    done
+
+    case "$action" in
+        0) return ;;
+        1)
+            if confirm "Delete state file for '${pname}'?"; then
+                sudo rm -f "$state_file"
+                print_success "State file deleted. Next run will forward only the most recent notification."
+            else
+                print_info "Cancelled."
+            fi ;;
+        2)
+            echo ""
+            print_info "Querying current max notification ID..."
+            local cur_max
+            cur_max=$(start-cli notification list 2>/dev/null \
+                | jq '[.[].id | tonumber] | max // 0' 2>/dev/null || echo "0")
+            echo -e "  Current max ID: ${cur_max}"
+            if confirm "Set last-forwarded ID to ${cur_max}?"; then
+                echo "$cur_max" | sudo tee "$state_file" >/dev/null
+                print_success "State set to ${cur_max}. Only notifications newer than this will be forwarded."
+            else
+                print_info "Cancelled."
+            fi ;;
+        3)
+            local new_id
+            while true; do
+                _read new_id "  Enter new last-forwarded ID: " || return 1
+                [[ "$new_id" =~ ^[0-9]+$ ]] && break
+                print_warn "Must be a non-negative integer."
+            done
+            if confirm "Set last-forwarded ID to ${new_id}?"; then
+                echo "$new_id" | sudo tee "$state_file" >/dev/null
+                print_success "State set to ${new_id}."
+            else
+                print_info "Cancelled."
+            fi ;;
+    esac
+    echo ""
+    pause
+}
+
 # Top-level submenu for notification forwarder management
 menu_manage_notif_pollers() {
     while true; do
         print_header
         print_section "Manage Notification Forwarders"
         echo ""
-        echo -e "    ${CYAN}${BOLD}1)${NC} Install / update a notification forwarder"
-        echo -e "    ${CYAN}${BOLD}2)${NC} List installed forwarders"
-        echo -e "    ${CYAN}${BOLD}3)${NC} Remove a forwarder"
-        echo -e "    ${CYAN}${BOLD}4)${NC} View forwarder log"
+        echo -e "    ${CYAN}${BOLD}1)${NC} Install a new notification forwarder"
+        echo -e "    ${CYAN}${BOLD}2)${NC} Edit an existing forwarder"
+        echo -e "    ${CYAN}${BOLD}3)${NC} List installed forwarders"
+        echo -e "    ${CYAN}${BOLD}4)${NC} Remove a forwarder"
+        echo -e "    ${CYAN}${BOLD}5)${NC} View forwarder log"
+        echo -e "    ${CYAN}${BOLD}6)${NC} Manage forwarder state"
         echo ""
         echo -e "    ${DIM}0) Back${NC}"
         echo ""
         _read sub_choice "  $(echo -e "${BOLD}Choice:${NC} ")" || return 1
         case "$sub_choice" in
             1) _poller_install_flow || return 1 ;;
-            2)
+            2) _poller_edit_flow    || return 1 ;;
+            3)
                 print_header
                 print_section "Installed Notification Forwarders"
                 echo ""
                 _poller_list_display || true
                 pause
                 ;;
-            3) _poller_remove_flow || return 1 ;;
-            4) _poller_view_log || return 1 ;;
+            4) _poller_remove_flow  || return 1 ;;
+            5) _poller_view_log     || return 1 ;;
+            6) _poller_state_flow   || return 1 ;;
             0) return ;;
-            *) print_warn "Enter 0-4." ; sleep 1 ;;
+            *) print_warn "Enter 0-6." ; sleep 1 ;;
         esac
     done
 }
