@@ -2,7 +2,7 @@
 # startos-admin.sh — Interactive admin menu for StartOS servers
 # Usage: chmod +x startos-admin.sh && ./startos-admin.sh
 
-VERSION="32"   # integer — increment on each release
+VERSION="33"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -2457,16 +2457,22 @@ main_menu() {
     check_for_update
     while true; do
         print_header
+        # Counts for display
+        local _cron_n _fwd_arr _fwd_n
+        _cron_n=$(sudo crontab -u root -l 2>/dev/null | grep -c '^# startos-admin v' 2>/dev/null || echo 0)
+        _fwd_arr=("${_POLLER_BIN_PREFIX}"*)
+        [[ -e "${_fwd_arr[0]}" ]] && _fwd_n=${#_fwd_arr[@]} || _fwd_n=0
+
         echo -e "  ${BOLD}Select an action:${NC}"
         echo ""
         echo -e "    ${CYAN}${BOLD}1)${NC} Documentation"
         echo -e "    ${CYAN}${BOLD}2)${NC} Create a StartOS notification"
         echo -e "    ${CYAN}${BOLD}3)${NC} Display disk used by services"
         echo -e "    ${CYAN}${BOLD}4)${NC} Display memory used by services"
-        echo -e "    ${CYAN}${BOLD}5)${NC} Manage cron jobs"
+        echo -e "    ${CYAN}${BOLD}5)${NC} Manage cron jobs  ${DIM}(${_cron_n})${NC}"
         echo -e "    ${CYAN}${BOLD}6)${NC} Schedule backups"
         echo -e "    ${CYAN}${BOLD}7)${NC} Schedule stay-alive curl"
-        echo -e "    ${CYAN}${BOLD}8)${NC} Manage notification forwarders"
+        echo -e "    ${CYAN}${BOLD}8)${NC} Manage notification forwarders  ${DIM}(${_fwd_n})${NC}"
         echo -e "    ${CYAN}${BOLD}9)${NC} System Database"
         echo ""
         echo -e "    ${DIM}0) Exit${NC}"
