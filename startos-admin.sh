@@ -2,7 +2,7 @@
 # startos-admin.sh — Interactive admin menu for StartOS servers
 # Usage: chmod +x startos-admin.sh && ./startos-admin.sh
 
-VERSION="25"   # integer — increment on each release
+VERSION="26"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -837,9 +837,8 @@ menu_schedule_backup() {
         echo -e "    ${BOLD}${i})${NC} ${pkg}"
         (( i++ ))
     done
-    echo -e "    ${BOLD}0)${NC} All packages"
     echo ""
-    print_info "For multiple packages enter numbers separated by commas (e.g. 1,3,4)"
+    print_info "Enter numbers separated by commas (e.g. 1,3,4), or 'all' for all packages"
     echo ""
 
     local selected_packages=()
@@ -1044,7 +1043,7 @@ menu_schedule_stay_alive() {
             3) CRON_SCHEDULE="*/30 * * * *"; break ;;
             4) CRON_SCHEDULE="0 * * * *";    break ;;
             5)
-                _read CRON_SCHEDULE "  Enter cron expression: " || return 1
+                _read CRON_SCHEDULE "  Enter cron expression (e.g. 0 2 * * 1-5): " || return 1
                 [[ -n "$CRON_SCHEDULE" ]] && break
                 print_warn "Expression cannot be empty."
                 ;;
@@ -1095,7 +1094,7 @@ _pick_poll_frequency() {
             3) CRON_SCHEDULE="*/30 * * * *"; return 0 ;;
             4) CRON_SCHEDULE="0 * * * *";    return 0 ;;
             5)
-                _read CRON_SCHEDULE "  Enter cron expression: " || return 1
+                _read CRON_SCHEDULE "  Enter cron expression (e.g. 0 2 * * 1-5): " || return 1
                 [[ -n "$CRON_SCHEDULE" ]] && return 0
                 print_warn "Expression cannot be empty."
                 ;;
@@ -1109,7 +1108,7 @@ _pick_poll_frequency() {
 _poller_list_display() {
     local all_scripts=(/usr/local/bin/startos-notif-poller-*)
     if [[ ! -e "${all_scripts[0]}" ]]; then
-        print_info "No notification pollers installed."
+        print_info "No notification forwarders installed."
         return 1
     fi
 
@@ -1160,14 +1159,14 @@ _poller_list_display() {
 # Wizard for installing or updating a named poller
 _poller_install_flow() {
     print_header
-    print_section "Install / Update Notification Poller"
+    print_section "Install / Update Notification Forwarder"
     echo ""
     _nav_tip
 
     # Step 0: Poller name
     local poller_name=""
     while true; do
-        _read poller_name "  Poller name (e.g. backup-errors): " || return 1
+        _read poller_name "  Forwarder name (e.g. backup-errors): " || return 1
         if [[ -z "$poller_name" ]]; then
             print_warn "Name cannot be empty."
         elif ! [[ "$poller_name" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]*$ ]]; then
@@ -1178,7 +1177,7 @@ _poller_install_flow() {
     done
 
     if [[ -f "/usr/local/bin/startos-notif-poller-${poller_name}" ]]; then
-        print_warn "A poller named '${poller_name}' already exists — this will update it."
+        print_warn "A forwarder named '${poller_name}' already exists — this will update it."
         if ! confirm "Continue and overwrite?"; then
             [[ $_BACK -eq 1 ]] && return 1
             print_info "Cancelled."
@@ -1242,7 +1241,7 @@ _poller_install_flow() {
 
     # Step 5: Preview
     echo ""
-    print_section "Review Notification Poller"
+    print_section "Review Notification Forwarder"
     echo ""
     echo -e "  ${BOLD}Name:${NC}     ${poller_name}"
     echo -e "  ${BOLD}URL:${NC}      ${webhook_url}"
@@ -1255,7 +1254,7 @@ _poller_install_flow() {
     echo -e "  ${DIM}Log:     /var/log/startos-notif-poller-${poller_name}.log${NC}"
     echo ""
 
-    if ! confirm "Install this poller?"; then
+    if ! confirm "Install this forwarder?"; then
         [[ $_BACK -eq 1 ]] && return 1
         print_info "Cancelled."
         pause; return
@@ -1433,7 +1432,7 @@ POLLER_BODY_END
     echo ""
     echo -e "  ${RED}${BOLD}┌─────────────────────────────────────────────────┐${NC}"
     echo -e "  ${RED}${BOLD}│  WARNING: SERVER WILL AUTOMATICALLY RESTART     │${NC}"
-    echo -e "  ${RED}${BOLD}│  after the poller is installed.                 │${NC}"
+    echo -e "  ${RED}${BOLD}│  after the forwarder is installed.              │${NC}"
     echo -e "  ${RED}${BOLD}│  Save any work and close open connections.      │${NC}"
     echo -e "  ${RED}${BOLD}└─────────────────────────────────────────────────┘${NC}"
     echo ""
@@ -1444,7 +1443,7 @@ POLLER_BODY_END
         return 1
     fi
 
-    print_success "Poller staged. Entering persistence mode now."
+    print_success "Forwarder staged. Entering persistence mode now."
     echo ""
 
     # Remove any existing entry for this poller name, then write the new script
@@ -1460,11 +1459,11 @@ exit
 EOF
 
     if [[ $chroot_exit -eq 0 ]]; then
-        print_success "Poller '${name}' installed persistently."
+        print_success "Forwarder '${name}' installed persistently."
         print_warn "The server will restart shortly — your SSH session will disconnect."
         print_warn "After reconnecting, test with: /usr/local/bin/startos-notif-poller-${name}"
     else
-        print_error "chroot-and-upgrade failed (exit $chroot_exit). Poller was not installed."
+        print_error "chroot-and-upgrade failed (exit $chroot_exit). Forwarder was not installed."
         pause
     fi
 }
@@ -1472,12 +1471,12 @@ EOF
 # Wizard for removing a named poller
 _poller_remove_flow() {
     print_header
-    print_section "Remove Notification Poller"
+    print_section "Remove Notification Forwarder"
     echo ""
 
     local all_scripts=(/usr/local/bin/startos-notif-poller-*)
     if [[ ! -e "${all_scripts[0]}" ]]; then
-        print_info "No notification pollers installed."
+        print_info "No notification forwarders installed."
         pause; return
     fi
 
@@ -1486,7 +1485,7 @@ _poller_remove_flow() {
         script_names+=("${s##*/startos-notif-poller-}")
     done
 
-    echo -e "  ${BOLD}Select poller(s) to remove:${NC}"
+    echo -e "  ${BOLD}Select forwarder(s) to remove:${NC}"
     local i=1
     for pname in "${script_names[@]}"; do
         echo -e "    ${BOLD}${i})${NC} ${pname}"
@@ -1522,8 +1521,8 @@ _poller_remove_flow() {
     echo ""
     local names_display
     names_display=$(printf "'%s' " "${names_to_remove[@]}")
-    print_warn "This will permanently remove pollers: ${names_display}"
-    if ! confirm "Remove the selected poller(s)?"; then
+    print_warn "This will permanently remove forwarders: ${names_display}"
+    if ! confirm "Remove the selected forwarder(s)?"; then
         [[ $_BACK -eq 1 ]] && return 1
         print_info "Cancelled."
         pause; return
@@ -1532,7 +1531,7 @@ _poller_remove_flow() {
     echo ""
     echo -e "  ${RED}${BOLD}┌─────────────────────────────────────────────────┐${NC}"
     echo -e "  ${RED}${BOLD}│  WARNING: SERVER WILL AUTOMATICALLY RESTART     │${NC}"
-    echo -e "  ${RED}${BOLD}│  after the poller(s) are removed.               │${NC}"
+    echo -e "  ${RED}${BOLD}│  after the forwarder(s) are removed.            │${NC}"
     echo -e "  ${RED}${BOLD}│  Save any work and close open connections.      │${NC}"
     echo -e "  ${RED}${BOLD}└─────────────────────────────────────────────────┘${NC}"
     echo ""
@@ -1572,7 +1571,7 @@ EOF
         print_success "Removed: ${names_display}"
         print_warn "The server will restart shortly — your SSH session will disconnect."
     else
-        print_error "chroot-and-upgrade failed (exit $chroot_exit). Poller(s) may not have been fully removed."
+        print_error "chroot-and-upgrade failed (exit $chroot_exit). Forwarder(s) may not have been fully removed."
         pause
     fi
 }
@@ -1580,12 +1579,12 @@ EOF
 # Display the last 50 lines of a poller's log file.
 _poller_view_log() {
     print_header
-    print_section "View Poller Log"
+    print_section "View Forwarder Log"
     echo ""
 
     local all_scripts=(/usr/local/bin/startos-notif-poller-*)
     if [[ ! -e "${all_scripts[0]}" ]]; then
-        print_info "No notification pollers installed."
+        print_info "No notification forwarders installed."
         pause; return
     fi
 
@@ -1615,12 +1614,12 @@ _poller_view_log() {
     local log_file="/var/log/startos-notif-poller-${log_name}.log"
 
     print_header
-    print_section "Poller Log: ${log_name}"
+    print_section "Forwarder Log: ${log_name}"
     echo ""
 
     if [[ ! -f "$log_file" ]]; then
         print_info "Log file not found: $log_file"
-        print_info "The poller may not have run yet."
+        print_info "The forwarder may not have run yet."
     else
         echo -e "  ${DIM}(last 50 lines of $log_file)${NC}"
         echo ""
@@ -1637,10 +1636,10 @@ menu_manage_notif_pollers() {
         print_header
         print_section "Manage Notification Forwarders"
         echo ""
-        echo -e "    ${CYAN}${BOLD}1)${NC} Install / update a notification poller"
-        echo -e "    ${CYAN}${BOLD}2)${NC} List installed pollers"
-        echo -e "    ${CYAN}${BOLD}3)${NC} Remove a poller"
-        echo -e "    ${CYAN}${BOLD}4)${NC} View poller log"
+        echo -e "    ${CYAN}${BOLD}1)${NC} Install / update a notification forwarder"
+        echo -e "    ${CYAN}${BOLD}2)${NC} List installed forwarders"
+        echo -e "    ${CYAN}${BOLD}3)${NC} Remove a forwarder"
+        echo -e "    ${CYAN}${BOLD}4)${NC} View forwarder log"
         echo ""
         echo -e "    ${DIM}0) Back${NC}"
         echo ""
@@ -1649,7 +1648,7 @@ menu_manage_notif_pollers() {
             1) _poller_install_flow || return 1 ;;
             2)
                 print_header
-                print_section "Installed Notification Pollers"
+                print_section "Installed Notification Forwarders"
                 echo ""
                 _poller_list_display || true
                 pause
