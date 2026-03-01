@@ -2,7 +2,7 @@
 # startos-admin.sh — Interactive admin menu for StartOS servers
 # Usage: chmod +x startos-admin.sh && ./startos-admin.sh
 
-VERSION="26"   # integer — increment on each release
+VERSION="27"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -17,6 +17,13 @@ CYAN="\e[36m"
 BOLD="\e[1m"
 DIM="\e[2m"
 NC="\e[0m"
+
+# ─────────────────────────────────────────────
+# Path Constants
+# ─────────────────────────────────────────────
+_POLLER_BIN_PREFIX="/usr/local/bin/startos-notif-poller-"
+_POLLER_STATE_PREFIX="/var/lib/startos-admin/startos-admin-poller-state-"
+_POLLER_LOG_PREFIX="/var/log/startos-notif-poller-"
 
 # ─────────────────────────────────────────────
 # Navigation — "exit" / "back" support
@@ -98,6 +105,20 @@ confirm() {
     done
 }
 
+# Print the standard server-restart warning box.
+# $1 = operation text for the variable line (e.g. "after the cron job is installed.")
+_warn_restart() {
+    local msg
+    printf -v msg "%-47s" "$1"
+    echo ""
+    echo -e "  ${RED}${BOLD}┌─────────────────────────────────────────────────┐${NC}"
+    echo -e "  ${RED}${BOLD}│  WARNING: SERVER WILL AUTOMATICALLY RESTART     │${NC}"
+    echo -e "  ${RED}${BOLD}│  ${msg}│${NC}"
+    echo -e "  ${RED}${BOLD}│  Save any work and close open connections.      │${NC}"
+    echo -e "  ${RED}${BOLD}└─────────────────────────────────────────────────┘${NC}"
+    echo ""
+}
+
 # Run a command, show colored output, return its exit code
 run_cmd() {
     local output exit_code=0
@@ -158,13 +179,7 @@ install_cron_job() {
     fi
 
     # Restart warning — shown before the point of no return
-    echo ""
-    echo -e "  ${RED}${BOLD}┌─────────────────────────────────────────────────┐${NC}"
-    echo -e "  ${RED}${BOLD}│  WARNING: SERVER WILL AUTOMATICALLY RESTART     │${NC}"
-    echo -e "  ${RED}${BOLD}│  after the cron job is installed.               │${NC}"
-    echo -e "  ${RED}${BOLD}│  Save any work and close open connections.      │${NC}"
-    echo -e "  ${RED}${BOLD}└─────────────────────────────────────────────────┘${NC}"
-    echo ""
+    _warn_restart "after the cron job is installed."
 
     if ! confirm "Proceed? (server will restart automatically)"; then
         [[ $_BACK -eq 1 ]] && return 1
@@ -525,13 +540,7 @@ _cron_view_delete() {
             continue
         fi
 
-        echo ""
-        echo -e "  ${RED}${BOLD}┌─────────────────────────────────────────────────┐${NC}"
-        echo -e "  ${RED}${BOLD}│  WARNING: SERVER WILL AUTOMATICALLY RESTART     │${NC}"
-        echo -e "  ${RED}${BOLD}│  after the cron job(s) are deleted.             │${NC}"
-        echo -e "  ${RED}${BOLD}│  Save any work and close open connections.      │${NC}"
-        echo -e "  ${RED}${BOLD}└─────────────────────────────────────────────────┘${NC}"
-        echo ""
+        _warn_restart "after the cron job(s) are deleted."
 
         if ! confirm "Proceed? (server will restart automatically)"; then
             [[ $_BACK -eq 1 ]] && return 1
@@ -638,40 +647,8 @@ _cron_add_flow() {
     done
 
     # ── Step 3: Post-command actions ─────────────────────────────────────────
-    echo ""
-    echo -e "  ${BOLD}Step 3 of 3 — Post-command actions:${NC}"
-    echo -e "    ${BOLD}1)${NC} curl to a URL"
-    echo -e "    ${BOLD}2)${NC} StartOS notification"
-    echo -e "    ${BOLD}3)${NC} Both"
-    echo -e "    ${BOLD}4)${NC} None"
-    echo ""
-    local notif_mode="" curl_url="" notif_svc="" notif_level="" notif_title="" notif_body=""
-    while true; do
-        _read notif_choice "  Choice [1-4]: " || return 1
-        case "$notif_choice" in
-            1)
-                _read curl_url "  Notification URL: " || return 1
-                [[ -z "$curl_url" ]] && { print_warn "URL cannot be empty."; continue; }
-                notif_mode="1"; break ;;
-            2)
-                _pick_notif_startos notif_svc notif_level notif_title notif_body || return 1
-                notif_mode="2"; break ;;
-            3)
-                _read curl_url "  Notification URL: " || return 1
-                [[ -z "$curl_url" ]] && { print_warn "URL cannot be empty."; continue; }
-                _pick_notif_startos notif_svc notif_level notif_title notif_body || return 1
-                notif_mode="3"; break ;;
-            4) notif_mode="4"; break ;;
-            *) print_warn "Enter 1, 2, 3, or 4." ;;
-        esac
-    done
-
     local notif_cmd=""
-    case "$notif_mode" in
-        1) notif_cmd="curl -fsS --max-time 10 \"${curl_url}\" >/dev/null 2>&1" ;;
-        2) notif_cmd="start-cli notification create ${notif_svc} ${notif_level} \"${notif_title}\" \"${notif_body}\"" ;;
-        3) notif_cmd="curl -fsS --max-time 10 \"${curl_url}\" >/dev/null 2>&1 && start-cli notification create ${notif_svc} ${notif_level} \"${notif_title}\" \"${notif_body}\"" ;;
-    esac
+    _pick_post_action "Step 3 of 3 — Post-command actions:" notif_cmd || return 1
 
     local full_line="$cron_schedule $cron_cmd"
     [[ -n "$notif_cmd" ]] && full_line+=" && $notif_cmd"
@@ -882,48 +859,12 @@ menu_schedule_backup() {
     pick_cron_schedule || return 1
 
     # ── Step 5: Post-backup notification ────────────────────────────────────
-    echo ""
-    echo -e "  ${BOLD}Post-backup notification:${NC}"
-    echo -e "    ${BOLD}1)${NC} curl to a URL"
-    echo -e "    ${BOLD}2)${NC} StartOS notification"
-    echo -e "    ${BOLD}3)${NC} Both"
-    echo -e "    ${BOLD}4)${NC} None"
-    echo ""
+    local notif_cmd=""
+    _pick_post_action "Post-backup notification:" notif_cmd || return 1
 
-    local notif_mode="" curl_url="" notif_svc="" notif_level="" notif_title="" notif_body=""
-    while true; do
-        _read notif_choice "  Choice [1-4]: " || return 1
-        case "$notif_choice" in
-            1)
-                _read curl_url "  Notification URL: " || return 1
-                [[ -z "$curl_url" ]] && { print_warn "URL cannot be empty."; continue; }
-                notif_mode="1"; break
-                ;;
-            2)
-                _pick_notif_startos notif_svc notif_level notif_title notif_body || return 1
-                notif_mode="2"; break
-                ;;
-            3)
-                _read curl_url "  Notification URL: " || return 1
-                [[ -z "$curl_url" ]] && { print_warn "URL cannot be empty."; continue; }
-                _pick_notif_startos notif_svc notif_level notif_title notif_body || return 1
-                notif_mode="3"; break
-                ;;
-            4) notif_mode="4"; break ;;
-            *) print_warn "Enter 1, 2, 3, or 4." ;;
-        esac
-    done
-
-    # ── Build backup and notification commands ───────────────────────────────
+    # ── Build backup command ──────────────────────────────────────────────────
     local backup_cmd="start-cli backup create ${backup_target} '${backup_password}'"
     [[ -n "$pkg_ids_arg" ]] && backup_cmd+=" --package-ids ${pkg_ids_arg}"
-
-    local notif_cmd=""
-    case "$notif_mode" in
-        1) notif_cmd="curl -fsS --max-time 10 \"${curl_url}\" >/dev/null 2>&1" ;;
-        2) notif_cmd="start-cli notification create ${notif_svc} ${notif_level} \"${notif_title}\" \"${notif_body}\"" ;;
-        3) notif_cmd="curl -fsS --max-time 10 \"${curl_url}\" >/dev/null 2>&1 && start-cli notification create ${notif_svc} ${notif_level} \"${notif_title}\" \"${notif_body}\"" ;;
-    esac
 
     local full_line="$CRON_SCHEDULE $backup_cmd"
     [[ -n "$notif_cmd" ]] && full_line+=" && $notif_cmd"
@@ -1007,6 +948,52 @@ _pick_notif_startos() {
     echo ""
     _read _title "  Notification title: " || return 1
     _read _body "  Notification message: " || return 1
+}
+
+# Post-action picker: curl / StartOS notification / both / none.
+# $1 = section header text (displayed as bold label)
+# $2 = nameref variable to receive the built notif_cmd string (empty = none)
+# On return, caller can append notif_cmd to their cron line.
+_pick_post_action() {
+    local _ppa_header="$1"
+    local -n _ppa_notif_cmd="$2"
+
+    echo ""
+    echo -e "  ${BOLD}${_ppa_header}${NC}"
+    echo -e "    ${BOLD}1)${NC} curl to a URL"
+    echo -e "    ${BOLD}2)${NC} StartOS notification"
+    echo -e "    ${BOLD}3)${NC} Both"
+    echo -e "    ${BOLD}4)${NC} None"
+    echo ""
+
+    local _ppa_mode="" _ppa_curl_url=""
+    local _ppa_svc="" _ppa_level="" _ppa_title="" _ppa_body=""
+    while true; do
+        _read _ppa_choice "  Choice [1-4]: " || return 1
+        case "$_ppa_choice" in
+            1)
+                _read _ppa_curl_url "  Notification URL: " || return 1
+                [[ -z "$_ppa_curl_url" ]] && { print_warn "URL cannot be empty."; continue; }
+                _ppa_mode="1"; break ;;
+            2)
+                _pick_notif_startos _ppa_svc _ppa_level _ppa_title _ppa_body || return 1
+                _ppa_mode="2"; break ;;
+            3)
+                _read _ppa_curl_url "  Notification URL: " || return 1
+                [[ -z "$_ppa_curl_url" ]] && { print_warn "URL cannot be empty."; continue; }
+                _pick_notif_startos _ppa_svc _ppa_level _ppa_title _ppa_body || return 1
+                _ppa_mode="3"; break ;;
+            4) _ppa_mode="4"; break ;;
+            *) print_warn "Enter 1, 2, 3, or 4." ;;
+        esac
+    done
+
+    case "$_ppa_mode" in
+        1) _ppa_notif_cmd="curl -fsS --max-time 10 \"${_ppa_curl_url}\" >/dev/null 2>&1" ;;
+        2) _ppa_notif_cmd="start-cli notification create ${_ppa_svc} ${_ppa_level} \"${_ppa_title}\" \"${_ppa_body}\"" ;;
+        3) _ppa_notif_cmd="curl -fsS --max-time 10 \"${_ppa_curl_url}\" >/dev/null 2>&1 && start-cli notification create ${_ppa_svc} ${_ppa_level} \"${_ppa_title}\" \"${_ppa_body}\"" ;;
+        4) _ppa_notif_cmd="" ;;
+    esac
 }
 
 # ─────────────────────────────────────────────
@@ -1103,10 +1090,27 @@ _pick_poll_frequency() {
     done
 }
 
+# Fill an array variable with names of installed forwarders (suffix after prefix).
+# Returns 1 (with message + pause) if none are installed.
+# Usage: _poller_get_names myarray || return 1
+_poller_get_names() {
+    local -n _pgn_arr="$1"
+    local all_scripts=("${_POLLER_BIN_PREFIX}"*)
+    if [[ ! -e "${all_scripts[0]}" ]]; then
+        print_info "No notification forwarders installed."
+        pause; return 1
+    fi
+    _pgn_arr=()
+    local s
+    for s in "${all_scripts[@]}"; do
+        _pgn_arr+=("${s##${_POLLER_BIN_PREFIX}}")
+    done
+}
+
 # Display installed pollers with their embedded config.
 # Returns 1 (with message) if none are installed.
 _poller_list_display() {
-    local all_scripts=(/usr/local/bin/startos-notif-poller-*)
+    local all_scripts=("${_POLLER_BIN_PREFIX}"*)
     if [[ ! -e "${all_scripts[0]}" ]]; then
         print_info "No notification forwarders installed."
         return 1
@@ -1114,7 +1118,7 @@ _poller_list_display() {
 
     local i=1
     for script in "${all_scripts[@]}"; do
-        local pname="${script##*/startos-notif-poller-}"
+        local pname="${script##${_POLLER_BIN_PREFIX}}"
         local url levels keyword schedule
         url=$(grep      '^WEBHOOK_URL=' "$script" 2>/dev/null | cut -d'"' -f2)
         levels=$(grep   '^LEVELS='      "$script" 2>/dev/null | cut -d'"' -f2)
@@ -1123,7 +1127,7 @@ _poller_list_display() {
             | grep -A1 "^# startos-notif-poller-${pname}" 2>/dev/null \
             | tail -1 | awk '{print $1,$2,$3,$4,$5}')
 
-        local state_file="/var/lib/startos-admin/startos-admin-poller-state-${pname}"
+        local state_file="${_POLLER_STATE_PREFIX}${pname}"
         local state_val
         if [[ -f "$state_file" ]]; then
             state_val=$(cat "$state_file" 2>/dev/null | tr -d '[:space:]')
@@ -1132,7 +1136,7 @@ _poller_list_display() {
             state_val="(file not found)"
         fi
 
-        local log_file="/var/log/startos-notif-poller-${pname}.log"
+        local log_file="${_POLLER_LOG_PREFIX}${pname}.log"
         local log_info
         if [[ -f "$log_file" ]]; then
             local log_lines
@@ -1176,7 +1180,7 @@ _poller_install_flow() {
         fi
     done
 
-    if [[ -f "/usr/local/bin/startos-notif-poller-${poller_name}" ]]; then
+    if [[ -f "${_POLLER_BIN_PREFIX}${poller_name}" ]]; then
         print_warn "A forwarder named '${poller_name}' already exists — this will update it."
         if ! confirm "Continue and overwrite?"; then
             [[ $_BACK -eq 1 ]] && return 1
@@ -1249,9 +1253,9 @@ _poller_install_flow() {
     echo -e "  ${BOLD}Keyword:${NC}  ${keyword:-(none)}"
     echo -e "  ${BOLD}Schedule:${NC} ${CRON_SCHEDULE}"
     echo ""
-    echo -e "  ${DIM}Script:  /usr/local/bin/startos-notif-poller-${poller_name}${NC}"
-    echo -e "  ${DIM}State:   /var/lib/startos-admin/startos-admin-poller-state-${poller_name}${NC}"
-    echo -e "  ${DIM}Log:     /var/log/startos-notif-poller-${poller_name}.log${NC}"
+    echo -e "  ${DIM}Script:  ${_POLLER_BIN_PREFIX}${poller_name}${NC}"
+    echo -e "  ${DIM}State:   ${_POLLER_STATE_PREFIX}${poller_name}${NC}"
+    echo -e "  ${DIM}Log:     ${_POLLER_LOG_PREFIX}${poller_name}.log${NC}"
     echo ""
 
     if ! confirm "Install this forwarder?"; then
@@ -1280,7 +1284,7 @@ POLLER_NAME=\"${name}\"
 WEBHOOK_URL=\"${url}\"
 LEVELS=\"${levels}\"
 KEYWORD=\"${keyword}\"
-STATE_FILE=\"/var/lib/startos-admin/startos-admin-poller-state-${name}\"
+STATE_FILE=\"${_POLLER_STATE_PREFIX}${name}\"
 "
 
     local body_template
@@ -1425,17 +1429,11 @@ POLLER_BODY_END
     local install_ts
     install_ts=$(date '+%Y.%m.%d %H:%M:%S %Z')
     local cron_comment="# startos-notif-poller-${name} | Added: ${install_ts} | v${VERSION} | Action: Manage Notification Forwarders | Webhook: ${url} | Levels: ${levels} | Keyword: ${keyword:-none}"
-    local cron_line="${schedule} /usr/local/bin/startos-notif-poller-${name} >> /var/log/startos-notif-poller-${name}.log 2>&1"
+    local cron_line="${schedule} ${_POLLER_BIN_PREFIX}${name} >> ${_POLLER_LOG_PREFIX}${name}.log 2>&1"
     encoded_comment=$(printf '%s' "$cron_comment" | base64 -w 0)
     encoded_cron=$(printf '%s' "$cron_line" | base64 -w 0)
 
-    echo ""
-    echo -e "  ${RED}${BOLD}┌─────────────────────────────────────────────────┐${NC}"
-    echo -e "  ${RED}${BOLD}│  WARNING: SERVER WILL AUTOMATICALLY RESTART     │${NC}"
-    echo -e "  ${RED}${BOLD}│  after the forwarder is installed.              │${NC}"
-    echo -e "  ${RED}${BOLD}│  Save any work and close open connections.      │${NC}"
-    echo -e "  ${RED}${BOLD}└─────────────────────────────────────────────────┘${NC}"
-    echo ""
+    _warn_restart "after the forwarder is installed."
 
     if ! confirm "Proceed? (server will restart automatically)"; then
         [[ $_BACK -eq 1 ]] && return 1
@@ -1452,8 +1450,8 @@ POLLER_BODY_END
     local chroot_exit=0
     sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || chroot_exit=$?
 { crontab -l 2>/dev/null || true; } | awk -v t="# startos-notif-poller-${name}" 'index(\$0,t)==1{skip=1;next} skip{skip=0;next} {print}' | crontab -
-printf '%s' "$encoded_script" | base64 -d > /usr/local/bin/startos-notif-poller-${name}
-chmod +x /usr/local/bin/startos-notif-poller-${name}
+printf '%s' "$encoded_script" | base64 -d > ${_POLLER_BIN_PREFIX}${name}
+chmod +x ${_POLLER_BIN_PREFIX}${name}
 { crontab -l 2>/dev/null; printf '%s' "$encoded_comment" | base64 -d; echo; printf '%s' "$encoded_cron" | base64 -d; echo; } | crontab -
 exit
 EOF
@@ -1461,7 +1459,7 @@ EOF
     if [[ $chroot_exit -eq 0 ]]; then
         print_success "Forwarder '${name}' installed persistently."
         print_warn "The server will restart shortly — your SSH session will disconnect."
-        print_warn "After reconnecting, test with: /usr/local/bin/startos-notif-poller-${name}"
+        print_warn "After reconnecting, test with: ${_POLLER_BIN_PREFIX}${name}"
     else
         print_error "chroot-and-upgrade failed (exit $chroot_exit). Forwarder was not installed."
         pause
@@ -1474,16 +1472,8 @@ _poller_remove_flow() {
     print_section "Remove Notification Forwarder"
     echo ""
 
-    local all_scripts=(/usr/local/bin/startos-notif-poller-*)
-    if [[ ! -e "${all_scripts[0]}" ]]; then
-        print_info "No notification forwarders installed."
-        pause; return
-    fi
-
     local script_names=()
-    for s in "${all_scripts[@]}"; do
-        script_names+=("${s##*/startos-notif-poller-}")
-    done
+    _poller_get_names script_names || return
 
     echo -e "  ${BOLD}Select forwarder(s) to remove:${NC}"
     local i=1
@@ -1528,13 +1518,7 @@ _poller_remove_flow() {
         pause; return
     fi
 
-    echo ""
-    echo -e "  ${RED}${BOLD}┌─────────────────────────────────────────────────┐${NC}"
-    echo -e "  ${RED}${BOLD}│  WARNING: SERVER WILL AUTOMATICALLY RESTART     │${NC}"
-    echo -e "  ${RED}${BOLD}│  after the forwarder(s) are removed.            │${NC}"
-    echo -e "  ${RED}${BOLD}│  Save any work and close open connections.      │${NC}"
-    echo -e "  ${RED}${BOLD}└─────────────────────────────────────────────────┘${NC}"
-    echo ""
+    _warn_restart "after the forwarder(s) are removed."
 
     if ! confirm "Proceed? (server will restart automatically)"; then
         [[ $_BACK -eq 1 ]] && return 1
@@ -1544,7 +1528,7 @@ _poller_remove_flow() {
 
     # Remove state files AFTER 2nd confirm — root-owned, not accessible inside chroot
     for rname in "${names_to_remove[@]}"; do
-        local state_file="/var/lib/startos-admin/startos-admin-poller-state-${rname}"
+        local state_file="${_POLLER_STATE_PREFIX}${rname}"
         if [[ -f "$state_file" ]]; then
             print_info "Removing state file: $state_file"
             sudo rm -f "$state_file"
@@ -1555,7 +1539,7 @@ _poller_remove_flow() {
     local chroot_body=""
     for rname in "${names_to_remove[@]}"; do
         chroot_body+="crontab -l 2>/dev/null | grep -v 'startos-notif-poller-${rname}' | crontab -
-rm -f /usr/local/bin/startos-notif-poller-${rname}
+rm -f ${_POLLER_BIN_PREFIX}${rname}
 "
     done
 
@@ -1582,16 +1566,8 @@ _poller_view_log() {
     print_section "View Forwarder Log"
     echo ""
 
-    local all_scripts=(/usr/local/bin/startos-notif-poller-*)
-    if [[ ! -e "${all_scripts[0]}" ]]; then
-        print_info "No notification forwarders installed."
-        pause; return
-    fi
-
     local script_names=()
-    for script in "${all_scripts[@]}"; do
-        script_names+=("${script##*/startos-notif-poller-}")
-    done
+    _poller_get_names script_names || return
 
     local i=1
     for pname in "${script_names[@]}"; do
@@ -1611,7 +1587,7 @@ _poller_view_log() {
     done
 
     local log_name="${script_names[$((log_choice - 1))]}"
-    local log_file="/var/log/startos-notif-poller-${log_name}.log"
+    local log_file="${_POLLER_LOG_PREFIX}${log_name}.log"
 
     print_header
     print_section "Forwarder Log: ${log_name}"
@@ -2081,13 +2057,7 @@ check_for_update() {
         print_info "Installing to /usr/local/bin/startos-admin lets you run 'startos-admin' from anywhere."
         echo ""
         if confirm "Install persistently to /usr/local/bin/startos-admin now?"; then
-            echo ""
-            echo -e "  ${RED}${BOLD}┌─────────────────────────────────────────────────┐${NC}"
-            echo -e "  ${RED}${BOLD}│  WARNING: SERVER WILL AUTOMATICALLY RESTART     │${NC}"
-            echo -e "  ${RED}${BOLD}│  after the script is installed.                 │${NC}"
-            echo -e "  ${RED}${BOLD}│  Save any work and close open connections.      │${NC}"
-            echo -e "  ${RED}${BOLD}└─────────────────────────────────────────────────┘${NC}"
-            echo ""
+            _warn_restart "after the script is installed."
             if ! confirm "Proceed? (server will restart automatically)"; then
                 [[ $_BACK -eq 1 ]] && { _BACK=0; }
                 return 0
@@ -2132,13 +2102,7 @@ EOF
         return 0
     fi
 
-    echo ""
-    echo -e "  ${RED}${BOLD}┌─────────────────────────────────────────────────┐${NC}"
-    echo -e "  ${RED}${BOLD}│  WARNING: SERVER WILL AUTOMATICALLY RESTART     │${NC}"
-    echo -e "  ${RED}${BOLD}│  after the update is installed.                 │${NC}"
-    echo -e "  ${RED}${BOLD}│  Save any work and close open connections.      │${NC}"
-    echo -e "  ${RED}${BOLD}└─────────────────────────────────────────────────┘${NC}"
-    echo ""
+    _warn_restart "after the update is installed."
     if ! confirm "Proceed? (server will restart automatically)"; then
         [[ $_BACK -eq 1 ]] && { _BACK=0; return 0; }
         return 0
