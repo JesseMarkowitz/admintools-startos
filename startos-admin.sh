@@ -2,7 +2,7 @@
 # startos-admin.sh — Interactive admin menu for StartOS servers
 # Usage: chmod +x startos-admin.sh && ./startos-admin.sh
 
-VERSION="31"   # integer — increment on each release
+VERSION="32"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -1665,10 +1665,15 @@ _poller_remove_flow() {
         (( i++ ))
     done
     echo ""
+    echo -e "    ${DIM}0) Back${NC}"
+    echo ""
 
     local names_to_remove=()
     while true; do
-        _read rchoice "  Choice(s) [1-$((i-1)), comma-separated, or 'all']: " || return 1
+        _read rchoice "  Choice(s) [1-$((i-1)), comma-separated, 'all', or 0 to go back]: " || return 1
+        if [[ "$rchoice" == "0" ]]; then
+            return
+        fi
         if [[ "$rchoice" == "all" ]]; then
             names_to_remove=("${script_names[@]}")
             break
