@@ -2,7 +2,7 @@
 # startos-admin.sh — Interactive admin menu for StartOS servers
 # Usage: chmod +x startos-admin.sh && ./startos-admin.sh
 
-VERSION="29"   # integer — increment on each release
+VERSION="30"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -1290,6 +1290,8 @@ WEBHOOK_URL=\"${url}\"
 LEVELS=\"${levels}\"
 KEYWORD=\"${keyword}\"
 STATE_FILE=\"${_POLLER_STATE_PREFIX}${name}\"
+LOG_MAX_LINES=25000
+DEBUG=0
 "
 
     local body_template
@@ -1299,19 +1301,31 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 _ts() { date '+%Y.%m.%d %H:%M:%S %Z'; }
 
+# ── Log self-truncation ───────────────────────────────────────────────────
+_SELF_LOG="/var/log/startos-notif-poller-${POLLER_NAME}.log"
+if [ -f "$_SELF_LOG" ]; then
+    _LC=$(wc -l < "$_SELF_LOG" 2>/dev/null || echo 0)
+    if [ "$_LC" -gt "$LOG_MAX_LINES" ]; then
+        _TMP=$(mktemp)
+        tail -n "$LOG_MAX_LINES" "$_SELF_LOG" > "$_TMP" && cat "$_TMP" > "$_SELF_LOG"
+        rm -f "$_TMP"
+        echo "$(_ts): NOTICE log truncated to last $LOG_MAX_LINES lines (was $_LC)"
+    fi
+fi
+
 # ── State file ────────────────────────────────────────────────────────────
 FIRST_RUN=0
 LAST_ID=0
 if [ -f "$STATE_FILE" ]; then
     RAW_STATE=$(cat "$STATE_FILE")
     LAST_ID=$(printf '%s' "$RAW_STATE" | tr -d '[:space:]')
-    echo "$(_ts): DEBUG state file exists — raw=[$RAW_STATE] stripped=[$LAST_ID]"
+    [ "$DEBUG" -eq 1 ] && echo "$(_ts): DEBUG state file exists — raw=[$RAW_STATE] stripped=[$LAST_ID]"
     if ! [[ "$LAST_ID" =~ ^[0-9]+$ ]]; then
         echo "$(_ts): WARN LAST_ID='$LAST_ID' is not a plain integer — resetting to 0"
         LAST_ID=0
     fi
 else
-    echo "$(_ts): DEBUG state file not found ($STATE_FILE) — first run mode"
+    [ "$DEBUG" -eq 1 ] && echo "$(_ts): DEBUG state file not found ($STATE_FILE) — first run mode"
     FIRST_RUN=1
 fi
 
@@ -1353,32 +1367,31 @@ if [ "$FIRST_RUN" -eq 1 ]; then
 fi
 
 # ── Inspect raw API response ──────────────────────────────────────────────
-TOTAL=$(echo "$NOTIFS" | jq 'length' 2>/dev/null || echo "?")
-echo "$(_ts): DEBUG API returned $TOTAL notification(s)"
-
-# Log the type and raw value of every ID in the response
-ID_DUMP=$(echo "$NOTIFS" | jq -r '.[] | "  id=\(.id) type=\(.id|type)"' 2>/dev/null || echo "  (jq failed)")
-echo "$(_ts): DEBUG all notification IDs from API:"
-echo "$ID_DUMP"
-
-# Log which IDs the jq filter considers new (before looping)
-NEW_IDS=$(echo "$NOTIFS" | jq -r --argjson last "$LAST_ID" \
-    '[.[] | select((.id | tonumber) > $last) | .id] | @json' 2>/dev/null || echo "?")
-NEW=$(echo "$NOTIFS" | jq --argjson last "$LAST_ID" \
-    '[.[] | select((.id | tonumber) > $last)] | length' 2>/dev/null || echo "?")
-echo "$(_ts): $TOTAL total, $NEW new (id > $LAST_ID) — new IDs: $NEW_IDS"
+if [ "$DEBUG" -eq 1 ]; then
+    TOTAL=$(echo "$NOTIFS" | jq 'length' 2>/dev/null || echo "?")
+    echo "$(_ts): DEBUG API returned $TOTAL notification(s)"
+    ID_DUMP=$(echo "$NOTIFS" | jq -r '.[] | "  id=\(.id) type=\(.id|type)"' 2>/dev/null || echo "  (jq failed)")
+    echo "$(_ts): DEBUG all notification IDs from API:"
+    echo "$ID_DUMP"
+    NEW_IDS=$(echo "$NOTIFS" | jq -r --argjson last "$LAST_ID" \
+        '[.[] | select((.id | tonumber) > $last) | .id] | @json' 2>/dev/null || echo "?")
+    NEW=$(echo "$NOTIFS" | jq --argjson last "$LAST_ID" \
+        '[.[] | select((.id | tonumber) > $last)] | length' 2>/dev/null || echo "?")
+    echo "$(_ts): DEBUG $TOTAL total, $NEW new (id > $LAST_ID) — new IDs: $NEW_IDS"
+fi
 
 # ── Process new notifications ─────────────────────────────────────────────
 MAX_ID=$LAST_ID
 
 while IFS= read -r notif; do
-    # Log the raw JSON for this notification for inspection
-    echo "$(_ts): DEBUG raw notif JSON: $notif"
+    [ "$DEBUG" -eq 1 ] && echo "$(_ts): DEBUG raw notif JSON: $notif"
 
     # Normalize id to a plain integer string regardless of JSON type
-    raw_id=$(echo "$notif" | jq -r '.id')
-    id=$(echo "$notif"     | jq -r '.id | tonumber | tostring')
-    echo "$(_ts): DEBUG raw_id=[$raw_id] normalized id=[$id] current MAX_ID=[$MAX_ID]"
+    id=$(echo "$notif" | jq -r '.id | tonumber | tostring')
+    if [ "$DEBUG" -eq 1 ]; then
+        raw_id=$(echo "$notif" | jq -r '.id')
+        echo "$(_ts): DEBUG raw_id=[$raw_id] normalized id=[$id] current MAX_ID=[$MAX_ID]"
+    fi
 
     level=$(echo "$notif" | jq -r '.level')
     title=$(echo "$notif" | jq -r '.title')
@@ -1388,7 +1401,7 @@ while IFS= read -r notif; do
 
     # Advance MAX_ID for ALL seen notifications, not just forwarded ones
     if [ "$id" -gt "$MAX_ID" ]; then
-        echo "$(_ts): DEBUG advancing MAX_ID: $MAX_ID → $id"
+        [ "$DEBUG" -eq 1 ] && echo "$(_ts): DEBUG advancing MAX_ID: $MAX_ID → $id"
         MAX_ID=$id
     fi
 
@@ -1411,21 +1424,18 @@ while IFS= read -r notif; do
     CURL_EXIT=$?
     HTTP_STATUS=$(echo "$CURL_OUT" | grep 'HTTP_STATUS:' | cut -d: -f2)
     CURL_BODY=$(echo "$CURL_OUT" | grep -v 'HTTP_STATUS:')
-    echo "$(_ts): DEBUG curl exit=$CURL_EXIT http=$HTTP_STATUS response=[$CURL_BODY]"
+    [ "$DEBUG" -eq 1 ] && echo "$(_ts): DEBUG curl exit=$CURL_EXIT http=$HTTP_STATUS response=[$CURL_BODY]"
 
 done < <(echo "$NOTIFS" | jq -c --argjson last "$LAST_ID" '[.[] | select((.id | tonumber) > $last)] | .[]')
 
 # ── Persist state ─────────────────────────────────────────────────────────
 echo "$(_ts): run complete — MAX_ID=$MAX_ID (was LAST_ID=$LAST_ID)"
-if [ "$MAX_ID" = "$LAST_ID" ]; then
-    echo "$(_ts): DEBUG no new notifications processed — state file unchanged"
-else
-    echo "$(_ts): DEBUG writing new MAX_ID=$MAX_ID to $STATE_FILE"
-fi
+[ "$DEBUG" -eq 1 ] && [ "$MAX_ID" = "$LAST_ID" ] && echo "$(_ts): DEBUG no new notifications processed — state file unchanged"
+[ "$DEBUG" -eq 1 ] && [ "$MAX_ID" != "$LAST_ID" ] && echo "$(_ts): DEBUG writing new MAX_ID=$MAX_ID to $STATE_FILE"
 mkdir -p "$(dirname "$STATE_FILE")"
 if ! echo "$MAX_ID" > "$STATE_FILE"; then
     echo "$(_ts): ERROR — could not write state file: $STATE_FILE (check permissions)"
-else
+elif [ "$DEBUG" -eq 1 ]; then
     VERIFY=$(cat "$STATE_FILE" | tr -d '[:space:]')
     echo "$(_ts): DEBUG state file write confirmed — read-back=[$VERIFY]"
 fi
