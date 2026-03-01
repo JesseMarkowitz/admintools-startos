@@ -2,7 +2,7 @@
 # startos-admin.sh — Interactive admin menu for StartOS servers
 # Usage: chmod +x startos-admin.sh && ./startos-admin.sh
 
-VERSION="27"   # integer — increment on each release
+VERSION="28"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -1236,6 +1236,7 @@ _poller_install_flow() {
 
     # Step 3: Keyword filter (optional)
     echo ""
+    echo -e "  ${DIM}Case-insensitive. Searches both the notification title and message body.${NC}"
     local keyword=""
     _read keyword "  Keyword filter — forward only if title/message contains (blank = none): " || return 1
 
@@ -1256,6 +1257,10 @@ _poller_install_flow() {
     echo -e "  ${DIM}Script:  ${_POLLER_BIN_PREFIX}${poller_name}${NC}"
     echo -e "  ${DIM}State:   ${_POLLER_STATE_PREFIX}${poller_name}${NC}"
     echo -e "  ${DIM}Log:     ${_POLLER_LOG_PREFIX}${poller_name}.log${NC}"
+    echo ""
+    echo -e "  ${YELLOW}First-run note:${NC} On the first poll after install, the forwarder will"
+    echo -e "  forward only the single most recent notification at that moment."
+    echo -e "  All older notifications are skipped to avoid a historical flood."
     echo ""
 
     if ! confirm "Install this forwarder?"; then
@@ -1334,7 +1339,12 @@ if [ -z "$NOTIFS" ]; then
     exit 0
 fi
 
-# ── First run: seed LAST_ID so only the single most recent notification is forwarded ──
+# ── First run: seed state to prevent historical flood ─────────────────────
+# On first run (no state file exists yet), we find the highest existing
+# notification ID and set LAST_ID = MAX_ID - 1 so that only the single most
+# recent notification is forwarded. This prevents replaying every historical
+# notification the first time the forwarder runs. Subsequent runs forward
+# only notifications with IDs greater than the last seen ID.
 if [ "$FIRST_RUN" -eq 1 ]; then
     MAX_RAW=$(echo "$NOTIFS" | jq '[.[].id | tonumber] | max // 0' 2>/dev/null || echo "0")
     LAST_ID=$(( MAX_RAW - 1 ))
@@ -2016,7 +2026,47 @@ menu_documentation() {
                 print_header
                 print_section "Manage Notification Forwarders"
                 echo ""
-                echo -e "  [Documentation coming soon]"
+                echo -e "  Creates persistent forwarders that forward StartOS notifications to"
+                echo -e "  external systems via HTTP. Each forwarder periodically runs"
+                echo -e "  ${CYAN}start-cli notification list${NC}, filters by level and/or keyword,"
+                echo -e "  and POSTs matching notifications as plain text to a webhook URL."
+                echo ""
+                echo -e "  Multiple forwarders can run simultaneously — e.g., one for all"
+                echo -e "  warnings, one scoped to backup errors only."
+                echo ""
+                echo -e "  ${BOLD}Configuration options:${NC}"
+                echo ""
+                echo -e "    ${CYAN}•${NC} ${BOLD}Name${NC} — identifier used in the forwarded message, log filename,"
+                echo -e "      and state file (e.g. ${DIM}backup-errors${NC})"
+                echo ""
+                echo -e "    ${CYAN}•${NC} ${BOLD}URL${NC} — webhook endpoint to POST to (NTFY, Slack, Discord,"
+                echo -e "      healthchecks.io, or any HTTP endpoint)"
+                echo ""
+                echo -e "    ${CYAN}•${NC} ${BOLD}Level filter${NC} — all / warning+error / error only / custom selection"
+                echo ""
+                echo -e "    ${CYAN}•${NC} ${BOLD}Keyword filter${NC} — optional text string; case-insensitive, searches"
+                echo -e "      both the notification title and message body (blank = no filter)"
+                echo ""
+                echo -e "    ${CYAN}•${NC} ${BOLD}Schedule${NC} — how often to poll (every 5/15/30 min, hourly,"
+                echo -e "      or a custom cron expression)"
+                echo ""
+                echo -e "  ${BOLD}Message format${NC} (plain text POST body):"
+                echo ""
+                echo -e "  ${DIM}2026.03.01 10:15:00 UTC  [backup-errors]  [Warning]  #42  btcpayserver  |  Backup Failed — Disk full${NC}"
+                echo ""
+                echo -e "  Fields: timestamp  [forwarder-name]  [Level]  #id  package  |  title — message"
+                echo ""
+                echo -e "  ${BOLD}First run behavior:${NC}"
+                echo -e "  On the first poll after install, the forwarder forwards only the"
+                echo -e "  single most recent notification at that moment. All older notifications"
+                echo -e "  are skipped to prevent a historical flood. Subsequent runs forward"
+                echo -e "  only notifications newer than the last one seen."
+                echo ""
+                echo -e "  ${BOLD}Files created per forwarder:${NC}"
+                echo ""
+                echo -e "    ${DIM}Script:  /usr/local/bin/startos-notif-poller-<name>${NC}"
+                echo -e "    ${DIM}State:   /var/lib/startos-admin/startos-admin-poller-state-<name>${NC}"
+                echo -e "    ${DIM}Log:     /var/log/startos-notif-poller-<name>.log${NC}"
                 echo ""
                 pause ;;
             8)
