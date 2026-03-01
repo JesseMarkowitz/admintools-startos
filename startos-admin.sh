@@ -2,7 +2,7 @@
 # startos-admin.sh — Interactive admin menu for StartOS servers
 # Usage: chmod +x startos-admin.sh && ./startos-admin.sh
 
-VERSION="24"   # integer — increment on each release
+VERSION="25"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -461,11 +461,11 @@ _cron_view_delete() {
             pause; return
         fi
 
-        echo -e "  ${DIM}Enter number(s) to delete (comma-separated or 'all'), 0 or Enter to go back.${NC}"
+        echo -e "  ${DIM}Enter number(s) to delete (comma-separated or 'all'), or 0 to go back.${NC}"
         echo ""
         _read del_choice "  Choice: " || return 1
 
-        if [[ -z "$del_choice" || "$del_choice" == "0" ]]; then
+        if [[ "$del_choice" == "0" ]]; then
             return
         fi
 
@@ -845,8 +845,8 @@ menu_schedule_backup() {
     local selected_packages=()
     local pkg_ids_arg=""
     while true; do
-        _read pkg_selection "  Selection (e.g. 1,3 or 0 for all): " || return 1
-        if [[ "$pkg_selection" == "0" ]]; then
+        _read pkg_selection "  Selection (e.g. 1,3 or 'all'): " || return 1
+        if [[ "$pkg_selection" == "all" ]]; then
             # No --package-ids flag = back up everything
             pkg_ids_arg=""
             break
@@ -867,7 +867,7 @@ menu_schedule_backup() {
             fi
             selected_packages=()
         else
-            print_warn "Enter numbers like 1,3 or 0 for all."
+            print_warn "Enter numbers like 1,3 or 'all'."
         fi
     done
 
