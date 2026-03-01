@@ -2,7 +2,7 @@
 # startos-admin.sh — Interactive admin menu for StartOS servers
 # Usage: chmod +x startos-admin.sh && ./startos-admin.sh
 
-VERSION="28"   # integer — increment on each release
+VERSION="29"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -2119,6 +2119,7 @@ check_for_update() {
             sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || _chroot_exit=$?
 printf '%s' "$_encoded" | base64 -d > /usr/local/bin/startos-admin
 chmod +x /usr/local/bin/startos-admin
+mkdir -p /var/lib/startos-admin
 exit
 EOF
             if [[ $_chroot_exit -eq 0 ]]; then
@@ -2166,6 +2167,7 @@ EOF
     sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || chroot_exit=$?
 printf '%s' "$encoded" | base64 -d > /usr/local/bin/startos-admin
 chmod +x /usr/local/bin/startos-admin
+mkdir -p /var/lib/startos-admin
 exit
 EOF
 
