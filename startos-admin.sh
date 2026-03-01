@@ -2,7 +2,7 @@
 # startos-admin.sh — Interactive admin menu for StartOS servers
 # Usage: chmod +x startos-admin.sh && ./startos-admin.sh
 
-VERSION="34"   # integer — increment on each release
+VERSION="35"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -220,7 +220,7 @@ EOF
 }
 
 # ─────────────────────────────────────────────
-# Feature 1: Create StartOS Notification
+# Create StartOS Notification
 # ─────────────────────────────────────────────
 
 menu_create_notification() {
@@ -319,7 +319,7 @@ menu_create_notification() {
 }
 
 # ─────────────────────────────────────────────
-# Feature 2: Display Disk Used by Service
+# Display Disk Used by Service
 # ─────────────────────────────────────────────
 
 menu_disk_usage() {
@@ -384,7 +384,7 @@ menu_disk_usage() {
 }
 
 # ─────────────────────────────────────────────
-# Feature 3: Display Memory Used by Service
+# Display Memory Used by Service
 # ─────────────────────────────────────────────
 
 menu_memory_usage() {
@@ -428,10 +428,10 @@ menu_memory_usage() {
 }
 
 # ─────────────────────────────────────────────
-# Feature 4: Manage Cron Jobs
+# Manage Cron Jobs
 # ─────────────────────────────────────────────
 
-_cron_view_delete() {
+_cron_manage_flow() {
     while true; do
         print_header
         print_section "View / Edit Cron Jobs"
@@ -768,7 +768,7 @@ menu_manage_crontab() {
         echo ""
         _read sub_choice "  $(echo -e "${BOLD}Choice:${NC} ")" || return 1
         case "$sub_choice" in
-            1) _cron_view_delete || return 1 ;;
+            1) _cron_manage_flow || return 1 ;;
             2) _cron_add_flow    || return 1 ;;
             0) return ;;
             *) print_warn "Enter 0-2." ; sleep 1 ;;
@@ -777,11 +777,11 @@ menu_manage_crontab() {
 }
 
 # ─────────────────────────────────────────────
-# Feature 5: Schedule Backups
+# Schedule Backups
 # ─────────────────────────────────────────────
 
 # Returns a cron schedule string, sets global CRON_SCHEDULE
-pick_cron_schedule() {
+_pick_backup_schedule() {
     echo ""
     echo -e "  ${BOLD}Select backup schedule:${NC}"
     echo -e "    ${BOLD}1)${NC} Daily at midnight     ${DIM}(0 0 * * *)${NC}"
@@ -936,7 +936,7 @@ menu_schedule_backup() {
 
     # ── Step 4: Schedule ─────────────────────────────────────────────────────
     local CRON_SCHEDULE
-    pick_cron_schedule || return 1
+    _pick_backup_schedule || return 1
 
     # ── Step 5: Post-backup notification ────────────────────────────────────
     local notif_cmd=""
@@ -1077,7 +1077,7 @@ _pick_post_action() {
 }
 
 # ─────────────────────────────────────────────
-# Feature 5: Schedule Stay-Alive Curl
+# Schedule Stay-Alive Curl
 # ─────────────────────────────────────────────
 
 menu_schedule_stay_alive() {
@@ -1092,31 +1092,8 @@ menu_schedule_stay_alive() {
         pause; return
     fi
 
-    echo ""
-    echo -e "  ${BOLD}Select frequency:${NC}"
-    echo -e "    ${BOLD}1)${NC} Every 5 minutes    ${DIM}(*/5 * * * *)${NC}"
-    echo -e "    ${BOLD}2)${NC} Every 15 minutes   ${DIM}(*/15 * * * *)${NC}"
-    echo -e "    ${BOLD}3)${NC} Every 30 minutes   ${DIM}(*/30 * * * *)${NC}"
-    echo -e "    ${BOLD}4)${NC} Hourly             ${DIM}(0 * * * *)${NC}"
-    echo -e "    ${BOLD}5)${NC} Custom cron expression"
-    echo ""
-
     local CRON_SCHEDULE
-    while true; do
-        _read freq_choice "  Choice [1-5]: " || return 1
-        case "$freq_choice" in
-            1) CRON_SCHEDULE="*/5 * * * *";  break ;;
-            2) CRON_SCHEDULE="*/15 * * * *"; break ;;
-            3) CRON_SCHEDULE="*/30 * * * *"; break ;;
-            4) CRON_SCHEDULE="0 * * * *";    break ;;
-            5)
-                _read CRON_SCHEDULE "  Enter cron expression (e.g. 0 2 * * 1-5): " || return 1
-                [[ -n "$CRON_SCHEDULE" ]] && break
-                print_warn "Expression cannot be empty."
-                ;;
-            *) print_warn "Enter 1 through 5." ;;
-        esac
-    done
+    _pick_poll_frequency || return 1
 
     local cron_line="$CRON_SCHEDULE curl -fsS --max-time 10 \"$stay_url\" > /dev/null 2>&1"
 
@@ -1140,7 +1117,7 @@ menu_schedule_stay_alive() {
 }
 
 # ─────────────────────────────────────────────
-# Feature 7: Manage Notification Forwarders
+# Manage Notification Forwarders
 # ─────────────────────────────────────────────
 
 # Prompt for polling frequency, sets $CRON_SCHEDULE
