@@ -2,7 +2,7 @@
 # startos-admin.sh — Interactive admin menu for StartOS servers
 # Usage: chmod +x startos-admin.sh && ./startos-admin.sh
 
-VERSION="33"   # integer — increment on each release
+VERSION="34"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -434,7 +434,7 @@ menu_memory_usage() {
 _cron_view_delete() {
     while true; do
         print_header
-        print_section "View / Delete Cron Jobs"
+        print_section "View / Edit Cron Jobs"
         echo ""
 
         local cron_output exit_code=0
@@ -455,17 +455,28 @@ _cron_view_delete() {
             pause; return
         fi
 
-        # Display crontab — comments dimmed, executable lines numbered for deletion
+        # Display crontab — comments dimmed; active entries numbered cyan; disabled entries numbered yellow
+        # Disabled cron lines: start with # followed immediately by a cron char (*, /, digit)
         local -a cron_lines=()
         local -a cron_line_nums=()
+        local -a cron_active=()
         local linenum=0
         while IFS= read -r line; do
             linenum=$(( linenum + 1 ))
-            if [[ "$line" =~ ^# ]]; then
+            if [[ "$line" =~ ^#[*/0-9] ]]; then
+                # Disabled cron entry — strip leading # for display
+                cron_lines+=("${line#\#}")
+                cron_line_nums+=("$linenum")
+                cron_active+=(0)
+                echo -e "  ${YELLOW}${BOLD}${#cron_lines[@]})${NC} ${DIM}[disabled] ${line#\#}${NC}"
+            elif [[ "$line" =~ ^# ]]; then
+                # Metadata comment — show dimmed, not numbered
                 echo -e "  ${DIM}${line}${NC}"
             elif [[ -n "$line" ]]; then
+                # Active cron entry
                 cron_lines+=("$line")
                 cron_line_nums+=("$linenum")
+                cron_active+=(1)
                 echo -e "  ${CYAN}${BOLD}${#cron_lines[@]})${NC} ${CYAN}${line}${NC}"
             fi
         done <<< "$cron_output"
@@ -476,24 +487,24 @@ _cron_view_delete() {
             pause; return
         fi
 
-        echo -e "  ${DIM}Enter number(s) to delete (comma-separated or 'all'), or 0 to go back.${NC}"
+        echo -e "  ${DIM}Enter number(s) (comma-separated or 'all'), or 0 to go back.${NC}"
         echo ""
-        _read del_choice "  Choice: " || return 1
+        _read sel_choice "  Select: " || return 1
 
-        if [[ "$del_choice" == "0" ]]; then
+        if [[ "$sel_choice" == "0" ]]; then
             return
         fi
 
         # Parse selection into array of 0-based indices into cron_lines
         local -a selected_indices=()
-        if [[ "$del_choice" == "all" ]]; then
+        if [[ "$sel_choice" == "all" ]]; then
             local j
             for (( j=0; j<${#cron_lines[@]}; j++ )); do
                 selected_indices+=("$j")
             done
         else
             local valid=true
-            IFS=',' read -ra parts <<< "$del_choice"
+            IFS=',' read -ra parts <<< "$sel_choice"
             for part in "${parts[@]}"; do
                 part="${part// /}"
                 if [[ "$part" =~ ^[0-9]+$ ]] && \
@@ -510,37 +521,84 @@ _cron_view_delete() {
             fi
         fi
 
-        # For each selected job, collect its crontab line number (and preceding comment if any)
-        local -a remove_linenums=()
+        # Action prompt
         echo ""
-        print_warn "This will delete:"
+        echo -e "  ${DIM}Action:  [d]elete  [c]omment out  [e]nable${NC}"
+        echo ""
+        local action_key
+        while true; do
+            _read action_key "  Action [d/c/e]: " || return 1
+            case "${action_key,,}" in
+                d|delete)  action_key="d"; break ;;
+                c|comment) action_key="c"; break ;;
+                e|enable)  action_key="e"; break ;;
+                *) print_warn "Enter d (delete), c (comment out), or e (enable)." ;;
+            esac
+        done
+
+        # Validate action against entry state
+        local bad=false
+        for idx in "${selected_indices[@]}"; do
+            if [[ "$action_key" == "c" && "${cron_active[$idx]}" -eq 0 ]]; then
+                print_warn "Entry $((idx+1)) is already disabled — cannot comment out."
+                bad=true; break
+            fi
+            if [[ "$action_key" == "e" && "${cron_active[$idx]}" -eq 1 ]]; then
+                print_warn "Entry $((idx+1)) is already active — cannot enable."
+                bad=true; break
+            fi
+        done
+        $bad && { sleep 1; continue; }
+
+        # Collect affected line numbers (including preceding comment tag for delete)
+        # For comment/uncomment, only the cron line itself is modified — tag line is untouched.
+        local -a affected_linenums=()
+        local -a target_linenums=()
+        echo ""
+        local action_verb
+        case "$action_key" in
+            d) action_verb="delete" ;;
+            c) action_verb="comment out" ;;
+            e) action_verb="enable" ;;
+        esac
+        print_warn "This will ${action_verb}:"
         for idx in "${selected_indices[@]}"; do
             local target_linenum="${cron_line_nums[$idx]}"
             local target_line="${cron_lines[$idx]}"
             local prev_linenum=$(( target_linenum - 1 ))
             local prev_line=""
             [[ $prev_linenum -gt 0 ]] && prev_line=$(echo "$cron_output" | sed -n "${prev_linenum}p")
-            if [[ "$prev_line" =~ ^# ]]; then
-                remove_linenums+=("$prev_linenum")
+            if [[ "$action_key" == "d" && "$prev_line" =~ ^# ]]; then
+                affected_linenums+=("$prev_linenum")
                 echo -e "  ${DIM}${prev_line}${NC}"
             fi
-            remove_linenums+=("$target_linenum")
+            affected_linenums+=("$target_linenum")
+            target_linenums+=("$target_linenum")
             echo -e "  ${CYAN}${target_line}${NC}"
         done
         echo ""
 
-        # Sort and deduplicate line numbers, then join with commas for awk
-        local remove_lines
-        remove_lines=$(printf '%s\n' "${remove_linenums[@]}" | sort -nu | paste -sd,)
+        local confirm_msg
+        case "$action_key" in
+            d) confirm_msg="Delete the selected cron job(s)?" ;;
+            c) confirm_msg="Comment out (disable) the selected cron job(s)?" ;;
+            e) confirm_msg="Enable (uncomment) the selected cron job(s)?" ;;
+        esac
 
-        if ! confirm "Delete the selected cron job(s)?"; then
+        if ! confirm "$confirm_msg"; then
             [[ $_BACK -eq 1 ]] && return 1
             print_info "Cancelled."
             sleep 1
             continue
         fi
 
-        _warn_restart "after the cron job(s) are deleted."
+        local restart_verb
+        case "$action_key" in
+            d) restart_verb="the cron job(s) are deleted." ;;
+            c) restart_verb="the cron job(s) are disabled." ;;
+            e) restart_verb="the cron job(s) are enabled." ;;
+        esac
+        _warn_restart "after ${restart_verb}"
 
         if ! confirm "Proceed? (server will restart automatically)"; then
             [[ $_BACK -eq 1 ]] && return 1
@@ -549,22 +607,44 @@ _cron_view_delete() {
             continue
         fi
 
-        print_success "Deletion staged. Entering persistence mode now."
-        echo ""
+        # Build sorted comma-separated line number strings for awk
+        local affected_lines target_lines
+        affected_lines=$(printf '%s\n' "${affected_linenums[@]}" | sort -nu | paste -sd,)
+        target_lines=$(printf '%s\n' "${target_linenums[@]}"   | sort -nu | paste -sd,)
 
-        # $remove_lines is e.g. "5" or "2,3,5,6" — expanded by outer bash, safe in heredoc.
-        # The awk program skips all lines whose NR is in the skip set.
-        local chroot_exit=0
-        sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || chroot_exit=$?
-{ crontab -l 2>/dev/null || true; } | awk -v lines="$remove_lines" 'BEGIN{n=split(lines,a,","); for(i=1;i<=n;i++) skip[a[i]]=1} !(NR in skip){print}' | crontab -
+        local action_label chroot_exit=0
+        case "$action_key" in
+            d)
+                print_success "Deletion staged. Entering persistence mode now."
+                echo ""
+                sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || chroot_exit=$?
+{ crontab -l 2>/dev/null || true; } | awk -v lines="$affected_lines" 'BEGIN{n=split(lines,a,",");for(i=1;i<=n;i++)skip[a[i]]=1} !(NR in skip){print}' | crontab -
 exit
 EOF
+                action_label="deleted" ;;
+            c)
+                print_success "Disable staged. Entering persistence mode now."
+                echo ""
+                sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || chroot_exit=$?
+{ crontab -l 2>/dev/null || true; } | awk -v lines="$target_lines" 'BEGIN{n=split(lines,a,",");for(i=1;i<=n;i++)tog[a[i]]=1} NR in tog{print "#" $0;next} {print}' | crontab -
+exit
+EOF
+                action_label="disabled" ;;
+            e)
+                print_success "Enable staged. Entering persistence mode now."
+                echo ""
+                sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || chroot_exit=$?
+{ crontab -l 2>/dev/null || true; } | awk -v lines="$target_lines" 'BEGIN{n=split(lines,a,",");for(i=1;i<=n;i++)tog[a[i]]=1} NR in tog{sub(/^#/,"");print;next} {print}' | crontab -
+exit
+EOF
+                action_label="enabled" ;;
+        esac
 
         if [[ $chroot_exit -eq 0 ]]; then
-            print_success "Cron job(s) deleted."
+            print_success "Cron job(s) ${action_label}."
             print_warn "The server will restart shortly — your SSH session will disconnect."
         else
-            print_error "chroot-and-upgrade failed (exit $chroot_exit). Cron job(s) were not deleted."
+            print_error "chroot-and-upgrade failed (exit $chroot_exit). Cron job(s) were not ${action_label}."
             pause
         fi
         return
@@ -681,7 +761,7 @@ menu_manage_crontab() {
         print_header
         print_section "Manage Cron Jobs"
         echo ""
-        echo -e "    ${CYAN}${BOLD}1)${NC} View / delete cron jobs"
+        echo -e "    ${CYAN}${BOLD}1)${NC} View / edit cron jobs"
         echo -e "    ${CYAN}${BOLD}2)${NC} Add a cron job"
         echo ""
         echo -e "    ${DIM}0) Back${NC}"
