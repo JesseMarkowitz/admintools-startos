@@ -1,8 +1,18 @@
 #!/usr/bin/env bash
 # startos-admin.sh — Interactive admin menu for StartOS servers
 # Usage: chmod +x startos-admin.sh && ./startos-admin.sh
+#
+# Features:
+#   1. Create StartOS notification      — fire a one-time notification via start-cli
+#   2. Disk usage                       — per-service disk breakdown
+#   3. Memory usage                     — per-service memory breakdown
+#   4. Manage cron jobs                 — view, delete, and add persistent cron entries
+#   5. Schedule backups                 — cron-based automated backup with notification
+#   6. Schedule stay-alive curl         — periodic curl to keep an external monitor alive
+#   7. Manage notification forwarders   — poll start-cli notifications, forward via webhook
+#   8. System database viewer           — browse start-cli db dump by category
 
-VERSION="35"   # integer — increment on each release
+VERSION="39"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -31,6 +41,14 @@ _POLLER_LOG_PREFIX="/var/log/startos-notif-poller-"
 
 _BACK=0
 
+# ─────────────────────────────────────────────
+# Debug Mode
+# ─────────────────────────────────────────────
+
+_DEBUG=0
+_DEBUG_FLAG_FILE="/var/lib/startos-admin/debug"
+[[ -f "$_DEBUG_FLAG_FILE" ]] && _DEBUG=1
+
 # _read VARNAME "prompt" — wrapper around read -rp.
 # Typing "exit" at any prompt exits the script immediately.
 # Typing "back" at any prompt sets _BACK=1 and returns 1.
@@ -47,6 +65,12 @@ _read() {
 _nav_tip() {
     echo -e "  ${DIM}(type 'back' to return to main menu, or 'exit' to quit)${NC}"
     echo ""
+}
+
+# Print a debug message when _DEBUG=1. No-op otherwise.
+debug_log() {
+    [[ $_DEBUG -eq 1 ]] || return 0
+    echo -e "  ${DIM}[debug] $*${NC}"
 }
 
 # ─────────────────────────────────────────────
@@ -198,6 +222,7 @@ install_cron_job() {
 
     print_success "Cron job staged. Entering persistence mode now."
     echo ""
+    debug_log "Installing cron entry: $cron_line"
 
     # Feed commands into chroot-and-upgrade via heredoc.
     # Encoded values are alphanumeric-only — safe in any shell context.
@@ -207,6 +232,7 @@ install_cron_job() {
 { crontab -l 2>/dev/null; printf '%s' "$encoded_comment" | base64 -d; echo; printf '%s' "$encoded_line" | base64 -d; echo; } | crontab -
 exit
 EOF
+    debug_log "chroot-and-upgrade exit: $chroot_exit"
 
     if [[ $chroot_exit -eq 0 ]]; then
         print_success "Cron job installed persistently."
@@ -223,6 +249,7 @@ EOF
 # Create StartOS Notification
 # ─────────────────────────────────────────────
 
+# Wizard: compose and send a one-time StartOS notification via start-cli.
 menu_create_notification() {
     print_header
     print_section "Create StartOS Notification"
@@ -305,9 +332,11 @@ menu_create_notification() {
     print_info "Creating [$notif_level] notification for ${svc_display}: \"$notif_title\""
     echo ""
 
+    debug_log "Calling: start-cli notification create '${notif_service}' '$notif_level' '$notif_title' '...'"
     local exit_code=0
     start-cli notification create "$notif_service" "$notif_level" "$notif_title" "$notif_body" 2>&1 \
         || exit_code=$?
+    debug_log "start-cli exit: $exit_code"
 
     if [[ $exit_code -eq 0 ]]; then
         print_success "Notification created."
@@ -322,6 +351,7 @@ menu_create_notification() {
 # Display Disk Used by Service
 # ─────────────────────────────────────────────
 
+# Display total disk stats and per-service disk usage breakdown.
 menu_disk_usage() {
     print_header
     print_section "Disk Usage"
@@ -387,15 +417,18 @@ menu_disk_usage() {
 # Display Memory Used by Service
 # ─────────────────────────────────────────────
 
+# Display per-service memory usage and percentage of total RAM via start-cli package stats.
 menu_memory_usage() {
     print_header
     print_section "Memory Used by Service"
     echo ""
     print_info "Running: start-cli package stats"
+    debug_log "Running: start-cli package stats"
     echo ""
 
     local stats_output exit_code=0
     stats_output=$(start-cli package stats 2>&1) || exit_code=$?
+    debug_log "start-cli package stats exit: $exit_code"
 
     if [[ $exit_code -ne 0 ]]; then
         print_error "Command failed (exit $exit_code)."
@@ -431,6 +464,7 @@ menu_memory_usage() {
 # Manage Cron Jobs
 # ─────────────────────────────────────────────
 
+# Interactive submenu: view/delete existing cron entries or add a new one.
 _cron_manage_flow() {
     while true; do
         print_header
@@ -745,6 +779,22 @@ _cron_add_flow() {
     echo -e "  ${DIM}${full_line}${NC}"
     echo ""
 
+    if confirm "Run this command once now to test it?"; then
+        [[ $_BACK -eq 1 ]] && return 1
+        echo ""
+        print_info "Running: $cron_cmd"
+        echo ""
+        bash -c "$cron_cmd"
+        local run_exit=$?
+        echo ""
+        if [[ $run_exit -eq 0 ]]; then
+            print_success "Command exited 0."
+        else
+            print_warn "Command exited $run_exit."
+        fi
+        echo ""
+    fi
+
     if ! confirm "Install this cron job?"; then
         [[ $_BACK -eq 1 ]] && return 1
         print_info "Cancelled."
@@ -813,9 +863,19 @@ menu_schedule_backup() {
     print_header
     print_section "Schedule Backups"
     echo ""
+    echo -e "  Schedule an automatic backup via cron. You will choose a backup target,"
+    echo -e "  enter your StartOS password, and set a schedule."
+    echo ""
     _nav_tip
+    if ! confirm "Continue to setup wizard?"; then
+        [[ $_BACK -eq 1 ]] && return 1
+        return
+    fi
 
     # ── Step 1: Select backup target ────────────────────────────────────────
+    print_header
+    print_section "Schedule Backups"
+    echo ""
     print_info "Fetching backup targets..."
     local raw_targets
     if ! raw_targets=$(start-cli backup target list 2>&1); then
@@ -981,9 +1041,15 @@ _pick_notif_startos() {
     # Service selection
     echo ""
     print_info "Fetching installed services for notification..."
+    debug_log "Running: start-cli package list"
     local _pkg_list
-    _pkg_list=$(start-cli package list 2>/dev/null) || true
+    if ! _pkg_list=$(start-cli package list 2>&1); then
+        print_error "Failed to list packages. Is start-cli authenticated?"
+        echo -e "${RED}${_pkg_list}${NC}"
+        pause; return 1
+    fi
     mapfile -t _pkgs <<< "$(parse_package_ids "$_pkg_list")"
+    debug_log "Fetched ${#_pkgs[@]} packages"
 
     echo ""
     echo -e "  ${BOLD}Notification service:${NC}"
@@ -1084,8 +1150,18 @@ menu_schedule_stay_alive() {
     print_header
     print_section "Schedule Stay-Alive Curl"
     echo ""
+    echo -e "  Schedule a recurring curl to keep a URL reachable — useful for Tor hidden"
+    echo -e "  services, clearnet addresses, or any endpoint that needs periodic pinging."
+    echo ""
     _nav_tip
+    if ! confirm "Continue to setup wizard?"; then
+        [[ $_BACK -eq 1 ]] && return 1
+        return
+    fi
 
+    print_header
+    print_section "Schedule Stay-Alive Curl"
+    echo ""
     _read stay_url "  URL to curl: " || return 1
     if [[ -z "$stay_url" ]]; then
         print_error "URL cannot be empty."
@@ -1105,6 +1181,26 @@ menu_schedule_stay_alive() {
     echo ""
     echo -e "  ${DIM}Cron line: ${cron_line}${NC}"
     echo ""
+
+    if confirm "Send a test GET to verify the URL responds?"; then
+        [[ $_BACK -eq 1 ]] && return 1
+        _test_url_get "$stay_url"
+    fi
+
+    if confirm "Run the exact cron command once now to verify it exits 0?"; then
+        [[ $_BACK -eq 1 ]] && return 1
+        echo ""
+        print_info "Running: curl -fsS --max-time 10 \"$stay_url\""
+        echo ""
+        local test_exit=0
+        curl -fsS --max-time 10 "$stay_url" > /dev/null 2>&1 || test_exit=$?
+        echo ""
+        if   [[ $test_exit -eq 0 ]];  then print_success "curl exited 0 — command will work in cron."
+        elif [[ $test_exit -eq 28 ]]; then print_warn "curl timed out after 10s (exit 28)."
+        else                               print_warn "curl exited $test_exit — URL may not be reachable."
+        fi
+        echo ""
+    fi
 
     if ! confirm "Install this cron job?"; then
         [[ $_BACK -eq 1 ]] && return 1
@@ -1156,11 +1252,35 @@ _test_webhook() {
     local ts_test
     ts_test=$(date '+%Y.%m.%d %H:%M:%S %Z')
     local test_msg="${ts_test}  [${pname}]  [Info]  #0  test  |  Test — This is a test from startos-admin.sh"
+    debug_log "curl POST → $url"
     local out exit_code http body
     out=$(curl -s -w "\nHTTP_STATUS:%{http_code}" --max-time 10 -d "$test_msg" "$url" 2>&1)
     exit_code=$?
     http=$(echo "$out" | grep 'HTTP_STATUS:' | cut -d: -f2)
     body=$(echo "$out" | grep -v 'HTTP_STATUS:')
+    debug_log "curl exit=$exit_code  http=$http"
+    if   [[ $exit_code -eq 28 ]]; then print_warn "Timed out after 10s"
+    elif [[ $exit_code -ne 0 ]];  then print_warn "curl failed — exit $exit_code"
+    elif [[ "$http" =~ ^2 ]];     then print_success "OK — HTTP $http"
+    else                               print_warn "HTTP $http (expected 2xx)"
+    fi
+    [[ -n "$body" ]] && echo -e "  ${DIM}Response: ${body}${NC}"
+    echo ""
+}
+
+# Send a GET request to a URL and display the HTTP status + response. Non-blocking.
+# Usage: _test_url_get url
+_test_url_get() {
+    local url="$1"
+    echo ""
+    echo -e "  ${DIM}Sending GET request...${NC}"
+    debug_log "curl GET → $url"
+    local out exit_code http body
+    out=$(curl -s -w "\nHTTP_STATUS:%{http_code}" --max-time 10 "$url" 2>&1)
+    exit_code=$?
+    http=$(echo "$out" | grep 'HTTP_STATUS:' | cut -d: -f2)
+    body=$(echo "$out" | grep -v 'HTTP_STATUS:')
+    debug_log "curl exit=$exit_code  http=$http"
     if   [[ $exit_code -eq 28 ]]; then print_warn "Timed out after 10s"
     elif [[ $exit_code -ne 0 ]];  then print_warn "curl failed — exit $exit_code"
     elif [[ "$http" =~ ^2 ]];     then print_success "OK — HTTP $http"
@@ -1512,6 +1632,7 @@ KEYWORD=\"${keyword}\"
 STATE_FILE=\"${_POLLER_STATE_PREFIX}${name}\"
 LOG_MAX_LINES=25000
 DEBUG=0
+[ -f /var/lib/startos-admin/debug ] && DEBUG=1
 "
 
     local body_template
@@ -1683,6 +1804,7 @@ POLLER_BODY_END
 
     print_success "Forwarder staged. Entering persistence mode now."
     echo ""
+    debug_log "Installing poller '$name' → ${_POLLER_BIN_PREFIX}${name}"
 
     # Remove any existing entry for this poller name, then write the new script
     # and add the tagged comment + cron line. All in one chroot session.
@@ -1695,6 +1817,7 @@ chmod +x ${_POLLER_BIN_PREFIX}${name}
 { crontab -l 2>/dev/null; printf '%s' "$encoded_comment" | base64 -d; echo; printf '%s' "$encoded_cron" | base64 -d; echo; } | crontab -
 exit
 EOF
+    debug_log "chroot-and-upgrade exit: $chroot_exit"
 
     if [[ $chroot_exit -eq 0 ]]; then
         print_success "Forwarder '${name}' installed persistently."
@@ -1978,6 +2101,7 @@ menu_manage_notif_pollers() {
 # System Database Viewer
 # ─────────────────────────────────────────────
 
+# Display hostname, OS version, architecture, and last backup timestamp from DB.
 _db_server_info() {
     local db="$1"
     print_header
@@ -2004,6 +2128,7 @@ _db_server_info() {
     pause
 }
 
+# Display Tor addresses, LAN/gateway IPs, WiFi, and DNS servers from DB.
 _db_network() {
     local db="$1"
     print_header
@@ -2087,6 +2212,7 @@ _db_network() {
     pause
 }
 
+# List all installed services with running state and health-check status from DB.
 _db_svc_status() {
     local db="$1"
     print_header
@@ -2122,6 +2248,7 @@ _db_svc_status() {
     pause
 }
 
+# Display full DB record for a single service selected by the user.
 _db_svc_detail() {
     local db="$1"
     print_header
@@ -2201,12 +2328,14 @@ menu_db_dump() {
     print_section "System Database"
     echo ""
     print_info "Fetching database dump..."
+    debug_log "Running: start-cli db dump"
     local db_json
     db_json=$(start-cli db dump 2>/dev/null) || {
         print_error "Failed to run 'start-cli db dump'."
         pause; return
     }
     [[ -z "$db_json" ]] && { print_error "Empty response."; pause; return; }
+    debug_log "DB dump: ${#db_json} bytes"
 
     while true; do
         print_header
@@ -2248,6 +2377,7 @@ menu_documentation() {
         echo -e "    ${CYAN}${BOLD}6)${NC} Schedule stay-alive curl"
         echo -e "    ${CYAN}${BOLD}7)${NC} Manage notification forwarders"
         echo -e "    ${CYAN}${BOLD}8)${NC} System Database"
+        echo -e "    ${CYAN}${BOLD}9)${NC} Troubleshooting"
         echo ""
         echo -e "    ${DIM}0) Back${NC}"
         echo ""
@@ -2411,8 +2541,42 @@ menu_documentation() {
                 echo -e "    ${CYAN}•${NC} ${BOLD}Service Detail${NC} — full detail for a single service"
                 echo ""
                 pause ;;
+            9)
+                print_header
+                print_section "Troubleshooting"
+                echo ""
+                echo -e "  ${BOLD}Cron jobs not running${NC}"
+                echo -e "  Check that the cron daemon is active: ${CYAN}systemctl status cron${NC}"
+                echo -e "  Verify entries exist: ${CYAN}sudo crontab -u root -l${NC}"
+                echo -e "  Entries installed by this tool are prefixed with ${DIM}# startos-admin v${NC}"
+                echo ""
+                echo -e "  ${BOLD}Webhook not receiving messages${NC}"
+                echo -e "  Use the test option in the forwarder install wizard to confirm the"
+                echo -e "  URL is reachable. Check the poller log:"
+                echo -e "  ${DIM}/var/log/startos-notif-poller-<name>.log${NC}"
+                echo -e "  Look for ${DIM}curl${NC} errors or non-2xx HTTP responses."
+                echo ""
+                echo -e "  ${BOLD}Forwarder state file corruption${NC}"
+                echo -e "  If a forwarder is re-forwarding old notifications or skipping new"
+                echo -e "  ones, delete its state file and reinstall:"
+                echo -e "  ${DIM}/var/lib/startos-admin/startos-admin-poller-state-<name>${NC}"
+                echo -e "  The next run will treat it as a first run and forward only the"
+                echo -e "  most recent notification."
+                echo ""
+                echo -e "  ${BOLD}start-cli authentication errors${NC}"
+                echo -e "  Some features require ${CYAN}start-cli${NC} to be authenticated."
+                echo -e "  If you see 'Failed to list packages', reconnect your SSH session"
+                echo -e "  and confirm ${CYAN}start-cli auth status${NC} reports authenticated."
+                echo ""
+                echo -e "  ${BOLD}Changes lost after reboot${NC}"
+                echo -e "  StartOS does not persist changes by default. All changes made by"
+                echo -e "  this tool go through ${CYAN}chroot-and-upgrade${NC}, which triggers a server"
+                echo -e "  restart and makes the change permanent. If a change was not made"
+                echo -e "  via this tool, it will be lost on next reboot."
+                echo ""
+                pause ;;
             0) return ;;
-            *) print_warn "Enter 0-8." ; sleep 1 ;;
+            *) print_warn "Enter 0-9." ; sleep 1 ;;
         esac
     done
 }
@@ -2420,6 +2584,14 @@ menu_documentation() {
 # ─────────────────────────────────────────────
 # Auto-Update Check
 # ─────────────────────────────────────────────
+# Two-phase flow:
+#   Phase 1 — Persistent install check: if the script is not running from
+#     /usr/local/bin/startos-admin, offer to install it there and return.
+#     Version comparison is skipped in this case.
+#   Phase 2 — Version check: fetch the remote script from GitHub, extract
+#     its VERSION, and offer an upgrade if the remote version is newer.
+#     Runs only when already installed persistently.
+# Both phases are silent on network failure (curl || return 0).
 
 check_for_update() {
     local raw_url="https://raw.githubusercontent.com/JesseMarkowitz/admintools-startos/refs/heads/main/startos-admin.sh"
@@ -2462,10 +2634,12 @@ EOF
 
     # ── Normal update check (only runs when already persistent) ─────────────
     # Fetch with short timeout — fail silently if offline or unreachable
+    debug_log "Fetching remote version from: $raw_url"
     remote_script=$(curl -fsSL --max-time 5 "$raw_url" 2>/dev/null) || return 0
 
     remote_version=$(echo "$remote_script" | grep '^VERSION=' | head -1 | tr -d '"' | cut -d= -f2 | awk '{print $1}')
     [[ -z "$remote_version" ]] && return 0
+    debug_log "Remote version: $remote_version  Local: $VERSION"
 
     # Compare as integers; skip if already current
     if [[ "$remote_version" -le "$VERSION" ]] 2>/dev/null; then
@@ -2507,6 +2681,45 @@ EOF
 }
 
 # ─────────────────────────────────────────────
+# Debug Mode Toggle
+# ─────────────────────────────────────────────
+
+# Toggle debug mode on/off. Writes or removes the flag file; updates _DEBUG for this session.
+menu_toggle_debug() {
+    print_header
+    print_section "Debug Mode"
+    echo ""
+    if [[ $_DEBUG -eq 1 ]]; then
+        echo -e "  Debug mode is currently ${GREEN}${BOLD}ON${NC}."
+        echo -e "  ${DIM}Extra output is shown during operations. Poller scripts log verbosely.${NC}"
+        echo ""
+        if confirm "Disable debug mode?"; then
+            rm -f "$_DEBUG_FLAG_FILE"
+            _DEBUG=0
+            print_success "Debug mode disabled."
+        else
+            [[ $_BACK -eq 1 ]] && return 1
+            print_info "No change."
+        fi
+    else
+        echo -e "  Debug mode is currently ${DIM}OFF${NC}."
+        echo -e "  ${DIM}Enabling shows extra output during operations and enables verbose poller logging.${NC}"
+        echo ""
+        if confirm "Enable debug mode?"; then
+            mkdir -p "$(dirname "$_DEBUG_FLAG_FILE")"
+            touch "$_DEBUG_FLAG_FILE"
+            _DEBUG=1
+            print_success "Debug mode enabled."
+        else
+            [[ $_BACK -eq 1 ]] && return 1
+            print_info "No change."
+        fi
+    fi
+    echo ""
+    pause
+}
+
+# ─────────────────────────────────────────────
 # Main Menu
 # ─────────────────────────────────────────────
 
@@ -2514,11 +2727,13 @@ main_menu() {
     check_for_update
     while true; do
         print_header
-        # Counts for display
-        local _cron_n _fwd_arr _fwd_n
+        _nav_tip
+        # Counts and labels for display
+        local _cron_n _fwd_arr _fwd_n _dbg_label
         _cron_n=$(sudo crontab -u root -l 2>/dev/null | grep -c '^# startos-admin v' 2>/dev/null || echo 0)
         _fwd_arr=("${_POLLER_BIN_PREFIX}"*)
         [[ -e "${_fwd_arr[0]}" ]] && _fwd_n=${#_fwd_arr[@]} || _fwd_n=0
+        [[ $_DEBUG -eq 1 ]] && _dbg_label="${GREEN}ON${NC}" || _dbg_label="${DIM}OFF${NC}"
 
         echo -e "  ${BOLD}Select an action:${NC}"
         echo ""
@@ -2531,6 +2746,7 @@ main_menu() {
         echo -e "    ${CYAN}${BOLD}7)${NC} Schedule stay-alive curl"
         echo -e "    ${CYAN}${BOLD}8)${NC} Manage notification forwarders  ${DIM}(${_fwd_n})${NC}"
         echo -e "    ${CYAN}${BOLD}9)${NC} System Database"
+        echo -e "    ${CYAN}${BOLD}10)${NC} Debug mode  ${DIM}(${NC}${_dbg_label}${DIM})${NC}"
         echo ""
         echo -e "    ${DIM}0) Exit${NC}"
         echo ""
@@ -2547,6 +2763,7 @@ main_menu() {
             7) menu_schedule_stay_alive    || { _BACK=0; continue; } ;;
             8) menu_manage_notif_pollers   || { _BACK=0; continue; } ;;
             9) menu_db_dump                || { _BACK=0; continue; } ;;
+            10) menu_toggle_debug          || { _BACK=0; continue; } ;;
             0)
                 echo ""
                 print_info "Goodbye."
@@ -2554,7 +2771,7 @@ main_menu() {
                 exit 0
                 ;;
             *)
-                print_warn "Invalid choice. Enter 0-9."
+                print_warn "Invalid choice. Enter 0-10."
                 sleep 1
                 ;;
         esac

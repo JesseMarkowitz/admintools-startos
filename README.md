@@ -37,9 +37,10 @@ Key risks and cautions:
 
 - **Root-level impact:** If you run this script as `root` (or via `sudo`), it can modify system state (e.g., write to `/usr/local/bin`, create/edit cron entries, create state files, make outbound HTTP requests). Mistakes or malicious changes could cause system damage or data loss.
 - **Not formally vetted or approved:** This project has **not** been heavily security-audited, formally reviewed, or approved by Start9/StartOS. It may contain bugs or unsafe assumptions.
-- **Supply-chain / update risk:** The script can check for updates and may offer to install a newer version. Any workflow that fetches and executes code from the internet increases supply-chain risk.
+- **Backup password stored in plaintext cron entry (S1):** When you schedule a backup, your StartOS primary password is written into the root crontab in plaintext as part of the `start-cli backup create` command. This means it is visible to anyone who can run `sudo crontab -l`, and it may appear in system logs. Evaluate whether this is acceptable in your threat model before scheduling backups. You can remove a backup cron entry at any time from the Manage Cron Jobs menu.
+- **Auto-update has no integrity verification (S2):** When the script checks for and installs updates, it fetches the new version from GitHub over HTTPS. No checksum, GPG signature, or other integrity mechanism is applied to verify the downloaded content. While HTTPS prevents most network-level attacks, a compromised GitHub account or repository could serve malicious code. Always review the script after an update, or disable auto-update by declining the prompt at startup.
+- **Supply-chain / update risk:** Any workflow that fetches and executes code from the internet increases supply-chain risk. See the auto-update note above.
 - **Outbound webhook/URL risk:** Features that `curl` a URL or POST to a webhook can leak metadata (timestamps, service names, notification text). Only use endpoints you trust, and prefer HTTPS.
-- **Cleartext in cron risk:** Actions in cron are stored in cleartext.  Scheduling backups requires the password specified in cleartext. You are responsible for evaluating that risk and determining if it is acceptable to you.
 - **Use at your own risk:** You are responsible for reviewing the code and deciding whether to run it in your environment.
 
 **Recommended best practices:**
