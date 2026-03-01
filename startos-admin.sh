@@ -12,7 +12,7 @@
 #   7. Manage notification forwarders   — poll start-cli notifications, forward via webhook
 #   8. System database viewer           — browse start-cli db dump by category
 
-VERSION="39"   # integer — increment on each release
+VERSION="40"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -390,7 +390,7 @@ menu_disk_usage() {
         pause; return
     fi
 
-    # Color-code the output: highlight lines >= 1G in red, >= 100M in yellow
+    # Sort largest first (sort -rh handles K/M/G/T), then color-code the output
     while IFS= read -r line; do
         local size_field
         size_field=$(echo "$line" | awk '{print $1}')
@@ -406,7 +406,7 @@ menu_disk_usage() {
         else
             echo -e "  ${line}"
         fi
-    done <<< "$raw_output"
+    done <<< "$(echo "$raw_output" | sort -rh)"
 
     echo ""
     echo -e "  ${DIM}(Red = ≥ 1G, Yellow = ≥ 100M)${NC}"
@@ -436,9 +436,9 @@ menu_memory_usage() {
         pause; return
     fi
 
-    # Reformat: strip table borders, drop Container ID column, colorize by usage %
+    # Reformat: strip table borders, drop Container ID column, sort by usage % desc, colorize
     echo "$stats_output" | awk '
-    BEGIN { FS="|" }
+    BEGIN { FS="|"; rc=0 }
     /^\+/ { next }
     /^\|/ {
         n = $2; gsub(/^[ \t]+|[ \t]+$/, "", n)
@@ -448,12 +448,23 @@ menu_memory_usage() {
         if (n == "Name") {
             printf "\033[1m  %-22s %-12s %-14s %s\033[0m\n", n, u, l, p
             printf "  %-22s %-12s %-14s %s\n", "──────────────────────", "──────────", "────────────", "────────"
-        } else {
-            pct = p + 0
-            if (pct >= 80)      color = "\033[1;31m"
-            else if (pct >= 50) color = "\033[33m"
-            else                color = "\033[0m"
-            printf "%s  %-22s %-12s %-14s %s\033[0m\n", color, n, u, l, p
+        } else if (n != "") {
+            rc++; ns[rc]=n; us[rc]=u; ls[rc]=l; ps[rc]=p; pn[rc]=p+0
+        }
+    }
+    END {
+        for (i=1; i<=rc; i++) for (j=i+1; j<=rc; j++) if (pn[j]>pn[i]) {
+            tmp=ns[i]; ns[i]=ns[j]; ns[j]=tmp
+            tmp=us[i]; us[i]=us[j]; us[j]=tmp
+            tmp=ls[i]; ls[i]=ls[j]; ls[j]=tmp
+            tmp=ps[i]; ps[i]=ps[j]; ps[j]=tmp
+            tmp=pn[i]; pn[i]=pn[j]; pn[j]=tmp
+        }
+        for (i=1; i<=rc; i++) {
+            if (pn[i]>=80)      color="\033[1;31m"
+            else if (pn[i]>=50) color="\033[33m"
+            else                color="\033[0m"
+            printf "%s  %-22s %-12s %-14s %s\033[0m\n", color, ns[i], us[i], ls[i], ps[i]
         }
     }'
     echo ""
@@ -2694,7 +2705,7 @@ menu_toggle_debug() {
         echo -e "  ${DIM}Extra output is shown during operations. Poller scripts log verbosely.${NC}"
         echo ""
         if confirm "Disable debug mode?"; then
-            rm -f "$_DEBUG_FLAG_FILE"
+            sudo rm -f "$_DEBUG_FLAG_FILE"
             _DEBUG=0
             print_success "Debug mode disabled."
         else
@@ -2706,8 +2717,8 @@ menu_toggle_debug() {
         echo -e "  ${DIM}Enabling shows extra output during operations and enables verbose poller logging.${NC}"
         echo ""
         if confirm "Enable debug mode?"; then
-            mkdir -p "$(dirname "$_DEBUG_FLAG_FILE")"
-            touch "$_DEBUG_FLAG_FILE"
+            sudo mkdir -p "$(dirname "$_DEBUG_FLAG_FILE")"
+            sudo touch "$_DEBUG_FLAG_FILE"
             _DEBUG=1
             print_success "Debug mode enabled."
         else
@@ -2730,7 +2741,7 @@ main_menu() {
         _nav_tip
         # Counts and labels for display
         local _cron_n _fwd_arr _fwd_n _dbg_label
-        _cron_n=$(sudo crontab -u root -l 2>/dev/null | grep -c '^# startos-admin v' 2>/dev/null || echo 0)
+        _cron_n=$(sudo crontab -u root -l 2>/dev/null | grep -c '^# startos-admin v' || true)
         _fwd_arr=("${_POLLER_BIN_PREFIX}"*)
         [[ -e "${_fwd_arr[0]}" ]] && _fwd_n=${#_fwd_arr[@]} || _fwd_n=0
         [[ $_DEBUG -eq 1 ]] && _dbg_label="${GREEN}ON${NC}" || _dbg_label="${DIM}OFF${NC}"
