@@ -12,7 +12,7 @@
 #   7. Manage notification forwarders   — poll start-cli notifications, forward via webhook
 #   8. System database viewer           — browse start-cli db dump by category
 
-VERSION="40"   # integer — increment on each release
+VERSION="41"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -32,8 +32,9 @@ NC="\e[0m"
 # Path Constants
 # ─────────────────────────────────────────────
 _POLLER_BIN_PREFIX="/usr/local/bin/startos-notif-poller-"
-_POLLER_STATE_PREFIX="/var/lib/startos-admin/startos-admin-poller-state-"
-_POLLER_LOG_PREFIX="/var/log/startos-notif-poller-"
+_STARTOS_DATA_DIR="/media/startos/data/startos-admin"
+_POLLER_STATE_PREFIX="${_STARTOS_DATA_DIR}/startos-admin-poller-state-"
+_POLLER_LOG_PREFIX="${_STARTOS_DATA_DIR}/startos-notif-poller-"
 
 # ─────────────────────────────────────────────
 # Navigation — "exit" / "back" support
@@ -46,7 +47,7 @@ _BACK=0
 # ─────────────────────────────────────────────
 
 _DEBUG=0
-_DEBUG_FLAG_FILE="/var/lib/startos-admin/debug"
+_DEBUG_FLAG_FILE="${_STARTOS_DATA_DIR}/debug"
 [[ -f "$_DEBUG_FLAG_FILE" ]] && _DEBUG=1
 
 # _read VARNAME "prompt" — wrapper around read -rp.
@@ -1641,9 +1642,10 @@ WEBHOOK_URL=\"${url}\"
 LEVELS=\"${levels}\"
 KEYWORD=\"${keyword}\"
 STATE_FILE=\"${_POLLER_STATE_PREFIX}${name}\"
+LOG_FILE=\"${_POLLER_LOG_PREFIX}${name}.log\"
 LOG_MAX_LINES=25000
 DEBUG=0
-[ -f /var/lib/startos-admin/debug ] && DEBUG=1
+[ -f ${_STARTOS_DATA_DIR}/debug ] && DEBUG=1
 "
 
     local body_template
@@ -1654,7 +1656,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 _ts() { date '+%Y.%m.%d %H:%M:%S %Z'; }
 
 # ── Log self-truncation ───────────────────────────────────────────────────
-_SELF_LOG="/var/log/startos-notif-poller-${POLLER_NAME}.log"
+_SELF_LOG="$LOG_FILE"
 if [ -f "$_SELF_LOG" ]; then
     _LC=$(wc -l < "$_SELF_LOG" 2>/dev/null || echo 0)
     if [ "$_LC" -gt "$LOG_MAX_LINES" ]; then
@@ -2533,8 +2535,8 @@ menu_documentation() {
                 echo -e "  ${BOLD}Files created per forwarder:${NC}"
                 echo ""
                 echo -e "    ${DIM}Script:  /usr/local/bin/startos-notif-poller-<name>${NC}"
-                echo -e "    ${DIM}State:   /var/lib/startos-admin/startos-admin-poller-state-<name>${NC}"
-                echo -e "    ${DIM}Log:     /var/log/startos-notif-poller-<name>.log${NC}"
+                echo -e "    ${DIM}State:   /media/startos/data/startos-admin/startos-admin-poller-state-<name>${NC}"
+                echo -e "    ${DIM}Log:     /media/startos/data/startos-admin/startos-notif-poller-<name>.log${NC}"
                 echo ""
                 pause ;;
             8)
@@ -2564,13 +2566,13 @@ menu_documentation() {
                 echo -e "  ${BOLD}Webhook not receiving messages${NC}"
                 echo -e "  Use the test option in the forwarder install wizard to confirm the"
                 echo -e "  URL is reachable. Check the poller log:"
-                echo -e "  ${DIM}/var/log/startos-notif-poller-<name>.log${NC}"
+                echo -e "  ${DIM}/media/startos/data/startos-admin/startos-notif-poller-<name>.log${NC}"
                 echo -e "  Look for ${DIM}curl${NC} errors or non-2xx HTTP responses."
                 echo ""
                 echo -e "  ${BOLD}Forwarder state file corruption${NC}"
                 echo -e "  If a forwarder is re-forwarding old notifications or skipping new"
                 echo -e "  ones, delete its state file and reinstall:"
-                echo -e "  ${DIM}/var/lib/startos-admin/startos-admin-poller-state-<name>${NC}"
+                echo -e "  ${DIM}/media/startos/data/startos-admin/startos-admin-poller-state-<name>${NC}"
                 echo -e "  The next run will treat it as a first run and forward only the"
                 echo -e "  most recent notification."
                 echo ""
@@ -2629,7 +2631,7 @@ check_for_update() {
             sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || _chroot_exit=$?
 printf '%s' "$_encoded" | base64 -d > /usr/local/bin/startos-admin
 chmod +x /usr/local/bin/startos-admin
-mkdir -p /var/lib/startos-admin
+mkdir -p /media/startos/data/startos-admin
 exit
 EOF
             if [[ $_chroot_exit -eq 0 ]]; then
@@ -2679,7 +2681,7 @@ EOF
     sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || chroot_exit=$?
 printf '%s' "$encoded" | base64 -d > /usr/local/bin/startos-admin
 chmod +x /usr/local/bin/startos-admin
-mkdir -p /var/lib/startos-admin
+mkdir -p /media/startos/data/startos-admin
 exit
 EOF
 
