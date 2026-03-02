@@ -98,11 +98,11 @@ Cron jobs (created by scheduling actions):
 - Stay-alive URL checks
 - Notification forwarder poll schedules
 
-Notification Forwarders 
-- Forwarding executables are installed in `/usr/local/bin/`
-- Each executable is intended to be independently runnable and scheduled.
-- Each forwarder maintains a state file so it only forwards notifications it hasn't already seen.
-- Location and naming are determined by the script's implementation; treat these as part of the persistent footprint.
+Notification Forwarders
+- Forwarding executables are installed in `/usr/local/bin/` (persistent via chroot)
+- Each forwarder maintains a state file between cron runs within a boot session
+- **State files are volatile**: they are lost on reboot. The forwarder silently catches up on the first post-boot run; notifications during downtime are not forwarded.
+- Log files are similarly volatile and reset each boot.
 
 **Mandatory reboots**
 After making a change that will be persistent startos-admin will confirm you want to do this, then prompt again - reminding you that this will restart your StartOS server.
@@ -255,11 +255,16 @@ If your server goes offline (hardware failure, ISP outage, power loss), it canno
 <details>
 <summary><strong>7. Manage Notification Pollers </strong></summary>
 
-Creates persistent pollers that forward StartOS notifications to external systems.  Each poller periodically runs `start-cli notification list`, filters the notifications by level and/or keyword and performs a HTTP request to a specified URL to forward matching entries.  
+Creates persistent pollers that forward StartOS notifications to external systems. Each poller periodically runs `start-cli notification list`, filters by level and/or keyword, and performs an HTTP request to forward matching entries.
 
-Each poller saves log files at: /var/log/startos-notif-poller-<name>.log (i.e. if your poller is named backups, the log is at /var/log/startos-notif-poller-backups.log).  They also maintain a state file to prevent duplicate forwarding 
+Log files: `/usr/local/share/startos-admin/startos-notif-poller-<name>.log`
+State files: `/usr/local/share/startos-admin/startos-admin-poller-state-<name>`
 
 Multiple pollers may be installed simultaneously (e.g., one for all warnings, one for backup-related errors only).
+
+**Limitations**
+- **State is volatile**: State and log files are stored in StartOS's runtime layer and are lost on each reboot. On first run after each reboot, the forwarder silently re-seeds its state from the current notification list.
+- **Notifications during downtime are not forwarded**: If a notification occurs while the server is offline or rebooting, it will not be forwarded. Only notifications that arrive after the first post-boot cron run will be sent.
 
 
 Options:

@@ -12,7 +12,7 @@
 #   7. Manage notification forwarders   — poll start-cli notifications, forward via webhook
 #   8. System database viewer           — browse start-cli db dump by category
 
-VERSION="43"   # integer — increment on each release
+VERSION="44"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -663,26 +663,32 @@ _cron_manage_flow() {
             d)
                 print_success "Deletion staged. Entering persistence mode now."
                 echo ""
+                debug_log "cron delete: line numbers=$affected_lines"
                 sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || chroot_exit=$?
 { crontab -l 2>/dev/null || true; } | awk -v lines="$affected_lines" 'BEGIN{n=split(lines,a,",");for(i=1;i<=n;i++)skip[a[i]]=1} !(NR in skip){print}' | crontab -
 exit
 EOF
+                debug_log "chroot-and-upgrade exit: $chroot_exit"
                 action_label="deleted" ;;
             c)
                 print_success "Disable staged. Entering persistence mode now."
                 echo ""
+                debug_log "cron disable: line numbers=$target_lines"
                 sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || chroot_exit=$?
 { crontab -l 2>/dev/null || true; } | awk -v lines="$target_lines" 'BEGIN{n=split(lines,a,",");for(i=1;i<=n;i++)tog[a[i]]=1} NR in tog{print "#" $0;next} {print}' | crontab -
 exit
 EOF
+                debug_log "chroot-and-upgrade exit: $chroot_exit"
                 action_label="disabled" ;;
             e)
                 print_success "Enable staged. Entering persistence mode now."
                 echo ""
+                debug_log "cron enable: line numbers=$target_lines"
                 sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || chroot_exit=$?
 { crontab -l 2>/dev/null || true; } | awk -v lines="$target_lines" 'BEGIN{n=split(lines,a,",");for(i=1;i<=n;i++)tog[a[i]]=1} NR in tog{sub(/^#/,"");print;next} {print}' | crontab -
 exit
 EOF
+                debug_log "chroot-and-upgrade exit: $chroot_exit"
                 action_label="enabled" ;;
         esac
 
@@ -691,6 +697,16 @@ EOF
             print_warn "The server will restart shortly — your SSH session will disconnect."
         else
             print_error "chroot-and-upgrade failed (exit $chroot_exit). Cron job(s) were not ${action_label}."
+            if [[ $_DEBUG -eq 1 ]]; then
+                local _c_path="/usr/lib/startos/scripts/chroot-and-upgrade"
+                if [[ -x "$_c_path" ]]; then
+                    debug_log "chroot-and-upgrade binary found and executable: $_c_path"
+                else
+                    debug_log "chroot-and-upgrade NOT found or not executable at: $_c_path"
+                fi
+            else
+                print_info "Enable debug mode (main menu → 10) and retry for more detail."
+            fi
             pause
         fi
         return
@@ -1470,9 +1486,10 @@ _poller_install_flow() {
     echo -e "  ${DIM}State:   ${_POLLER_STATE_PREFIX}${poller_name}${NC}"
     echo -e "  ${DIM}Log:     ${_POLLER_LOG_PREFIX}${poller_name}.log${NC}"
     echo ""
-    echo -e "  ${YELLOW}First-run note:${NC} On the first poll after install, the forwarder will"
-    echo -e "  forward only the single most recent notification at that moment."
-    echo -e "  All older notifications are skipped to avoid a historical flood."
+    echo -e "  ${YELLOW}First-run note:${NC} On first run and after every server reboot, the forwarder"
+    echo -e "  silently catches up to the current notification state — nothing is forwarded."
+    echo -e "  Only notifications that arrive after the first post-boot cron tick will be sent."
+    echo -e "  ${DIM}Notifications during downtime or reboots are not forwarded (known limitation).${NC}"
     echo ""
 
     local _tw_yn
@@ -2024,7 +2041,7 @@ _poller_state_flow() {
     echo -e "  ${BOLD}State file:${NC}        ${state_file}"
     echo -e "  ${BOLD}Last forwarded ID:${NC} ${sv}"
     echo ""
-    echo -e "    ${BOLD}1)${NC} Delete state file  ${DIM}(next run seeds from most recent notification)${NC}"
+    echo -e "    ${BOLD}1)${NC} Delete state file  ${DIM}(next run silently catches up — no notifications forwarded)${NC}"
     echo -e "    ${BOLD}2)${NC} Set to current max  ${DIM}(skip all existing, forward only future)${NC}"
     echo -e "    ${BOLD}3)${NC} Set to specific ID"
     echo -e "    ${DIM}0) Back${NC}"
@@ -2566,16 +2583,16 @@ menu_documentation() {
                 echo ""
                 echo -e "  ${BOLD}Webhook not receiving messages${NC}"
                 echo -e "  Use the test option in the forwarder install wizard to confirm the"
-                echo -e "  URL is reachable. Check the poller log:"
-                echo -e "  ${DIM}/media/startos/data/startos-admin/startos-notif-poller-<name>.log${NC}"
+                echo -e "  URL is reachable. Check the poller log (volatile — lost on reboot):"
+                echo -e "  ${DIM}/usr/local/share/startos-admin/startos-notif-poller-<name>.log${NC}"
                 echo -e "  Look for ${DIM}curl${NC} errors or non-2xx HTTP responses."
                 echo ""
-                echo -e "  ${BOLD}Forwarder state file corruption${NC}"
-                echo -e "  If a forwarder is re-forwarding old notifications or skipping new"
-                echo -e "  ones, delete its state file and reinstall:"
-                echo -e "  ${DIM}/media/startos/data/startos-admin/startos-admin-poller-state-<name>${NC}"
-                echo -e "  The next run will treat it as a first run and forward only the"
-                echo -e "  most recent notification."
+                echo -e "  ${BOLD}Forwarder state file${NC}"
+                echo -e "  State files are volatile and lost on reboot. On the first post-boot"
+                echo -e "  cron run, the forwarder silently catches up — no notifications are"
+                echo -e "  forwarded. Notifications that occurred during downtime are not sent."
+                echo -e "  To force a re-seed manually, delete the state file:"
+                echo -e "  ${DIM}/usr/local/share/startos-admin/startos-admin-poller-state-<name>${NC}"
                 echo ""
                 echo -e "  ${BOLD}start-cli authentication errors${NC}"
                 echo -e "  Some features require ${CYAN}start-cli${NC} to be authenticated."
