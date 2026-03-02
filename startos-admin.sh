@@ -12,7 +12,7 @@
 #   7. Manage notification forwarders   — poll start-cli notifications, forward via webhook
 #   8. System database viewer           — browse start-cli db dump by category
 
-VERSION="42"   # integer — increment on each release
+VERSION="43"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -32,7 +32,7 @@ NC="\e[0m"
 # Path Constants
 # ─────────────────────────────────────────────
 _POLLER_BIN_PREFIX="/usr/local/bin/startos-notif-poller-"
-_STARTOS_DATA_DIR="/media/startos/data/startos-admin"
+_STARTOS_DATA_DIR="/usr/local/share/startos-admin"
 _POLLER_STATE_PREFIX="${_STARTOS_DATA_DIR}/startos-admin-poller-state-"
 _POLLER_LOG_PREFIX="${_STARTOS_DATA_DIR}/startos-notif-poller-"
 
@@ -1707,17 +1707,15 @@ if [ -z "$NOTIFS" ]; then
     exit 0
 fi
 
-# ── First run: seed state to prevent historical flood ─────────────────────
-# On first run (no state file exists yet), we find the highest existing
-# notification ID and set LAST_ID = MAX_ID - 1 so that only the single most
-# recent notification is forwarded. This prevents replaying every historical
-# notification the first time the forwarder runs. Subsequent runs forward
-# only notifications with IDs greater than the last seen ID.
+# ── First run: seed state to skip existing notifications ──────────────────
+# On first run (no state file), set LAST_ID to the current maximum so that
+# no historical notifications are forwarded. Only notifications that arrive
+# after this run will be forwarded. This also applies after a reboot since
+# the state file is recreated on the first post-boot cron tick.
 if [ "$FIRST_RUN" -eq 1 ]; then
     MAX_RAW=$(echo "$NOTIFS" | jq '[.[].id | tonumber] | max // 0' 2>/dev/null || echo "0")
-    LAST_ID=$(( MAX_RAW - 1 ))
-    [ "$LAST_ID" -lt 0 ] && LAST_ID=0
-    echo "$(_ts): INFO first run — most recent notification id=$MAX_RAW, setting LAST_ID=$LAST_ID so only that notification is forwarded"
+    LAST_ID=$MAX_RAW
+    echo "$(_ts): INFO first run — no state file found. Skipping $MAX_RAW existing notification(s). Only new notifications will be forwarded."
 fi
 
 # ── Inspect raw API response ──────────────────────────────────────────────
@@ -1819,16 +1817,14 @@ POLLER_BODY_END
     echo ""
     debug_log "Installing poller '$name' → ${_POLLER_BIN_PREFIX}${name}"
 
-    # Create data dir on the LIVE mounted data partition now (before the restart).
-    # mkdir inside chroot-and-upgrade targets the root-fs overlay, not the mounted
-    # /media/startos/data partition, so it would be hidden by the mount point at runtime.
-    sudo mkdir -p "${_STARTOS_DATA_DIR}"
-
     # Remove any existing entry for this poller name, then write the new script
     # and add the tagged comment + cron line. All in one chroot session.
+    # mkdir -p here creates the data dir in the persistent root-fs overlay so that
+    # cron jobs writing state/log files there survive across reboots.
     # \$0 in the heredoc → $0 for awk (the outer bash escapes \$ → $).
     local chroot_exit=0
     sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || chroot_exit=$?
+mkdir -p ${_STARTOS_DATA_DIR}
 { crontab -l 2>/dev/null || true; } | awk -v t="# startos-notif-poller-${name}" 'index(\$0,t)==1{skip=1;next} skip{skip=0;next} {print}' | crontab -
 printf '%s' "$encoded_script" | base64 -d > ${_POLLER_BIN_PREFIX}${name}
 chmod +x ${_POLLER_BIN_PREFIX}${name}
@@ -2632,7 +2628,6 @@ check_for_update() {
             echo ""
             local _encoded
             _encoded=$(base64 -w 0 < "$_script_path")
-            sudo mkdir -p "${_STARTOS_DATA_DIR}"
             local _chroot_exit=0
             sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || _chroot_exit=$?
 printf '%s' "$_encoded" | base64 -d > /usr/local/bin/startos-admin
@@ -2682,7 +2677,6 @@ EOF
     local encoded
     encoded=$(printf '%s' "$remote_script" | base64 -w 0)
 
-    sudo mkdir -p "${_STARTOS_DATA_DIR}"
     local chroot_exit=0
     sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || chroot_exit=$?
 printf '%s' "$encoded" | base64 -d > /usr/local/bin/startos-admin

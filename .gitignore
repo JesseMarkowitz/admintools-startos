@@ -1,1 +1,3 @@
 *.txt
+startos-admin-poller-state-*
+startos-notif-poller-*.log
