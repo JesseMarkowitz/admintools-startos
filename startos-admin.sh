@@ -12,7 +12,7 @@
 #   7. Manage notification forwarders   — poll start-cli notifications, forward via webhook
 #   8. System database viewer           — browse start-cli db dump by category
 
-VERSION="45"   # integer — increment on each release
+VERSION="46"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -1134,27 +1134,31 @@ _pick_post_action() {
 
     echo ""
     echo -e "  ${BOLD}${_ppa_header}${NC}"
-    echo -e "    ${BOLD}1)${NC} curl to a URL"
+    echo -e "    ${BOLD}1)${NC} Shell command"
     echo -e "    ${BOLD}2)${NC} StartOS notification"
     echo -e "    ${BOLD}3)${NC} Both"
     echo -e "    ${BOLD}4)${NC} None"
     echo ""
 
-    local _ppa_mode="" _ppa_curl_url=""
+    local _ppa_mode="" _ppa_cmd=""
     local _ppa_svc="" _ppa_level="" _ppa_title="" _ppa_body=""
     while true; do
         _read _ppa_choice "  Choice [1-4]: " || return 1
         case "$_ppa_choice" in
             1)
-                _read _ppa_curl_url "  Notification URL: " || return 1
-                [[ -z "$_ppa_curl_url" ]] && { print_warn "URL cannot be empty."; continue; }
+                echo -e "  ${DIM}Enter the full command to run. Example:${NC}"
+                echo -e "  ${DIM}curl -d \"Backup started\" https://ntfy.sh/Your-Topic${NC}"
+                _read _ppa_cmd "  Shell command: " || return 1
+                [[ -z "$_ppa_cmd" ]] && { print_warn "Command cannot be empty."; continue; }
                 _ppa_mode="1"; break ;;
             2)
                 _pick_notif_startos _ppa_svc _ppa_level _ppa_title _ppa_body || return 1
                 _ppa_mode="2"; break ;;
             3)
-                _read _ppa_curl_url "  Notification URL: " || return 1
-                [[ -z "$_ppa_curl_url" ]] && { print_warn "URL cannot be empty."; continue; }
+                echo -e "  ${DIM}Enter the full command to run. Example:${NC}"
+                echo -e "  ${DIM}curl -d \"Backup started\" https://ntfy.sh/Your-Topic${NC}"
+                _read _ppa_cmd "  Shell command: " || return 1
+                [[ -z "$_ppa_cmd" ]] && { print_warn "Command cannot be empty."; continue; }
                 _pick_notif_startos _ppa_svc _ppa_level _ppa_title _ppa_body || return 1
                 _ppa_mode="3"; break ;;
             4) _ppa_mode="4"; break ;;
@@ -1163,9 +1167,9 @@ _pick_post_action() {
     done
 
     case "$_ppa_mode" in
-        1) _ppa_notif_cmd="curl -fsS --max-time 10 \"${_ppa_curl_url}\" >/dev/null 2>&1" ;;
+        1) _ppa_notif_cmd="${_ppa_cmd}" ;;
         2) _ppa_notif_cmd="start-cli notification create ${_ppa_svc} ${_ppa_level} \"${_ppa_title}\" \"${_ppa_body}\"" ;;
-        3) _ppa_notif_cmd="curl -fsS --max-time 10 \"${_ppa_curl_url}\" >/dev/null 2>&1 && start-cli notification create ${_ppa_svc} ${_ppa_level} \"${_ppa_title}\" \"${_ppa_body}\"" ;;
+        3) _ppa_notif_cmd="${_ppa_cmd} && start-cli notification create ${_ppa_svc} ${_ppa_level} \"${_ppa_title}\" \"${_ppa_body}\"" ;;
         4) _ppa_notif_cmd="" ;;
     esac
 }
@@ -2489,10 +2493,11 @@ menu_documentation() {
                 echo -e "    ${CYAN}•${NC} ${BOLD}Schedule${NC} — how frequently and at what time backups run, using cron"
                 echo -e "      syntax. Use ${CYAN}https://crontab.guru/${NC} to verify your expression."
                 echo ""
-                echo -e "    ${CYAN}•${NC} ${BOLD}Post-backup notification${NC} — optionally browse to a URL (useful for"
-                echo -e "      services like NTFY) and/or create a StartOS notification. Since StartOS"
-                echo -e "      already notifies you when a backup completes, combining this with the"
-                echo -e "      kick-off notification gives you elapsed time for each backup run."
+                echo -e "    ${CYAN}•${NC} ${BOLD}Post-backup action${NC} — optionally run a shell command and/or create a"
+                echo -e "      StartOS notification. Enter the full command, e.g.:"
+                echo -e "      ${DIM}curl -d \"Backup started\" https://ntfy.sh/Your-Topic${NC}"
+                echo -e "      Since StartOS already notifies you when a backup completes, combining"
+                echo -e "      a kickoff notification with the completion one gives you elapsed time."
                 echo ""
                 pause ;;
             6)

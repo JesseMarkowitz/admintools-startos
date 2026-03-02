@@ -192,7 +192,7 @@ Options:
 - View / Delete existing cron entries
 - Add new entry (allows specification of schedule, command and post command notifications)
 
-Post command notifications can be StartOS notifications or using curl to go to a web page.
+Post command notifications can be StartOS notifications or any shell command (e.g., curl with parameters to NTFY or a webhook).
 
 There are tools online to assist with interpreting the cron scheduling - such as: [crontab.guru](https://crontab.guru/).  
 
@@ -220,7 +220,7 @@ Configuration options:
 - Services (individual selection or all)
 - Schedule (cron syntax)
 - Post-backup actions:
-  - Optional HTTP request (e.g., NTFY, webhook) - might look like: curl -d "Backup to CIFs-0 for Nextcloud and Vaultwarden started" https://ntfy.sh/StartOS-adjective-noun-Alerts
+  - Optional shell command — enter the full command, e.g.: `curl -d "Backup to CIFs-0 for Nextcloud and Vaultwarden started" https://ntfy.sh/StartOS-adjective-noun-Alerts`
   - Optional StartOS standard UI notification
 
 > **Note:** StartOS already generates a notification when a backup completes. Combining a kickoff notification with the completion notification can help estimate time it takes for backups to complete
