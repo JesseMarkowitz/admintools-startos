@@ -12,7 +12,7 @@
 #   7. Manage notification forwarders   — poll start-cli notifications, forward via webhook
 #   8. System database viewer           — browse start-cli db dump by category
 
-VERSION="41"   # integer — increment on each release
+VERSION="42"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -1819,6 +1819,11 @@ POLLER_BODY_END
     echo ""
     debug_log "Installing poller '$name' → ${_POLLER_BIN_PREFIX}${name}"
 
+    # Create data dir on the LIVE mounted data partition now (before the restart).
+    # mkdir inside chroot-and-upgrade targets the root-fs overlay, not the mounted
+    # /media/startos/data partition, so it would be hidden by the mount point at runtime.
+    sudo mkdir -p "${_STARTOS_DATA_DIR}"
+
     # Remove any existing entry for this poller name, then write the new script
     # and add the tagged comment + cron line. All in one chroot session.
     # \$0 in the heredoc → $0 for awk (the outer bash escapes \$ → $).
@@ -2627,11 +2632,11 @@ check_for_update() {
             echo ""
             local _encoded
             _encoded=$(base64 -w 0 < "$_script_path")
+            sudo mkdir -p "${_STARTOS_DATA_DIR}"
             local _chroot_exit=0
             sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || _chroot_exit=$?
 printf '%s' "$_encoded" | base64 -d > /usr/local/bin/startos-admin
 chmod +x /usr/local/bin/startos-admin
-mkdir -p /media/startos/data/startos-admin
 exit
 EOF
             if [[ $_chroot_exit -eq 0 ]]; then
@@ -2677,11 +2682,11 @@ EOF
     local encoded
     encoded=$(printf '%s' "$remote_script" | base64 -w 0)
 
+    sudo mkdir -p "${_STARTOS_DATA_DIR}"
     local chroot_exit=0
     sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || chroot_exit=$?
 printf '%s' "$encoded" | base64 -d > /usr/local/bin/startos-admin
 chmod +x /usr/local/bin/startos-admin
-mkdir -p /media/startos/data/startos-admin
 exit
 EOF
 
