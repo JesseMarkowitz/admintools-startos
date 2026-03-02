@@ -12,7 +12,7 @@
 #   7. Manage notification forwarders   — poll start-cli notifications, forward via webhook
 #   8. System database viewer           — browse start-cli db dump by category
 
-VERSION="44"   # integer — increment on each release
+VERSION="45"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -1352,8 +1352,8 @@ _poller_list_display() {
         levels=$(grep   '^LEVELS='      "$script" 2>/dev/null | cut -d'"' -f2)
         keyword=$(grep  '^KEYWORD='     "$script" 2>/dev/null | cut -d'"' -f2)
         schedule=$(sudo crontab -u root -l 2>/dev/null \
-            | grep -A1 "^# startos-notif-poller-${pname}" 2>/dev/null \
-            | tail -1 | awk '{print $1,$2,$3,$4,$5}')
+            | grep "${_POLLER_BIN_PREFIX}${pname}" 2>/dev/null \
+            | awk '{print $1,$2,$3,$4,$5}')
 
         local state_file="${_POLLER_STATE_PREFIX}${pname}"
         local state_val
@@ -1537,7 +1537,7 @@ _poller_edit_flow() {
     cur_levels=$(grep   '^LEVELS='       "$script_path" 2>/dev/null | cut -d'"' -f2)
     cur_keyword=$(grep  '^KEYWORD='      "$script_path" 2>/dev/null | cut -d'"' -f2)
     cur_schedule=$(sudo crontab -u root -l 2>/dev/null \
-        | grep -A1 "^# startos-notif-poller-${poller_name}" | tail -1 \
+        | grep "${_POLLER_BIN_PREFIX}${poller_name}" \
         | awk '{print $1,$2,$3,$4,$5}')
 
     echo ""
@@ -1817,7 +1817,7 @@ POLLER_BODY_END
 
     local install_ts
     install_ts=$(date '+%Y.%m.%d %H:%M:%S %Z')
-    local cron_comment="# startos-notif-poller-${name} | Added: ${install_ts} | v${VERSION} | Action: Manage Notification Forwarders | Webhook: ${url} | Levels: ${levels} | Keyword: ${keyword:-none}"
+    local cron_comment="# startos-admin v${VERSION} | Added: ${install_ts} | Action: Manage Notification Forwarders | Poller: ${name} | Webhook: ${url} | Levels: ${levels} | Keyword: ${keyword:-none}"
     local cron_line="${schedule} ${_POLLER_BIN_PREFIX}${name} >> ${_POLLER_LOG_PREFIX}${name}.log 2>&1"
     encoded_comment=$(printf '%s' "$cron_comment" | base64 -w 0)
     encoded_cron=$(printf '%s' "$cron_line" | base64 -w 0)
@@ -1842,7 +1842,7 @@ POLLER_BODY_END
     local chroot_exit=0
     sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || chroot_exit=$?
 mkdir -p ${_STARTOS_DATA_DIR}
-{ crontab -l 2>/dev/null || true; } | awk -v t="# startos-notif-poller-${name}" 'index(\$0,t)==1{skip=1;next} skip{skip=0;next} {print}' | crontab -
+{ crontab -l 2>/dev/null || true; } | awk -v t1="| Poller: ${name} |" -v t2="# startos-notif-poller-${name}" 'index(\$0,t1)||index(\$0,t2)==1{skip=1;next} skip{skip=0;next} {print}' | crontab -
 printf '%s' "$encoded_script" | base64 -d > ${_POLLER_BIN_PREFIX}${name}
 chmod +x ${_POLLER_BIN_PREFIX}${name}
 { crontab -l 2>/dev/null; printf '%s' "$encoded_comment" | base64 -d; echo; printf '%s' "$encoded_cron" | base64 -d; echo; } | crontab -
@@ -1937,7 +1937,8 @@ _poller_remove_flow() {
     # Build chroot commands with names already substituted (avoids $0 escaping in heredoc)
     local chroot_body=""
     for rname in "${names_to_remove[@]}"; do
-        chroot_body+="crontab -l 2>/dev/null | grep -v 'startos-notif-poller-${rname}' | crontab -
+        chroot_body+="crontab -l 2>/dev/null | grep -v 'startos-notif-poller-${rname}' | grep -Fv '| Poller: ${rname} |' | crontab -
+"
 rm -f ${_POLLER_BIN_PREFIX}${rname}
 "
     done
