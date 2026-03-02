@@ -12,7 +12,7 @@
 #   7. Manage notification forwarders   — poll start-cli notifications, forward via webhook
 #   8. System database viewer           — browse start-cli db dump by category
 
-VERSION="46"   # integer — increment on each release
+VERSION="47"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -1942,7 +1942,6 @@ _poller_remove_flow() {
     local chroot_body=""
     for rname in "${names_to_remove[@]}"; do
         chroot_body+="crontab -l 2>/dev/null | grep -v 'startos-notif-poller-${rname}' | grep -Fv '| Poller: ${rname} |' | crontab -
-"
 rm -f ${_POLLER_BIN_PREFIX}${rname}
 "
     done
