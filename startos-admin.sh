@@ -12,7 +12,7 @@
 #   7. Manage notification forwarders   — poll start-cli notifications, forward via webhook
 #   8. System database viewer           — browse start-cli db dump by category
 
-VERSION="47"   # integer — increment on each release
+VERSION="48"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -59,6 +59,16 @@ _read() {
     read -rp "$@" _out
     if [[ "${_out,,}" == "exit" ]]; then exit 0; fi
     if [[ "${_out,,}" == "back" ]]; then _BACK=1; return 1; fi
+    return 0
+}
+
+# Like _read but silent (for passwords). Supports 'back' and 'exit'.
+_read_silent() {
+    local -n _sout="$1"; shift
+    read -rsp "$@" _sout
+    echo ""
+    if [[ "${_sout,,}" == "exit" ]]; then exit 0; fi
+    if [[ "${_sout,,}" == "back" ]]; then _BACK=1; return 1; fi
     return 0
 }
 
@@ -315,17 +325,17 @@ menu_create_notification() {
 
     # ── Step 3: Title & message ──────────────────────────────────────────────
     echo ""
-    _read notif_title "  Notification title: " || return 1
-    if [[ -z "$notif_title" ]]; then
-        print_error "Title cannot be empty."
-        pause; return
-    fi
+    local notif_title=""
+    while [[ -z "$notif_title" ]]; do
+        _read notif_title "  Notification title: " || return 1
+        [[ -z "$notif_title" ]] && print_warn "Title cannot be empty."
+    done
 
-    _read notif_body "  Notification message: " || return 1
-    if [[ -z "$notif_body" ]]; then
-        print_error "Message cannot be empty."
-        pause; return
-    fi
+    local notif_body=""
+    while [[ -z "$notif_body" ]]; do
+        _read notif_body "  Notification message: " || return 1
+        [[ -z "$notif_body" ]] && print_warn "Message cannot be empty."
+    done
 
     # ── Execute ──────────────────────────────────────────────────────────────
     echo ""
@@ -438,7 +448,7 @@ menu_memory_usage() {
     fi
 
     # Reformat: strip table borders, drop Container ID column, sort by usage % desc, colorize
-    echo "$stats_output" | awk '
+    echo "$stats_output" | awk -v red="$RED" -v yellow="$YELLOW" -v nc="$NC" -v bold="$BOLD" '
     BEGIN { FS="|"; rc=0 }
     /^\+/ { next }
     /^\|/ {
@@ -447,7 +457,7 @@ menu_memory_usage() {
         l = $5; gsub(/^[ \t]+|[ \t]+$/, "", l)
         p = $6; gsub(/^[ \t]+|[ \t]+$/, "", p)
         if (n == "Name") {
-            printf "\033[1m  %-22s %-12s %-14s %s\033[0m\n", n, u, l, p
+            printf "%s  %-22s %-12s %-14s %s%s\n", bold, n, u, l, p, nc
             printf "  %-22s %-12s %-14s %s\n", "──────────────────────", "──────────", "────────────", "────────"
         } else if (n != "") {
             rc++; ns[rc]=n; us[rc]=u; ls[rc]=l; ps[rc]=p; pn[rc]=p+0
@@ -462,10 +472,10 @@ menu_memory_usage() {
             tmp=pn[i]; pn[i]=pn[j]; pn[j]=tmp
         }
         for (i=1; i<=rc; i++) {
-            if (pn[i]>=80)      color="\033[1;31m"
-            else if (pn[i]>=50) color="\033[33m"
-            else                color="\033[0m"
-            printf "%s  %-22s %-12s %-14s %s\033[0m\n", color, ns[i], us[i], ls[i], ps[i]
+            if (pn[i]>=80)      color=bold red
+            else if (pn[i]>=60) color=yellow
+            else                color=nc
+            printf "%s  %-22s %-12s %-14s %s%s\n", color, ns[i], us[i], ls[i], ps[i], nc
         }
     }'
     echo ""
@@ -947,10 +957,7 @@ menu_schedule_backup() {
     echo -e "  ${DIM}(type 'back' + Enter to return to main menu, or 'exit' + Enter to quit)${NC}"
     local backup_password=""
     while true; do
-        read -rsp "  Password: " backup_password
-        echo ""
-        if [[ "${backup_password,,}" == "exit" ]]; then exit 0; fi
-        if [[ "${backup_password,,}" == "back" ]]; then _BACK=1; return 1; fi
+        _read_silent backup_password "  Password: " || return 1
         if [[ -z "$backup_password" ]]; then
             print_warn "Password cannot be empty."
         else
@@ -1148,8 +1155,23 @@ _pick_post_action() {
             1)
                 echo -e "  ${DIM}Enter the full command to run. Example:${NC}"
                 echo -e "  ${DIM}curl -d \"Backup started\" https://ntfy.sh/Your-Topic${NC}"
+                echo -e "  ${DIM}Hint: no need for >/dev/null; avoid bare & (use && to chain commands).${NC}"
                 _read _ppa_cmd "  Shell command: " || return 1
                 [[ -z "$_ppa_cmd" ]] && { print_warn "Command cannot be empty."; continue; }
+                echo ""
+                _read _ppa_test "  Test this command now? [y/N]: " || return 1
+                if [[ "${_ppa_test,,}" == "y" ]]; then
+                    echo ""
+                    print_info "Running: $_ppa_cmd"
+                    local _ppa_test_exit=0
+                    bash -c "$_ppa_cmd"; _ppa_test_exit=$?
+                    echo ""
+                    if [[ $_ppa_test_exit -eq 0 ]]; then
+                        print_success "Command exited 0 (success)."
+                    else
+                        print_warn "Command exited $_ppa_test_exit. Check the output above before continuing."
+                    fi
+                fi
                 _ppa_mode="1"; break ;;
             2)
                 _pick_notif_startos _ppa_svc _ppa_level _ppa_title _ppa_body || return 1
@@ -1157,8 +1179,23 @@ _pick_post_action() {
             3)
                 echo -e "  ${DIM}Enter the full command to run. Example:${NC}"
                 echo -e "  ${DIM}curl -d \"Backup started\" https://ntfy.sh/Your-Topic${NC}"
+                echo -e "  ${DIM}Hint: no need for >/dev/null; avoid bare & (use && to chain commands).${NC}"
                 _read _ppa_cmd "  Shell command: " || return 1
                 [[ -z "$_ppa_cmd" ]] && { print_warn "Command cannot be empty."; continue; }
+                echo ""
+                _read _ppa_test "  Test this command now? [y/N]: " || return 1
+                if [[ "${_ppa_test,,}" == "y" ]]; then
+                    echo ""
+                    print_info "Running: $_ppa_cmd"
+                    local _ppa_test_exit=0
+                    bash -c "$_ppa_cmd"; _ppa_test_exit=$?
+                    echo ""
+                    if [[ $_ppa_test_exit -eq 0 ]]; then
+                        print_success "Command exited 0 (success)."
+                    else
+                        print_warn "Command exited $_ppa_test_exit. Check the output above before continuing."
+                    fi
+                fi
                 _pick_notif_startos _ppa_svc _ppa_level _ppa_title _ppa_body || return 1
                 _ppa_mode="3"; break ;;
             4) _ppa_mode="4"; break ;;
@@ -1339,6 +1376,16 @@ _poller_get_names() {
     done
 }
 
+# Read config vars from an installed poller script.
+# Usage: _poller_read_config script_path url_ref levels_ref keyword_ref
+_poller_read_config() {
+    local _prc_path="$1"
+    local -n _prc_url="$2" _prc_levels="$3" _prc_keyword="$4"
+    _prc_url=$(grep     '^WEBHOOK_URL=' "$_prc_path" 2>/dev/null | cut -d'"' -f2)
+    _prc_levels=$(grep  '^LEVELS='      "$_prc_path" 2>/dev/null | cut -d'"' -f2)
+    _prc_keyword=$(grep '^KEYWORD='     "$_prc_path" 2>/dev/null | cut -d'"' -f2)
+}
+
 # Display installed pollers with their embedded config.
 # Returns 1 (with message) if none are installed.
 _poller_list_display() {
@@ -1352,11 +1399,9 @@ _poller_list_display() {
     for script in "${all_scripts[@]}"; do
         local pname="${script##${_POLLER_BIN_PREFIX}}"
         local url levels keyword schedule
-        url=$(grep      '^WEBHOOK_URL=' "$script" 2>/dev/null | cut -d'"' -f2)
-        levels=$(grep   '^LEVELS='      "$script" 2>/dev/null | cut -d'"' -f2)
-        keyword=$(grep  '^KEYWORD='     "$script" 2>/dev/null | cut -d'"' -f2)
+        _poller_read_config "$script" url levels keyword
         schedule=$(sudo crontab -u root -l 2>/dev/null \
-            | grep "${_POLLER_BIN_PREFIX}${pname}" 2>/dev/null \
+            | grep "^[^#]*${_POLLER_BIN_PREFIX}${pname}" 2>/dev/null \
             | awk '{print $1,$2,$3,$4,$5}')
 
         local state_file="${_POLLER_STATE_PREFIX}${pname}"
@@ -1537,11 +1582,9 @@ _poller_edit_flow() {
 
     # Read current config from installed script
     local cur_url cur_levels cur_keyword cur_schedule
-    cur_url=$(grep      '^WEBHOOK_URL='  "$script_path" 2>/dev/null | cut -d'"' -f2)
-    cur_levels=$(grep   '^LEVELS='       "$script_path" 2>/dev/null | cut -d'"' -f2)
-    cur_keyword=$(grep  '^KEYWORD='      "$script_path" 2>/dev/null | cut -d'"' -f2)
+    _poller_read_config "$script_path" cur_url cur_levels cur_keyword
     cur_schedule=$(sudo crontab -u root -l 2>/dev/null \
-        | grep "${_POLLER_BIN_PREFIX}${poller_name}" \
+        | grep "^[^#]*${_POLLER_BIN_PREFIX}${poller_name}" \
         | awk '{print $1,$2,$3,$4,$5}')
 
     echo ""
@@ -2061,8 +2104,11 @@ _poller_state_flow() {
         0) return ;;
         1)
             if confirm "Delete state file for '${pname}'?"; then
-                sudo rm -f "$state_file"
-                print_success "State file deleted. Next run will forward only the most recent notification."
+                if sudo rm -f "$state_file" && [[ ! -e "$state_file" ]]; then
+                    print_success "State file deleted. Next run will forward only the most recent notification."
+                else
+                    print_error "Failed to delete state file."
+                fi
             else
                 print_info "Cancelled."
             fi ;;
@@ -2364,11 +2410,14 @@ menu_db_dump() {
     echo ""
     print_info "Fetching database dump..."
     debug_log "Running: start-cli db dump"
-    local db_json
-    db_json=$(start-cli db dump 2>/dev/null) || {
+    local db_json db_err
+    db_json=$(start-cli db dump 2>/tmp/_sadmin_dberr) || {
+        db_err=$(cat /tmp/_sadmin_dberr 2>/dev/null); rm -f /tmp/_sadmin_dberr
         print_error "Failed to run 'start-cli db dump'."
+        [[ -n "$db_err" ]] && echo -e "${RED}${db_err}${NC}"
         pause; return
     }
+    rm -f /tmp/_sadmin_dberr
     [[ -z "$db_json" ]] && { print_error "Empty response."; pause; return; }
     debug_log "DB dump: ${#db_json} bytes"
 
@@ -2650,16 +2699,16 @@ check_for_update() {
             echo ""
             local _encoded
             _encoded=$(base64 -w 0 < "$_script_path")
-            local _chroot_exit=0
-            sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || _chroot_exit=$?
+            local chroot_exit=0
+            sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || chroot_exit=$?
 printf '%s' "$_encoded" | base64 -d > /usr/local/bin/startos-admin
 chmod +x /usr/local/bin/startos-admin
 exit
 EOF
-            if [[ $_chroot_exit -eq 0 ]]; then
+            if [[ $chroot_exit -eq 0 ]]; then
                 print_success "Installed. Server restarting — reconnect and run: startos-admin"
             else
-                print_error "Installation failed (exit $_chroot_exit)."
+                print_error "Installation failed (exit $chroot_exit)."
                 pause
             fi
         fi
@@ -2670,7 +2719,10 @@ EOF
     # ── Normal update check (only runs when already persistent) ─────────────
     # Fetch with short timeout — fail silently if offline or unreachable
     debug_log "Fetching remote version from: $raw_url"
-    remote_script=$(curl -fsSL --max-time 5 "$raw_url" 2>/dev/null) || return 0
+    remote_script=$(curl -fsSL --max-time 5 "$raw_url" 2>/dev/null) || {
+        debug_log "Remote fetch failed or timed out — skipping update check"
+        return 0
+    }
 
     remote_version=$(echo "$remote_script" | grep '^VERSION=' | head -1 | tr -d '"' | cut -d= -f2 | awk '{print $1}')
     [[ -z "$remote_version" ]] && return 0
@@ -2725,12 +2777,15 @@ menu_toggle_debug() {
     echo ""
     if [[ $_DEBUG -eq 1 ]]; then
         echo -e "  Debug mode is currently ${GREEN}${BOLD}ON${NC}."
-        echo -e "  ${DIM}Extra output is shown during operations. Poller scripts log verbosely.${NC}"
+        echo -e "  ${DIM}Shows extra output during operations and enables verbose poller logging.${NC}"
         echo ""
         if confirm "Disable debug mode?"; then
-            sudo rm -f "$_DEBUG_FLAG_FILE"
-            _DEBUG=0
-            print_success "Debug mode disabled."
+            if sudo rm -f "$_DEBUG_FLAG_FILE"; then
+                _DEBUG=0
+                print_success "Debug mode disabled."
+            else
+                print_error "Failed to remove flag file. Debug mode unchanged."
+            fi
         else
             [[ $_BACK -eq 1 ]] && return 1
             print_info "No change."
@@ -2741,9 +2796,12 @@ menu_toggle_debug() {
         echo ""
         if confirm "Enable debug mode?"; then
             sudo mkdir -p "$(dirname "$_DEBUG_FLAG_FILE")"
-            sudo touch "$_DEBUG_FLAG_FILE"
-            _DEBUG=1
-            print_success "Debug mode enabled."
+            if sudo touch "$_DEBUG_FLAG_FILE"; then
+                _DEBUG=1
+                print_success "Debug mode enabled."
+            else
+                print_error "Failed to create flag file. Debug mode unchanged."
+            fi
         else
             [[ $_BACK -eq 1 ]] && return 1
             print_info "No change."
@@ -2790,8 +2848,8 @@ main_menu() {
         case "$choice" in
             1) menu_documentation          || { _BACK=0; continue; } ;;
             2) menu_create_notification    || { _BACK=0; continue; } ;;
-            3) menu_disk_usage ;;
-            4) menu_memory_usage ;;
+            3) menu_disk_usage             || { _BACK=0; continue; } ;;
+            4) menu_memory_usage           || { _BACK=0; continue; } ;;
             5) menu_manage_crontab         || { _BACK=0; continue; } ;;
             6) menu_schedule_backup        || { _BACK=0; continue; } ;;
             7) menu_schedule_stay_alive    || { _BACK=0; continue; } ;;
