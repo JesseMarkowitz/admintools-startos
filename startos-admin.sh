@@ -12,7 +12,7 @@
 #   7. Manage notification forwarders   — poll start-cli notifications, forward via webhook
 #   8. System database viewer           — browse start-cli db dump by category
 
-VERSION="51"   # integer — increment on each release
+VERSION="52"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -872,17 +872,20 @@ menu_manage_crontab() {
 # ─────────────────────────────────────────────
 
 # Returns a cron schedule string, sets global CRON_SCHEDULE
+# Optional first arg: current schedule string. If provided, adds a "5) Keep current" option.
 _pick_backup_schedule() {
+    local _pbs_def="${1:-}"
     echo ""
     echo -e "  ${BOLD}Select backup schedule:${NC}"
     echo -e "    ${BOLD}1)${NC} Daily at midnight     ${DIM}(0 0 * * *)${NC}"
     echo -e "    ${BOLD}2)${NC} Daily at 3 AM         ${DIM}(0 3 * * *)${NC}"
     echo -e "    ${BOLD}3)${NC} Weekly (Sun midnight) ${DIM}(0 0 * * 0)${NC}"
     echo -e "    ${BOLD}4)${NC} Custom cron expression"
+    [[ -n "$_pbs_def" ]] && echo -e "    ${BOLD}5)${NC} Keep current          ${DIM}(${_pbs_def})${NC}"
     echo ""
 
     while true; do
-        _read sched_choice "  Choice [1-4]: " || return 1
+        _read sched_choice "  Choice [1-4${_pbs_def:+/5}]: " || return 1
         case "$sched_choice" in
             1) CRON_SCHEDULE="0 0 * * *";  return 0 ;;
             2) CRON_SCHEDULE="0 3 * * *";  return 0 ;;
@@ -895,16 +898,24 @@ _pick_backup_schedule() {
                     return 0
                 fi
                 ;;
-            *) print_warn "Enter 1, 2, 3, or 4." ;;
+            5) [[ -n "$_pbs_def" ]] && { CRON_SCHEDULE="$_pbs_def"; return 0; } ;;&
+            *) print_warn "Enter 1-4${_pbs_def:+, or 5 to keep current}." ;;
         esac
     done
 }
 
 # Run the backup setup wizard (steps 1–5, preview). Populates namerefs
 # full_line_ref and password_ref. Does NOT install or confirm restart.
+# Optional defaults (pass from edit flow): $3=target $4=schedule $5=pkg_ids $6=notif_cmd
+#   pkg_ids: empty string = all packages; non-empty = comma-separated IDs.
+#   Pass sentinel "__NONE__" for $5 to indicate no package default.
 _backup_wizard() {
     local -n _bwfl="$1"
     local -n _bwpw="$2"
+    local _bw_def_target="${3:-}"
+    local _bw_def_sched="${4:-}"
+    local _bw_def_pkg="${5-__NONE__}"   # no-colon: distinguish unset from empty ("")
+    local _bw_def_notif="${6:-}"
     _nav_tip
 
     # ── Step 1: Select backup target ────────────────────────────────────────
@@ -933,18 +944,22 @@ _backup_wizard() {
         echo -e "    ${BOLD}${i})${NC} ${tgt}"
         (( i++ ))
     done
+    [[ -n "$_bw_def_target" ]] && echo -e "  ${DIM}Current: ${_bw_def_target} — press Enter to keep${NC}"
     echo ""
 
     local backup_target=""
     while true; do
-        _read tgt_choice "  Choice [1-$((i-1))]: " || return 1
+        _read tgt_choice "  Choice [1-$((i-1))]${_bw_def_target:+, Enter to keep}: " || return 1
+        if [[ -z "$tgt_choice" && -n "$_bw_def_target" ]]; then
+            backup_target="$_bw_def_target"; break
+        fi
         if [[ "$tgt_choice" =~ ^[0-9]+$ ]] && \
            [[ "$tgt_choice" -ge 1 ]] && [[ "$tgt_choice" -lt "$i" ]]; then
             backup_target="${targets[$((tgt_choice - 1))]}"
             backup_target=$(echo "$backup_target" | awk '{print $1}')
             break
         fi
-        print_warn "Enter a number between 1 and $((i-1))."
+        print_warn "Enter a number between 1 and $((i-1))${_bw_def_target:+, or Enter to keep current}."
     done
 
     # ── Step 2: Password ─────────────────────────────────────────────────────
@@ -983,12 +998,21 @@ _backup_wizard() {
     done
     echo ""
     print_info "Enter numbers separated by commas (e.g. 1,3,4), or 'all' for all packages"
+    local _bw_has_pkg_def=0
+    if [[ "$_bw_def_pkg" != "__NONE__" ]]; then
+        _bw_has_pkg_def=1
+        local _bw_pkg_display; [[ -z "$_bw_def_pkg" ]] && _bw_pkg_display="ALL" || _bw_pkg_display="$_bw_def_pkg"
+        echo -e "  ${DIM}Current: ${_bw_pkg_display} — press Enter to keep${NC}"
+    fi
     echo ""
 
     local selected_packages=()
     local pkg_ids_arg=""
     while true; do
-        _read pkg_selection "  Selection (e.g. 1,3 or 'all'): " || return 1
+        _read pkg_selection "  Selection (e.g. 1,3 or 'all'${_bw_has_pkg_def:+, Enter to keep}): " || return 1
+        if [[ -z "$pkg_selection" && "$_bw_has_pkg_def" -eq 1 ]]; then
+            pkg_ids_arg="$_bw_def_pkg"; break
+        fi
         if [[ "$pkg_selection" == "all" ]]; then
             pkg_ids_arg=""
             break
@@ -1008,7 +1032,7 @@ _backup_wizard() {
             fi
             selected_packages=()
         else
-            print_warn "Enter numbers like 1,3 or 'all'."
+            print_warn "Enter numbers like 1,3 or 'all'${_bw_has_pkg_def:+, or Enter to keep current}."
         fi
     done
 
@@ -1017,11 +1041,11 @@ _backup_wizard() {
 
     # ── Step 4: Schedule ─────────────────────────────────────────────────────
     local CRON_SCHEDULE
-    _pick_backup_schedule || return 1
+    _pick_backup_schedule "$_bw_def_sched" || return 1
 
     # ── Step 5: Post-backup notification ────────────────────────────────────
     local notif_cmd=""
-    _pick_post_action "Post-backup notification:" notif_cmd || return 1
+    _pick_post_action "Post-backup notification:" notif_cmd "$_bw_def_notif" || return 1
 
     # ── Build cron line ──────────────────────────────────────────────────────
     local backup_cmd="${_START_CLI} backup create ${backup_target} '${backup_password}'"
@@ -1098,24 +1122,42 @@ _backup_edit_flow() {
     done
 
     local e_choice
-    while true; do
-        _read e_choice "  Pick entry to replace [1-${#old_comments[@]}]: " || return 1
-        if [[ "$e_choice" =~ ^[0-9]+$ ]] && \
-           [[ "$e_choice" -ge 1 ]] && [[ "$e_choice" -le ${#old_comments[@]} ]]; then
-            break
-        fi
-        print_warn "Enter a number between 1 and ${#old_comments[@]}."
-    done
+    if [[ ${#old_comments[@]} -eq 1 ]]; then
+        e_choice=1
+        print_info "Only one backup schedule found — selecting it automatically."
+        echo ""
+    else
+        while true; do
+            _read e_choice "  Pick entry to replace [1-${#old_comments[@]}, default 1]: " || return 1
+            [[ -z "$e_choice" ]] && e_choice=1
+            if [[ "$e_choice" =~ ^[0-9]+$ ]] && \
+               [[ "$e_choice" -ge 1 ]] && [[ "$e_choice" -le ${#old_comments[@]} ]]; then
+                break
+            fi
+            print_warn "Enter a number between 1 and ${#old_comments[@]}."
+        done
+    fi
 
     local old_comment="${old_comments[$((e_choice-1))]}"
     local old_cron_line="${old_cron_lines[$((e_choice-1))]}"
+
+    # ── Parse defaults from existing entry ───────────────────────────────────
+    local def_target def_sched def_pkg def_notif=""
+    def_target=$(echo "$old_cron_line" | grep -oE "backup create [^ ]+" | awk '{print $3}')
+    def_sched=$(echo "$old_cron_line" | awk '{print $1,$2,$3,$4,$5}')
+    # If --package-ids present, extract value; otherwise empty string = all packages
+    def_pkg=$(echo "$old_cron_line" | grep -oE "\-\-package-ids [^ ]+" | awk '{print $2}')
+    # Extract post-action command (everything after first ' && ')
+    if echo "$old_cron_line" | grep -qF ' && '; then
+        def_notif=$(echo "$old_cron_line" | awk -F' && ' '{for(i=2;i<=NF;i++) printf "%s%s",$i,(i<NF?" && ":""); print ""}')
+    fi
 
     # ── Run wizard for replacement ───────────────────────────────────────────
     print_header
     print_section "Edit Backup Schedule"
     echo ""
     local bw_full_line bw_password
-    _backup_wizard bw_full_line bw_password || return 1
+    _backup_wizard bw_full_line bw_password "$def_target" "$def_sched" "$def_pkg" "$def_notif" || return 1
 
     if ! confirm "Replace existing schedule with this?"; then
         [[ $_BACK -eq 1 ]] && return 1
@@ -1249,6 +1291,13 @@ _pick_notif_startos() {
 _pick_post_action() {
     local _ppa_header="$1"
     local -n _ppa_notif_cmd="$2"
+    local _ppa_def_cmd="${3:-}"
+
+    local _ppa_preview=""
+    if [[ -n "$_ppa_def_cmd" ]]; then
+        _ppa_preview="${_ppa_def_cmd:0:60}"
+        [[ ${#_ppa_def_cmd} -gt 60 ]] && _ppa_preview+="..."
+    fi
 
     echo ""
     echo -e "  ${BOLD}${_ppa_header}${NC}"
@@ -1256,13 +1305,15 @@ _pick_post_action() {
     echo -e "    ${BOLD}2)${NC} StartOS notification"
     echo -e "    ${BOLD}3)${NC} Both"
     echo -e "    ${BOLD}4)${NC} None"
+    [[ -n "$_ppa_def_cmd" ]] && echo -e "    ${BOLD}5)${NC} Keep current  ${DIM}(${_ppa_preview})${NC}"
     echo ""
 
     local _ppa_mode="" _ppa_cmd=""
     local _ppa_svc="" _ppa_level="" _ppa_title="" _ppa_body=""
     while true; do
-        _read _ppa_choice "  Choice [1-4]: " || return 1
+        _read _ppa_choice "  Choice [1-4${_ppa_def_cmd:+/5}]: " || return 1
         case "$_ppa_choice" in
+            5) [[ -n "$_ppa_def_cmd" ]] && { _ppa_notif_cmd="$_ppa_def_cmd"; return 0; } ;;&
             1)
                 echo -e "  ${DIM}Enter the full command to run. Example:${NC}"
                 echo -e "  ${DIM}curl -d \"Backup started\" https://ntfy.sh/Your-Topic${NC}"
@@ -1310,7 +1361,7 @@ _pick_post_action() {
                 _pick_notif_startos _ppa_svc _ppa_level _ppa_title _ppa_body || return 1
                 _ppa_mode="3"; break ;;
             4) _ppa_mode="4"; break ;;
-            *) print_warn "Enter 1, 2, 3, or 4." ;;
+            *) print_warn "Enter 1, 2, 3, or 4${_ppa_def_cmd:+, or 5 to keep current}." ;;
         esac
     done
 
