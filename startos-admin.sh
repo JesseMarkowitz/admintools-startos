@@ -12,7 +12,7 @@
 #   7. Manage notification forwarders   — poll start-cli notifications, forward via webhook
 #   8. System database viewer           — browse start-cli db dump by category
 
-VERSION="48"   # integer — increment on each release
+VERSION="49"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -35,6 +35,9 @@ _POLLER_BIN_PREFIX="/usr/local/bin/startos-notif-poller-"
 _STARTOS_DATA_DIR="/usr/local/share/startos-admin"
 _POLLER_STATE_PREFIX="${_STARTOS_DATA_DIR}/startos-admin-poller-state-"
 _POLLER_LOG_PREFIX="${_STARTOS_DATA_DIR}/startos-notif-poller-"
+# Full path to start-cli — resolved once so cron jobs and generated scripts
+# embed the absolute path and don't depend on cron's minimal PATH.
+_START_CLI=$(command -v start-cli 2>/dev/null || echo "start-cli")
 
 # ─────────────────────────────────────────────
 # Navigation — "exit" / "back" support
@@ -1038,7 +1041,7 @@ menu_schedule_backup() {
     _pick_post_action "Post-backup notification:" notif_cmd || return 1
 
     # ── Build backup command ──────────────────────────────────────────────────
-    local backup_cmd="start-cli backup create ${backup_target} '${backup_password}'"
+    local backup_cmd="${_START_CLI} backup create ${backup_target} '${backup_password}'"
     [[ -n "$pkg_ids_arg" ]] && backup_cmd+=" --package-ids ${pkg_ids_arg}"
 
     local full_line="$CRON_SCHEDULE $backup_cmd"
@@ -1205,8 +1208,8 @@ _pick_post_action() {
 
     case "$_ppa_mode" in
         1) _ppa_notif_cmd="${_ppa_cmd}" ;;
-        2) _ppa_notif_cmd="start-cli notification create ${_ppa_svc} ${_ppa_level} \"${_ppa_title}\" \"${_ppa_body}\"" ;;
-        3) _ppa_notif_cmd="${_ppa_cmd} && start-cli notification create ${_ppa_svc} ${_ppa_level} \"${_ppa_title}\" \"${_ppa_body}\"" ;;
+        2) _ppa_notif_cmd="${_START_CLI} notification create ${_ppa_svc} ${_ppa_level} \"${_ppa_title}\" \"${_ppa_body}\"" ;;
+        3) _ppa_notif_cmd="${_ppa_cmd} && ${_START_CLI} notification create ${_ppa_svc} ${_ppa_level} \"${_ppa_title}\" \"${_ppa_body}\"" ;;
         4) _ppa_notif_cmd="" ;;
     esac
 }
@@ -1707,6 +1710,7 @@ LEVELS=\"${levels}\"
 KEYWORD=\"${keyword}\"
 STATE_FILE=\"${_POLLER_STATE_PREFIX}${name}\"
 LOG_FILE=\"${_POLLER_LOG_PREFIX}${name}.log\"
+START_CLI=\"${_START_CLI}\"
 LOG_MAX_LINES=25000
 DEBUG=0
 [ -f ${_STARTOS_DATA_DIR}/debug ] && DEBUG=1
@@ -1749,8 +1753,8 @@ fi
 
 echo "$(_ts): run start — LAST_ID=$LAST_ID  levels=$LEVELS  keyword='$KEYWORD'"
 
-if ! command -v start-cli >/dev/null 2>&1; then
-    echo "$(_ts): ERROR — start-cli not found in PATH: $PATH"
+if [ ! -x "$START_CLI" ]; then
+    echo "$(_ts): ERROR — start-cli not found or not executable: $START_CLI"
     exit 1
 fi
 
@@ -1760,10 +1764,10 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 # ── Fetch notifications ───────────────────────────────────────────────────
-NOTIFS=$(start-cli notification list 2>&1)
+NOTIFS=$("$START_CLI" notification list 2>&1)
 NOTIFS_EXIT=$?
 if [ $NOTIFS_EXIT -ne 0 ]; then
-    echo "$(_ts): ERROR — start-cli notification list failed (exit $NOTIFS_EXIT): $NOTIFS"
+    echo "$(_ts): ERROR — $START_CLI notification list failed (exit $NOTIFS_EXIT): $NOTIFS"
     exit 0
 fi
 if [ -z "$NOTIFS" ]; then
