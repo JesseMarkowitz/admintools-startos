@@ -12,7 +12,7 @@
 #   7. Manage notification forwarders   — poll start-cli notifications, forward via webhook
 #   8. System database viewer           — browse start-cli db dump by category
 
-VERSION="50"   # integer — increment on each release
+VERSION="51"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -900,18 +900,12 @@ _pick_backup_schedule() {
     done
 }
 
-menu_schedule_backup() {
-    print_header
-    print_section "Schedule Backups"
-    echo ""
-    echo -e "  Schedule an automatic backup via cron. You will choose a backup target,"
-    echo -e "  enter your StartOS password, and set a schedule."
-    echo ""
+# Run the backup setup wizard (steps 1–5, preview). Populates namerefs
+# full_line_ref and password_ref. Does NOT install or confirm restart.
+_backup_wizard() {
+    local -n _bwfl="$1"
+    local -n _bwpw="$2"
     _nav_tip
-    if ! confirm "Continue to setup wizard?"; then
-        [[ $_BACK -eq 1 ]] && return 1
-        return
-    fi
 
     # ── Step 1: Select backup target ────────────────────────────────────────
     print_header
@@ -922,14 +916,14 @@ menu_schedule_backup() {
     if ! raw_targets=$(start-cli backup target list 2>&1); then
         print_error "Failed to list backup targets."
         echo -e "${RED}${raw_targets}${NC}"
-        pause; return
+        pause; return 1
     fi
 
     mapfile -t targets <<< "$(parse_backup_targets "$raw_targets")"
 
     if [[ ${#targets[@]} -eq 0 ]]; then
         print_warn "No backup targets found. Add a target in the StartOS UI first."
-        pause; return
+        pause; return 1
     fi
 
     echo ""
@@ -947,7 +941,6 @@ menu_schedule_backup() {
         if [[ "$tgt_choice" =~ ^[0-9]+$ ]] && \
            [[ "$tgt_choice" -ge 1 ]] && [[ "$tgt_choice" -lt "$i" ]]; then
             backup_target="${targets[$((tgt_choice - 1))]}"
-            # Extract just the target ID if the line contains extra info (e.g. "cifs-6  My NAS")
             backup_target=$(echo "$backup_target" | awk '{print $1}')
             break
         fi
@@ -957,15 +950,11 @@ menu_schedule_backup() {
     # ── Step 2: Password ─────────────────────────────────────────────────────
     echo ""
     print_warn "Enter your StartOS primary password (used for backup encryption)."
-    echo -e "  ${DIM}(type 'back' + Enter to return to main menu, or 'exit' + Enter to quit)${NC}"
     local backup_password=""
     while true; do
         _read_silent backup_password "  Password: " || return 1
-        if [[ -z "$backup_password" ]]; then
-            print_warn "Password cannot be empty."
-        else
-            break
-        fi
+        [[ -z "$backup_password" ]] && { print_warn "Password cannot be empty."; continue; }
+        break
     done
 
     # ── Step 3: Select packages ──────────────────────────────────────────────
@@ -975,14 +964,14 @@ menu_schedule_backup() {
     if ! pkg_list=$(start-cli package list 2>&1); then
         print_error "Failed to list packages."
         echo -e "${RED}${pkg_list}${NC}"
-        pause; return
+        pause; return 1
     fi
 
     mapfile -t packages <<< "$(parse_package_ids "$pkg_list")"
 
     if [[ ${#packages[@]} -eq 0 ]]; then
         print_warn "No packages found."
-        pause; return
+        pause; return 1
     fi
 
     echo ""
@@ -1001,7 +990,6 @@ menu_schedule_backup() {
     while true; do
         _read pkg_selection "  Selection (e.g. 1,3 or 'all'): " || return 1
         if [[ "$pkg_selection" == "all" ]]; then
-            # No --package-ids flag = back up everything
             pkg_ids_arg=""
             break
         elif [[ "$pkg_selection" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
@@ -1015,7 +1003,6 @@ menu_schedule_backup() {
                 selected_packages+=("${packages[$((idx - 1))]}")
             done
             if [[ "$valid" == true ]]; then
-                # Join with commas for --package-ids
                 pkg_ids_arg=$(IFS=','; echo "${selected_packages[*]}")
                 break
             fi
@@ -1026,11 +1013,7 @@ menu_schedule_backup() {
     done
 
     local packages_display
-    if [[ -z "$pkg_ids_arg" ]]; then
-        packages_display="ALL"
-    else
-        packages_display="$pkg_ids_arg"
-    fi
+    [[ -z "$pkg_ids_arg" ]] && packages_display="ALL" || packages_display="$pkg_ids_arg"
 
     # ── Step 4: Schedule ─────────────────────────────────────────────────────
     local CRON_SCHEDULE
@@ -1040,14 +1023,14 @@ menu_schedule_backup() {
     local notif_cmd=""
     _pick_post_action "Post-backup notification:" notif_cmd || return 1
 
-    # ── Build backup command ──────────────────────────────────────────────────
+    # ── Build cron line ──────────────────────────────────────────────────────
     local backup_cmd="${_START_CLI} backup create ${backup_target} '${backup_password}'"
     [[ -n "$pkg_ids_arg" ]] && backup_cmd+=" --package-ids ${pkg_ids_arg}"
+    _bwfl="$CRON_SCHEDULE $backup_cmd"
+    [[ -n "$notif_cmd" ]] && _bwfl+=" && $notif_cmd"
+    _bwpw="$backup_password"
 
-    local full_line="$CRON_SCHEDULE $backup_cmd"
-    [[ -n "$notif_cmd" ]] && full_line+=" && $notif_cmd"
-
-    # ── Step 6: Preview & confirm ────────────────────────────────────────────
+    # ── Preview ──────────────────────────────────────────────────────────────
     echo ""
     print_section "Review Backup Schedule"
     echo ""
@@ -1056,20 +1039,145 @@ menu_schedule_backup() {
     echo -e "  ${BOLD}Schedule:${NC}  $CRON_SCHEDULE"
     [[ -n "$notif_cmd" ]] && echo -e "  ${BOLD}Notify:${NC}    $notif_cmd"
     echo ""
-    echo -e "  ${DIM}Cron line to install:${NC}"
-    # Show password masked in preview
-    local preview_line="${full_line//${backup_password}/********}"
+    echo -e "  ${DIM}Cron line:${NC}"
+    local preview_line="${_bwfl//${backup_password}/********}"
     echo -e "  ${DIM}${preview_line}${NC}"
     echo ""
+}
 
-    if ! confirm "Install this cron job?"; then
+_backup_install_flow() {
+    print_header
+    print_section "Schedule Backups"
+    echo ""
+    local bw_full_line bw_password
+    _backup_wizard bw_full_line bw_password || return 1
+
+    if ! confirm "Install this backup schedule?"; then
         [[ $_BACK -eq 1 ]] && return 1
         print_info "Cancelled."
         pause; return
     fi
 
-    install_cron_job "$full_line" "Schedule Backups" || return 1
+    install_cron_job "$bw_full_line" "Schedule Backups" || return 1
     # NOTE: server restarts after this — nothing below executes
+}
+
+_backup_edit_flow() {
+    # ── Find existing backup entries ─────────────────────────────────────────
+    local cron_output
+    cron_output=$(sudo crontab -u root -l 2>/dev/null)
+    local -a old_comments=() old_cron_lines=() all_lines
+    mapfile -t all_lines <<< "$cron_output"
+    local total=${#all_lines[@]} eidx
+    for (( eidx=0; eidx<total; eidx++ )); do
+        if [[ "${all_lines[$eidx]}" == *"| Action: Schedule Backups"* ]]; then
+            old_comments+=("${all_lines[$eidx]}")
+            local enext=""
+            [[ $((eidx+1)) -lt $total ]] && enext="${all_lines[$((eidx+1))]}"
+            old_cron_lines+=("$enext")
+        fi
+    done
+
+    if [[ ${#old_comments[@]} -eq 0 ]]; then
+        print_info "No backup schedules installed."
+        pause; return
+    fi
+
+    # ── List and pick ────────────────────────────────────────────────────────
+    print_header
+    print_section "Edit Backup Schedule"
+    echo ""
+    local ei
+    for (( ei=0; ei<${#old_comments[@]}; ei++ )); do
+        local e_sched e_target
+        e_sched=$(echo "${old_cron_lines[$ei]}" | awk '{print $1,$2,$3,$4,$5}')
+        e_target=$(echo "${old_cron_lines[$ei]}" | grep -oE "backup create [^ ]+" | awk '{print $3}')
+        echo -e "  ${BOLD}$((ei+1)))${NC} ${e_sched}  →  ${e_target:-unknown}"
+        echo -e "     ${DIM}${old_comments[$ei]}${NC}"
+        echo ""
+    done
+
+    local e_choice
+    while true; do
+        _read e_choice "  Pick entry to replace [1-${#old_comments[@]}]: " || return 1
+        if [[ "$e_choice" =~ ^[0-9]+$ ]] && \
+           [[ "$e_choice" -ge 1 ]] && [[ "$e_choice" -le ${#old_comments[@]} ]]; then
+            break
+        fi
+        print_warn "Enter a number between 1 and ${#old_comments[@]}."
+    done
+
+    local old_comment="${old_comments[$((e_choice-1))]}"
+    local old_cron_line="${old_cron_lines[$((e_choice-1))]}"
+
+    # ── Run wizard for replacement ───────────────────────────────────────────
+    print_header
+    print_section "Edit Backup Schedule"
+    echo ""
+    local bw_full_line bw_password
+    _backup_wizard bw_full_line bw_password || return 1
+
+    if ! confirm "Replace existing schedule with this?"; then
+        [[ $_BACK -eq 1 ]] && return 1
+        print_info "Cancelled."
+        pause; return
+    fi
+
+    local install_ts
+    install_ts=$(date '+%Y.%m.%d %H:%M:%S %Z')
+    local new_comment="# startos-admin v${VERSION} | Added: ${install_ts} | Action: Schedule Backups"
+    local enc_old_c enc_old_l enc_new_c enc_new_l
+    enc_old_c=$(printf '%s' "$old_comment"   | base64 -w 0)
+    enc_old_l=$(printf '%s' "$old_cron_line" | base64 -w 0)
+    enc_new_c=$(printf '%s' "$new_comment"   | base64 -w 0)
+    enc_new_l=$(printf '%s' "$bw_full_line"  | base64 -w 0)
+
+    _warn_restart "after the backup schedule is updated."
+    if ! confirm "Proceed? (server will restart automatically)"; then
+        [[ $_BACK -eq 1 ]] && return 1
+        print_info "Cancelled."
+        return
+    fi
+
+    print_success "Replacement staged. Entering persistence mode now."
+    echo ""
+    debug_log "Replacing backup schedule. Old comment: $old_comment"
+    local chroot_exit=0
+    sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || chroot_exit=$?
+old_c=\$(printf '%s' "$enc_old_c" | base64 -d)
+old_l=\$(printf '%s' "$enc_old_l" | base64 -d)
+{ crontab -l 2>/dev/null | grep -vxF "\$old_c" | grep -vxF "\$old_l"; printf '%s' "$enc_new_c" | base64 -d; echo; printf '%s' "$enc_new_l" | base64 -d; echo; } | crontab -
+exit
+EOF
+
+    if [[ $chroot_exit -eq 0 ]]; then
+        print_success "Backup schedule updated persistently."
+        print_warn "The server will restart shortly — your SSH session will disconnect."
+        print_warn "After reconnecting, verify with: crontab -l"
+    else
+        print_error "chroot-and-upgrade failed (exit $chroot_exit). Schedule may not have been updated."
+        pause
+    fi
+}
+
+menu_schedule_backup() {
+    while true; do
+        print_header
+        print_section "Schedule Backups"
+        echo ""
+        echo -e "    ${CYAN}${BOLD}1)${NC} Add a new backup schedule"
+        echo -e "    ${CYAN}${BOLD}2)${NC} Edit an existing backup schedule"
+        echo ""
+        echo -e "    ${DIM}0) Back${NC}"
+        echo ""
+        _read sub_choice "  $(echo -e "${BOLD}Choice:${NC} ")" || return 1
+        case "$sub_choice" in
+            1) _backup_install_flow || return 1 ;;
+            2) _backup_edit_flow    || return 1 ;;
+            0) return ;;
+            *) print_warn "Enter 0-2." ; sleep 1 ;;
+        esac
+    done
 }
 
 # Helper: prompt for StartOS notification fields, storing into named variables
@@ -1226,11 +1334,6 @@ menu_schedule_stay_alive() {
     echo -e "  services, clearnet addresses, or any endpoint that needs periodic pinging."
     echo ""
     _nav_tip
-    if ! confirm "Continue to setup wizard?"; then
-        [[ $_BACK -eq 1 ]] && return 1
-        return
-    fi
-
     print_header
     print_section "Schedule Stay-Alive Curl"
     echo ""
