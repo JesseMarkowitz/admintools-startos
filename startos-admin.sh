@@ -12,7 +12,7 @@
 #   7. Manage notification forwarders   — poll start-cli notifications, forward via webhook
 #   8. System database viewer           — browse start-cli db dump by category
 
-VERSION="49"   # integer — increment on each release
+VERSION="50"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -1846,7 +1846,7 @@ while IFS= read -r notif; do
     CURL_BODY=$(echo "$CURL_OUT" | grep -v 'HTTP_STATUS:')
     [ "$DEBUG" -eq 1 ] && echo "$(_ts): DEBUG curl exit=$CURL_EXIT http=$HTTP_STATUS response=[$CURL_BODY]"
 
-done < <(echo "$NOTIFS" | jq -c --argjson last "$LAST_ID" '[.[] | select((.id | tonumber) > $last)] | .[]')
+done < <(echo "$NOTIFS" | jq -c --argjson last "$LAST_ID" '[.[] | select((.id | tonumber) > $last)] | sort_by(.id | tonumber) | .[]')
 
 # ── Persist state ─────────────────────────────────────────────────────────
 echo "$(_ts): run complete — MAX_ID=$MAX_ID (was LAST_ID=$LAST_ID)"
