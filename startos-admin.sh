@@ -12,7 +12,7 @@
 #   7. Manage notification forwarders   — poll start-cli notifications, forward via webhook
 #   8. System database viewer           — browse start-cli db dump by category
 
-VERSION="52"   # integer — increment on each release
+VERSION="53"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -2562,6 +2562,116 @@ _db_svc_detail() {
     pause
 }
 
+# Display service interfaces (URLs) extracted from DB for selected services.
+_db_interfaces() {
+    local db="$1"
+    print_header
+    print_section "Service Interfaces"
+    echo ""
+    _nav_tip
+
+    # Build service list
+    local svc_list
+    mapfile -t svc_list < <(echo "$db" | jq -r '.value.packageData | keys[]')
+
+    local i=1
+    for svc in "${svc_list[@]}"; do
+        echo -e "    ${CYAN}${BOLD}${i})${NC} ${svc}"
+        (( i++ )) || true
+    done
+    echo ""
+    echo -e "    ${CYAN}${BOLD}a)${NC} All services"
+    echo ""
+
+    local svc_input
+    _read svc_input "  $(echo -e "${BOLD}Select services (comma-separated) or 'a' for all:${NC} ")" || return 1
+
+    # Parse selection into a jq-friendly filter array
+    local selected=()
+    if [[ "${svc_input,,}" == "a" || "${svc_input,,}" == "all" ]]; then
+        selected=("${svc_list[@]}")
+    else
+        IFS=',' read -ra picks <<< "$svc_input"
+        for p in "${picks[@]}"; do
+            p=$(echo "$p" | tr -d '[:space:]')
+            if ! [[ "$p" =~ ^[0-9]+$ ]] || [[ "$p" -lt 1 ]] || [[ "$p" -gt "${#svc_list[@]}" ]]; then
+                print_warn "Invalid selection: $p"; sleep 1; return 0
+            fi
+            selected+=("${svc_list[$((p - 1))]}")
+        done
+    fi
+    [[ ${#selected[@]} -eq 0 ]] && { print_warn "No services selected."; sleep 1; return 0; }
+
+    # Build jq filter string: ["svc1","svc2",...]
+    local jq_filter
+    jq_filter=$(printf '%s\n' "${selected[@]}" | jq -R . | jq -sc .)
+
+    print_header
+    print_section "Service Interfaces"
+    echo ""
+
+    # Extract and display interfaces
+    local output
+    output=$(echo "$db" | jq -r --argjson svcs "$jq_filter" '
+      .value.packageData | to_entries[] |
+      select(.key as $k | $svcs | index($k)) |
+      .key as $svc |
+      .value as $pkg |
+      $pkg.serviceInterfaces | to_entries[] |
+      .value as $iface |
+      $iface.addressInfo.hostId as $hostId |
+      $iface.addressInfo.suffix as $suffix |
+      $iface.addressInfo.scheme as $scheme |
+      $iface.addressInfo.sslScheme as $sslScheme |
+      ($pkg.hosts[$hostId].hostnameInfo // {} | to_entries[] | .value[]) as $h |
+      # Filter: skip loopback gateway, link-local IPv6
+      select(($h.gateway.id? // "onion") | . != "lo" and . != "lxcbr0") |
+      select(($h.hostname.kind == "ipv6" and ($h.hostname.value | startswith("fe80::"))) | not) |
+      # Wrap IPv6 in brackets
+      (if $h.hostname.kind == "ipv6" then "[" + $h.hostname.value + "]"
+       else $h.hostname.value end) as $host |
+      # Build URL: prefer SSL when available
+      (
+        if ($h.hostname.sslPort != null and $sslScheme != null) then
+          $sslScheme + "://" + $host + ":" + ($h.hostname.sslPort|tostring) + $suffix
+        elif ($h.hostname.port != null and $scheme != null) then
+          $scheme + "://" + $host + ":" + ($h.hostname.port|tostring) + $suffix
+        elif ($h.hostname.sslPort != null) then
+          "ssl://" + $host + ":" + ($h.hostname.sslPort|tostring) + $suffix
+        elif ($h.hostname.port != null) then
+          "tcp://" + $host + ":" + ($h.hostname.port|tostring) + $suffix
+        else empty
+        end
+      ) as $url |
+      # Network label
+      (if $h.kind == "onion" then "tor"
+       elif ($h.gateway.id? // "") == "wg1" then "tunnel"
+       else ($h.gateway.name? // $h.gateway.id? // "unknown")
+       end) as $net |
+      "\($svc)\t\($iface.name)\t\($iface.type)\t\($net)\t\($url)"
+    ' 2>/dev/null)
+
+    if [[ -z "$output" ]]; then
+        print_info "No interfaces found for selected services."
+    else
+        local prev_svc=""
+        while IFS=$'\t' read -r svc iname itype net url; do
+            if [[ "$svc" != "$prev_svc" ]]; then
+                [[ -n "$prev_svc" ]] && echo ""
+                echo -e "  ${BOLD}${svc}${NC}"
+                prev_svc="$svc"
+            fi
+            local type_color="$GREEN"
+            [[ "$itype" == "api" ]] && type_color="$YELLOW"
+            [[ "$itype" == "p2p" ]] && type_color="$BLUE"
+            printf "    ${type_color}%-4s${NC}  %-20s  %-24s  %s\n" "$itype" "$iname" "$net" "$url"
+        done <<< "$output"
+    fi
+    echo ""
+
+    pause
+}
+
 menu_db_dump() {
     print_header
     print_section "System Database"
@@ -2587,17 +2697,19 @@ menu_db_dump() {
         echo -e "    ${CYAN}${BOLD}2)${NC} Network"
         echo -e "    ${CYAN}${BOLD}3)${NC} Service Status"
         echo -e "    ${CYAN}${BOLD}4)${NC} Service Detail"
+        echo -e "    ${CYAN}${BOLD}5)${NC} Service Interfaces"
         echo ""
         echo -e "    ${DIM}0) Back${NC}"
         echo ""
         _read db_choice "  $(echo -e "${BOLD}Choice:${NC} ")" || return 1
         case "$db_choice" in
-            1) _db_server_info "$db_json" ;;
-            2) _db_network     "$db_json" ;;
-            3) _db_svc_status  "$db_json" ;;
-            4) _db_svc_detail  "$db_json" || return 1 ;;
+            1) _db_server_info  "$db_json" ;;
+            2) _db_network      "$db_json" ;;
+            3) _db_svc_status   "$db_json" ;;
+            4) _db_svc_detail   "$db_json" || return 1 ;;
+            5) _db_interfaces   "$db_json" || return 1 ;;
             0) return ;;
-            *) print_warn "Enter 0-4." ; sleep 1 ;;
+            *) print_warn "Enter 0-5." ; sleep 1 ;;
         esac
     done
 }

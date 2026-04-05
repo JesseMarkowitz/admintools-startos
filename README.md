@@ -289,3 +289,54 @@ Forwarded messages are sent as plain text:
 
 
 </details>
+
+---
+
+<details>
+<summary><strong>8. System Database</strong></summary>
+
+Reads the full system database via `start-cli db dump` and presents it through several focused views.
+
+Sub-options:
+
+**1) Server Info** — hostname, StartOS version, architecture, platform, last backup time.
+
+**2) Network** — addresses, Tor onion addresses, WiFi status, gateways (with LAN/WAN IPs), and DNS servers.
+
+**3) Service Status** — desired state and health-check results for every installed service.
+
+**4) Service Detail** — deep view of a single service: status, started time, last backup, registry, health checks, and dependencies.
+
+**5) Service Interfaces** — displays all externally reachable URLs for one or more services. Select individual services (comma-separated) or all at once.
+
+For each interface, shows:
+- Interface type (`ui`, `api`, `p2p`)
+- Interface name
+- Network (e.g. Wired connection, tor, tunnel)
+- Full URL with correct scheme and port
+
+Filtering:
+- Excludes loopback (`lo`) and internal bridge (`lxcbr0`) gateways
+- Excludes link-local IPv6 (`fe80::`) addresses
+- Wraps IPv6 addresses in brackets
+- Prefers SSL when available; falls back to plain scheme or `tcp://`/`ssl://` for interfaces without an explicit scheme (e.g. peer, ZeroMQ)
+
+Use cases:
+- Quickly find the URL for any service interface
+- Verify which addresses are reachable on each network
+- Input for automated testing or monitoring
+
+</details>
+
+---
+
+<details>
+<summary><strong>9. Debug Mode</strong></summary>
+
+Toggles debug mode on or off.
+
+When enabled, shows extra output during operations and enables verbose logging for notification pollers.
+
+Debug state persists within a boot session via a flag file. It is reset on reboot.
+
+</details>
