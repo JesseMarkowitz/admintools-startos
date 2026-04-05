@@ -2631,16 +2631,18 @@ _db_interfaces() {
       # Wrap IPv6 in brackets
       (if $a.metadata.kind == "ipv6" then "[" + $a.hostname + "]"
        else $a.hostname end) as $host |
+      # Strip query params from suffix (hides embedded certs/macaroons)
+      ($suffix | split("?")[0]) as $safeSuffix |
       # Build URL using ssl flag and interface scheme
       (
         if ($a.ssl and $sslScheme != null) then
-          $sslScheme + "://" + $host + ":" + ($a.port|tostring) + $suffix
+          $sslScheme + "://" + $host + ":" + ($a.port|tostring) + $safeSuffix
         elif ($a.ssl | not) and ($scheme != null) then
-          $scheme + "://" + $host + ":" + ($a.port|tostring) + $suffix
+          $scheme + "://" + $host + ":" + ($a.port|tostring) + $safeSuffix
         elif $a.ssl then
-          "ssl://" + $host + ":" + ($a.port|tostring) + $suffix
+          "ssl://" + $host + ":" + ($a.port|tostring) + $safeSuffix
         else
-          "tcp://" + $host + ":" + ($a.port|tostring) + $suffix
+          "tcp://" + $host + ":" + ($a.port|tostring) + $safeSuffix
         end
       ) as $url |
       # Network label
