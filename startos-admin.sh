@@ -2623,30 +2623,30 @@ _db_interfaces() {
       $iface.addressInfo.suffix as $suffix |
       $iface.addressInfo.scheme as $scheme |
       $iface.addressInfo.sslScheme as $sslScheme |
-      ($pkg.hosts[$hostId].hostnameInfo // {} | to_entries[] | .value[]) as $h |
-      # Filter: skip loopback gateway, link-local IPv6
-      select(($h.gateway.id? // "onion") | . != "lo" and . != "lxcbr0") |
-      select(($h.hostname.kind == "ipv6" and ($h.hostname.value | startswith("fe80::"))) | not) |
+      # Walk bindings → addresses.available for the matched host
+      ($pkg.hosts[$hostId].bindings // {} | to_entries[].value.addresses.available[]?) as $a |
+      # Filter: skip loopback, internal bridge, link-local IPv6
+      select($a.metadata.gateway | . != "lo" and . != "lxcbr0") |
+      select(($a.metadata.kind == "ipv6" and ($a.hostname | startswith("fe80::"))) | not) |
       # Wrap IPv6 in brackets
-      (if $h.hostname.kind == "ipv6" then "[" + $h.hostname.value + "]"
-       else $h.hostname.value end) as $host |
-      # Build URL: prefer SSL when available
+      (if $a.metadata.kind == "ipv6" then "[" + $a.hostname + "]"
+       else $a.hostname end) as $host |
+      # Build URL using ssl flag and interface scheme
       (
-        if ($h.hostname.sslPort != null and $sslScheme != null) then
-          $sslScheme + "://" + $host + ":" + ($h.hostname.sslPort|tostring) + $suffix
-        elif ($h.hostname.port != null and $scheme != null) then
-          $scheme + "://" + $host + ":" + ($h.hostname.port|tostring) + $suffix
-        elif ($h.hostname.sslPort != null) then
-          "ssl://" + $host + ":" + ($h.hostname.sslPort|tostring) + $suffix
-        elif ($h.hostname.port != null) then
-          "tcp://" + $host + ":" + ($h.hostname.port|tostring) + $suffix
-        else empty
+        if ($a.ssl and $sslScheme != null) then
+          $sslScheme + "://" + $host + ":" + ($a.port|tostring) + $suffix
+        elif ($a.ssl | not) and ($scheme != null) then
+          $scheme + "://" + $host + ":" + ($a.port|tostring) + $suffix
+        elif $a.ssl then
+          "ssl://" + $host + ":" + ($a.port|tostring) + $suffix
+        else
+          "tcp://" + $host + ":" + ($a.port|tostring) + $suffix
         end
       ) as $url |
       # Network label
-      (if $h.kind == "onion" then "tor"
-       elif ($h.gateway.id? // "") == "wg1" then "tunnel"
-       else ($h.gateway.name? // $h.gateway.id? // "unknown")
+      (if $a.metadata.gateway == "wg1" then "tunnel"
+       elif $a.metadata.gateway == null then "local"
+       else $a.metadata.gateway
        end) as $net |
       "\($svc)\t\($iface.name)\t\($iface.type)\t\($net)\t\($url)"
     ' 2>/dev/null)
