@@ -3049,7 +3049,7 @@ _config_export_flow() {
     local enc_exit=0
     printf '%s' "$bundle" \
         | openssl enc -aes-256-cbc -pbkdf2 -salt -a \
-            -passin "file:${pass_file}" > "$_CONFIG_BACKUP_FILE" \
+            -pass "file:${pass_file}" > "$_CONFIG_BACKUP_FILE" \
         || enc_exit=$?
     rm -f "$pass_file"
 
@@ -3139,7 +3139,7 @@ _config_restore_flow() {
 
     local bundle dec_exit=0
     bundle=$(openssl enc -d -aes-256-cbc -pbkdf2 -a \
-        -passin "file:${pass_file}" -in "$backup_path" 2>/dev/null) || dec_exit=$?
+        -pass "file:${pass_file}" -in "$backup_path" 2>/dev/null) || dec_exit=$?
     rm -f "$pass_file"
 
     if [[ $dec_exit -ne 0 || -z "$bundle" ]]; then
