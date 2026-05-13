@@ -339,7 +339,7 @@ Exports your installed cron jobs and notification forwarders as a single AES-256
 - All root cron entries
 - All notification forwarder scripts (including embedded webhook URLs and schedules)
 
-**Restore reinstalls** cron jobs and notification forwarder scripts in a single reboot. The `startos-admin` script itself is not included in the backup — after a reflash, the latest version is always downloaded fresh from GitHub.
+**Restore reinstalls** everything in a single reboot: cron jobs, notification forwarder scripts, and the `startos-admin` script itself (downloaded fresh from GitHub — always the latest version).
 
 **Encryption:** The backup is encrypted with AES-256-CBC (OpenSSL, PBKDF2 key derivation). The passphrase you set at export time is required to restore. There is no passphrase recovery option — a forgotten passphrase makes the backup permanently unreadable.
 
@@ -360,7 +360,7 @@ scp ./startos-config-backup.enc start9@<server-ip>:/tmp/
 **Post-reflash restore workflow:**
 1. SSH into the fresh server
 2. Download `startos-admin.sh` (see Install section above)
-3. Run it — when prompted to install persistently, you may decline if you plan to restore (saves a reboot; the Restore step does not reinstall the script)
+3. Run it — when prompted to install persistently, you may decline; the Restore step installs the latest version as part of the same reboot
 4. Navigate to **9) Backup / Restore configuration → 2) Restore**
 5. Follow the prompts; server restarts once with everything restored
 

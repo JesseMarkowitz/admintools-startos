@@ -3192,6 +3192,7 @@ _config_restore_flow() {
     print_warn "Your current crontab will be REPLACED with the backed-up version."
     [[ $pcount -gt 0 ]] && \
         print_warn "Forwarder scripts with matching names will be overwritten."
+    print_info "The latest startos-admin script will also be downloaded and installed persistently."
     echo ""
 
     # ── Confirmations ─────────────────────────────────────────────────────────
@@ -3213,6 +3214,8 @@ _config_restore_flow() {
     # ── Build and run chroot session ──────────────────────────────────────────
     local chroot_body
     chroot_body="mkdir -p ${_STARTOS_DATA_DIR}
+curl -fsSL https://raw.githubusercontent.com/JesseMarkowitz/admintools-startos/refs/heads/main/startos-admin.sh -o /usr/local/bin/startos-admin
+chmod +x /usr/local/bin/startos-admin
 "
     if [[ -n "$crontab_b64" ]]; then
         chroot_body+="{ printf '%s' '${crontab_b64}' | base64 -d; echo; } | crontab -
