@@ -12,7 +12,7 @@
 #   7. Manage notification forwarders   — poll start-cli notifications, forward via webhook
 #   8. System database viewer           — browse start-cli db dump by category
 
-VERSION="54"   # integer — increment on each release
+VERSION="55"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -3064,6 +3064,8 @@ _config_export_flow() {
     [[ -n "$crontab_out" ]] && \
         cron_count=$(echo "$crontab_out" | grep -c '^# startos-admin v' 2>/dev/null || true)
 
+    ${_START_CLI} notification create blank info "StartOS Admin" "StartOS Admin Configuration Backed Up" 2>/dev/null || true
+
     echo ""
     print_success "Backup written to: ${_CONFIG_BACKUP_FILE}"
     echo ""
@@ -3083,7 +3085,7 @@ _config_export_flow() {
     echo ""
     echo -e "  Run this command from your ${BOLD}local machine${NC}:"
     echo ""
-    echo -e "  ${CYAN}scp root@${server_ip}:${_CONFIG_BACKUP_FILE} ./${NC}"
+    echo -e "  ${CYAN}scp start9@${server_ip}:${_CONFIG_BACKUP_FILE} ./${NC}"
     echo ""
 
     pause
@@ -3102,7 +3104,7 @@ _config_restore_flow() {
     echo ""
     echo -e "  Run this command from your ${BOLD}local machine${NC} before continuing:"
     echo ""
-    echo -e "  ${CYAN}scp ./startos-config-backup.enc root@${server_ip}:${_CONFIG_BACKUP_FILE}${NC}"
+    echo -e "  ${CYAN}scp ./startos-config-backup.enc start9@${server_ip}:${_CONFIG_BACKUP_FILE}${NC}"
     echo ""
 
     local _rp_reply
@@ -3186,9 +3188,6 @@ _config_restore_flow() {
     for pi in "${!pnames[@]}"; do
         echo -e "    ${DIM}• ${pnames[$pi]}${NC}"
     done
-
-    echo -e "  ${BOLD}Script:${NC}       startos-admin will be permanently installed to"
-    echo -e "                ${DIM}/usr/local/bin/startos-admin${NC}"
     echo ""
     print_warn "Your current crontab will be REPLACED with the backed-up version."
     [[ $pcount -gt 0 ]] && \
@@ -3209,15 +3208,14 @@ _config_restore_flow() {
         return
     fi
 
-    # ── Build and run chroot session ──────────────────────────────────────────
-    local enc_self
-    enc_self=$(base64 -w 0 < "$(realpath "$0" 2>/dev/null || echo "$0")")
+    ${_START_CLI} notification create blank info "StartOS Admin" "StartOS Admin Configuration Restored" 2>/dev/null || true
 
+    # ── Build and run chroot session ──────────────────────────────────────────
     local chroot_body
     chroot_body="mkdir -p ${_STARTOS_DATA_DIR}
 "
     if [[ -n "$crontab_b64" ]]; then
-        chroot_body+="printf '%s' '${crontab_b64}' | base64 -d | crontab -
+        chroot_body+="{ printf '%s' '${crontab_b64}' | base64 -d; echo; } | crontab -
 "
     fi
 
@@ -3228,10 +3226,6 @@ _config_restore_flow() {
 chmod +x ${_POLLER_BIN_PREFIX}${pn}
 "
     done
-
-    chroot_body+="printf '%s' '${enc_self}' | base64 -d > /usr/local/bin/startos-admin
-chmod +x /usr/local/bin/startos-admin
-"
 
     print_success "Restore staged. Entering persistence mode now."
     echo ""
