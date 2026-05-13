@@ -12,7 +12,7 @@
 #   7. Manage notification forwarders   — poll start-cli notifications, forward via webhook
 #   8. System database viewer           — browse start-cli db dump by category
 
-VERSION="55"   # integer — increment on each release
+VERSION="56"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -349,7 +349,9 @@ menu_create_notification() {
 
     debug_log "Calling: start-cli notification create '${notif_service}' '$notif_level' '$notif_title' '...'"
     local exit_code=0
-    start-cli notification create "$notif_service" "$notif_level" "$notif_title" "$notif_body" 2>&1 \
+    local _pkg_args=()
+    [[ -n "$notif_service" && "$notif_service" != "blank" ]] && _pkg_args=(--package "$notif_service")
+    start-cli notification create "${_pkg_args[@]}" "$notif_level" "$notif_title" "$notif_body" 2>&1 \
         || exit_code=$?
     debug_log "start-cli exit: $exit_code"
 
@@ -1366,10 +1368,12 @@ _pick_post_action() {
         esac
     done
 
+    local _ppa_pkg_flag=""
+    [[ -n "$_ppa_svc" && "$_ppa_svc" != "blank" ]] && _ppa_pkg_flag="--package ${_ppa_svc} "
     case "$_ppa_mode" in
         1) _ppa_notif_cmd="${_ppa_cmd}" ;;
-        2) _ppa_notif_cmd="${_START_CLI} notification create ${_ppa_svc} ${_ppa_level} \"${_ppa_title}\" \"${_ppa_body}\"" ;;
-        3) _ppa_notif_cmd="${_ppa_cmd} && ${_START_CLI} notification create ${_ppa_svc} ${_ppa_level} \"${_ppa_title}\" \"${_ppa_body}\"" ;;
+        2) _ppa_notif_cmd="${_START_CLI} notification create ${_ppa_pkg_flag}${_ppa_level} \"${_ppa_title}\" \"${_ppa_body}\"" ;;
+        3) _ppa_notif_cmd="${_ppa_cmd} && ${_START_CLI} notification create ${_ppa_pkg_flag}${_ppa_level} \"${_ppa_title}\" \"${_ppa_body}\"" ;;
         4) _ppa_notif_cmd="" ;;
     esac
 }
@@ -3064,7 +3068,7 @@ _config_export_flow() {
     [[ -n "$crontab_out" ]] && \
         cron_count=$(echo "$crontab_out" | grep -c '^# startos-admin v' 2>/dev/null || true)
 
-    ${_START_CLI} notification create blank info "StartOS Admin" "StartOS Admin Configuration Backed Up" 2>/dev/null || true
+    ${_START_CLI} notification create info "StartOS Admin" "StartOS Admin Configuration Backed Up" 2>/dev/null || true
 
     echo ""
     print_success "Backup written to: ${_CONFIG_BACKUP_FILE}"
@@ -3209,7 +3213,7 @@ _config_restore_flow() {
         return
     fi
 
-    ${_START_CLI} notification create blank info "StartOS Admin" "StartOS Admin Configuration Restored" 2>/dev/null || true
+    ${_START_CLI} notification create info "StartOS Admin" "StartOS Admin Configuration Restored" 2>/dev/null || true
 
     # ── Build and run chroot session ──────────────────────────────────────────
     local chroot_body
