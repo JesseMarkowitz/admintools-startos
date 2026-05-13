@@ -3134,12 +3134,12 @@ _config_restore_flow() {
     local pass_file
     pass_file=$(mktemp)
     chmod 600 "$pass_file"
-    printf '%s' "$passphrase" > "$pass_file"
+    printf '%s\n' "$passphrase" > "$pass_file"
     unset passphrase
 
     local bundle dec_exit=0
     bundle=$(openssl enc -d -aes-256-cbc -pbkdf2 -a \
-        -pass "file:${pass_file}" -in "$backup_path" 2>/dev/null) || dec_exit=$?
+        -pass "file:${pass_file}" -in "$backup_path") || dec_exit=$?
     rm -f "$pass_file"
 
     if [[ $dec_exit -ne 0 || -z "$bundle" ]]; then
