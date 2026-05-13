@@ -12,7 +12,7 @@
 #   7. Manage notification forwarders   — poll start-cli notifications, forward via webhook
 #   8. System database viewer           — browse start-cli db dump by category
 
-VERSION="53"   # integer — increment on each release
+VERSION="54"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -38,6 +38,7 @@ _POLLER_LOG_PREFIX="${_STARTOS_DATA_DIR}/startos-notif-poller-"
 # Full path to start-cli — resolved once so cron jobs and generated scripts
 # embed the absolute path and don't depend on cron's minimal PATH.
 _START_CLI=$(command -v start-cli 2>/dev/null || echo "start-cli")
+_CONFIG_BACKUP_FILE="/tmp/startos-config-backup.enc"
 
 # ─────────────────────────────────────────────
 # Navigation — "exit" / "back" support
@@ -2734,6 +2735,7 @@ menu_documentation() {
         echo -e "    ${CYAN}${BOLD}7)${NC} Manage notification forwarders"
         echo -e "    ${CYAN}${BOLD}8)${NC} System Database"
         echo -e "    ${CYAN}${BOLD}9)${NC} Troubleshooting"
+        echo -e "    ${CYAN}${BOLD}10)${NC} Backup / Restore configuration"
         echo ""
         echo -e "    ${DIM}0) Back${NC}"
         echo ""
@@ -2932,8 +2934,340 @@ menu_documentation() {
                 echo -e "  via this tool, it will be lost on next reboot."
                 echo ""
                 pause ;;
+            10)
+                print_header
+                print_section "Backup / Restore Configuration"
+                echo ""
+                echo -e "  Exports your installed cron jobs and notification forwarders as a"
+                echo -e "  single AES-256 encrypted backup file, and can restore them after"
+                echo -e "  an OS upgrade or reflash."
+                echo ""
+                echo -e "  ${BOLD}Export${NC} saves:"
+                echo ""
+                echo -e "    ${CYAN}•${NC} All root cron entries"
+                echo -e "    ${CYAN}•${NC} All notification forwarder scripts  ${DIM}(including embedded webhook URLs)${NC}"
+                echo ""
+                echo -e "  ${BOLD}Restore${NC} reinstalls everything in a single reboot — including the"
+                echo -e "  ${CYAN}startos-admin${NC} script itself at ${DIM}/usr/local/bin/startos-admin${NC}."
+                echo ""
+                echo -e "  The backup file is encrypted with AES-256-CBC using a passphrase you"
+                echo -e "  provide. ${YELLOW}The passphrase cannot be recovered.${NC} A forgotten passphrase"
+                echo -e "  makes the backup permanently unreadable."
+                echo ""
+                echo -e "  The encrypted file is saved to ${DIM}${_CONFIG_BACKUP_FILE}${NC}."
+                echo -e "  An ${CYAN}scp${NC} command is shown after export to transfer it off the server."
+                echo -e "  The same command (reversed) is shown at the start of the restore flow."
+                echo ""
+                pause ;;
             0) return ;;
-            *) print_warn "Enter 0-9." ; sleep 1 ;;
+            *) print_warn "Enter 0-10." ; sleep 1 ;;
+        esac
+    done
+}
+
+# ─────────────────────────────────────────────
+# Configuration Backup / Restore
+# ─────────────────────────────────────────────
+
+_config_export_flow() {
+    print_header
+    print_section "Export Configuration Backup"
+    echo ""
+    _nav_tip
+
+    # ── Preflight ─────────────────────────────────────────────────────────────
+    if ! command -v openssl &>/dev/null; then
+        print_error "openssl not found. Cannot create encrypted backup."
+        pause; return
+    fi
+
+    local crontab_out
+    crontab_out=$(sudo crontab -u root -l 2>/dev/null || true)
+    local poller_scripts=("${_POLLER_BIN_PREFIX}"*)
+    local has_pollers=0
+    [[ -e "${poller_scripts[0]}" ]] && has_pollers=1
+
+    if [[ -z "$crontab_out" && $has_pollers -eq 0 ]]; then
+        print_warn "Nothing to back up: no cron jobs and no forwarders are installed."
+        pause; return
+    fi
+
+    # ── Encryption warning ────────────────────────────────────────────────────
+    echo ""
+    echo -e "  ${RED}${BOLD}┌─────────────────────────────────────────────────┐${NC}"
+    echo -e "  ${RED}${BOLD}│  WARNING: ENCRYPTION PASSPHRASE CANNOT          │${NC}"
+    echo -e "  ${RED}${BOLD}│  BE RECOVERED.                                  │${NC}"
+    echo -e "  ${RED}${BOLD}│                                                 │${NC}"
+    echo -e "  ${RED}${BOLD}│  If you forget the passphrase, this backup      │${NC}"
+    echo -e "  ${RED}${BOLD}│  file will be permanently unreadable.           │${NC}"
+    echo -e "  ${RED}${BOLD}│  There is no reset or recovery option.          │${NC}"
+    echo -e "  ${RED}${BOLD}└─────────────────────────────────────────────────┘${NC}"
+    echo ""
+
+    # ── Collect and confirm passphrase ────────────────────────────────────────
+    local passphrase passphrase2
+    while true; do
+        _read_silent passphrase "  Enter backup passphrase: " || return 1
+        if [[ -z "$passphrase" ]]; then
+            print_warn "Passphrase cannot be empty."
+            continue
+        fi
+        _read_silent passphrase2 "  Confirm passphrase: " || { unset passphrase; return 1; }
+        if [[ "$passphrase" == "$passphrase2" ]]; then
+            unset passphrase2
+            break
+        fi
+        print_warn "Passphrases do not match. Try again."
+    done
+
+    # ── Assemble plaintext bundle ─────────────────────────────────────────────
+    local bundle
+    bundle="STARTOS_ADMIN_BACKUP_V1"$'\n'
+    bundle+="BACKUP_DATE=$(date '+%Y.%m.%d %H:%M:%S %Z')"$'\n'
+    bundle+="CRONTAB_B64=$(printf '%s' "$crontab_out" | base64 -w 0)"$'\n'
+
+    local pcount=0
+    if [[ $has_pollers -eq 1 ]]; then
+        local s
+        for s in "${poller_scripts[@]}"; do
+            [[ -f "$s" ]] || continue
+            local pname="${s##${_POLLER_BIN_PREFIX}}"
+            bundle+="POLLER_${pcount}_NAME=${pname}"$'\n'
+            bundle+="POLLER_${pcount}_SCRIPT_B64=$(base64 -w 0 < "$s")"$'\n'
+            (( pcount++ ))
+        done
+    fi
+    bundle+="POLLER_COUNT=${pcount}"$'\n'
+
+    # ── Encrypt to file ───────────────────────────────────────────────────────
+    local pass_file
+    pass_file=$(mktemp)
+    chmod 600 "$pass_file"
+    printf '%s' "$passphrase" > "$pass_file"
+    unset passphrase
+
+    local enc_exit=0
+    printf '%s' "$bundle" \
+        | openssl enc -aes-256-cbc -pbkdf2 -salt -a \
+            -passin "file:${pass_file}" -out "$_CONFIG_BACKUP_FILE" 2>/dev/null \
+        || enc_exit=$?
+    rm -f "$pass_file"
+
+    if [[ $enc_exit -ne 0 ]]; then
+        rm -f "$_CONFIG_BACKUP_FILE"
+        print_error "Encryption failed (openssl exit ${enc_exit}). Backup not written."
+        pause; return
+    fi
+
+    # ── Display results ───────────────────────────────────────────────────────
+    local cron_count=0
+    [[ -n "$crontab_out" ]] && \
+        cron_count=$(echo "$crontab_out" | grep -c '^# startos-admin v' 2>/dev/null || true)
+
+    echo ""
+    print_success "Backup written to: ${_CONFIG_BACKUP_FILE}"
+    echo ""
+    print_section "Backup Summary"
+    echo ""
+    echo -e "  ${BOLD}Cron entries:${NC} ${cron_count} startos-admin managed entries"
+    echo -e "  ${BOLD}Forwarders:${NC}   ${pcount}"
+    echo ""
+    print_section "Encrypted backup file contents"
+    echo ""
+    cat "$_CONFIG_BACKUP_FILE"
+    echo ""
+
+    local server_ip
+    server_ip=$(hostname -I | awk '{print $1}')
+    print_section "Copy this file off the server"
+    echo ""
+    echo -e "  Run this command from your ${BOLD}local machine${NC}:"
+    echo ""
+    echo -e "  ${CYAN}scp root@${server_ip}:${_CONFIG_BACKUP_FILE} ./${NC}"
+    echo ""
+
+    pause
+}
+
+_config_restore_flow() {
+    print_header
+    print_section "Restore Configuration Backup"
+    echo ""
+    _nav_tip
+
+    # ── scp instructions ──────────────────────────────────────────────────────
+    local server_ip
+    server_ip=$(hostname -I | awk '{print $1}')
+    print_section "Copy the backup file to this server first"
+    echo ""
+    echo -e "  Run this command from your ${BOLD}local machine${NC} before continuing:"
+    echo ""
+    echo -e "  ${CYAN}scp ./startos-config-backup.enc root@${server_ip}:${_CONFIG_BACKUP_FILE}${NC}"
+    echo ""
+
+    local _rp_reply
+    read -rp "$(echo -e "${DIM}  Press Enter once the file is on the server (or type 'exit' to quit)...${NC}")" _rp_reply
+    [[ "${_rp_reply,,}" == "exit" ]] && exit 0
+
+    # ── File path ─────────────────────────────────────────────────────────────
+    echo ""
+    local backup_path
+    _read backup_path "  Path to backup file [${_CONFIG_BACKUP_FILE}]: " || return 1
+    [[ -z "$backup_path" ]] && backup_path="$_CONFIG_BACKUP_FILE"
+
+    if [[ ! -f "$backup_path" ]]; then
+        print_error "File not found: ${backup_path}"
+        pause; return
+    fi
+
+    # ── Preflight ─────────────────────────────────────────────────────────────
+    if ! command -v openssl &>/dev/null; then
+        print_error "openssl not found. Cannot decrypt backup."
+        pause; return
+    fi
+
+    # ── Collect passphrase and decrypt ────────────────────────────────────────
+    echo ""
+    local passphrase
+    _read_silent passphrase "  Enter backup passphrase: " || return 1
+
+    local pass_file
+    pass_file=$(mktemp)
+    chmod 600 "$pass_file"
+    printf '%s' "$passphrase" > "$pass_file"
+    unset passphrase
+
+    local bundle dec_exit=0
+    bundle=$(openssl enc -d -aes-256-cbc -pbkdf2 -a \
+        -passin "file:${pass_file}" -in "$backup_path" 2>/dev/null) || dec_exit=$?
+    rm -f "$pass_file"
+
+    if [[ $dec_exit -ne 0 || -z "$bundle" ]]; then
+        print_error "Decryption failed. Wrong passphrase or corrupt file."
+        pause; return
+    fi
+
+    # ── Validate and parse bundle ─────────────────────────────────────────────
+    local header
+    header=$(printf '%s' "$bundle" | head -1)
+    if [[ "$header" != "STARTOS_ADMIN_BACKUP_V1" ]]; then
+        print_error "Unrecognized backup format. Cannot restore."
+        pause; return
+    fi
+
+    local crontab_b64 pcount backup_date
+    backup_date=$(printf '%s' "$bundle" | grep '^BACKUP_DATE='  | head -1 | cut -d= -f2-)
+    crontab_b64=$(printf '%s' "$bundle" | grep '^CRONTAB_B64='  | head -1 | cut -d= -f2-)
+    pcount=$(printf '%s'      "$bundle" | grep '^POLLER_COUNT=' | head -1 | cut -d= -f2-)
+    pcount="${pcount//[^0-9]/}"
+    [[ -z "$pcount" ]] && pcount=0
+
+    local -a pnames=() pscripts=()
+    local pi
+    for (( pi=0; pi<pcount; pi++ )); do
+        pnames+=("$(printf '%s'  "$bundle" | grep "^POLLER_${pi}_NAME="        | head -1 | cut -d= -f2-)")
+        pscripts+=("$(printf '%s' "$bundle" | grep "^POLLER_${pi}_SCRIPT_B64=" | head -1 | cut -d= -f2-)")
+    done
+
+    # ── Show restore summary ──────────────────────────────────────────────────
+    print_header
+    print_section "Restore Summary"
+    echo ""
+    echo -e "  ${BOLD}Backup date:${NC}  ${backup_date}"
+    echo ""
+
+    local cron_count=0
+    [[ -n "$crontab_b64" ]] && \
+        cron_count=$(printf '%s' "$crontab_b64" | base64 -d 2>/dev/null \
+            | grep -c '^# startos-admin v' || true)
+    echo -e "  ${BOLD}Cron entries:${NC} ${cron_count} startos-admin managed entries"
+
+    echo -e "  ${BOLD}Forwarders:${NC}   ${pcount}"
+    for pi in "${!pnames[@]}"; do
+        echo -e "    ${DIM}• ${pnames[$pi]}${NC}"
+    done
+
+    echo -e "  ${BOLD}Script:${NC}       startos-admin will be permanently installed to"
+    echo -e "                ${DIM}/usr/local/bin/startos-admin${NC}"
+    echo ""
+    print_warn "Your current crontab will be REPLACED with the backed-up version."
+    [[ $pcount -gt 0 ]] && \
+        print_warn "Forwarder scripts with matching names will be overwritten."
+    echo ""
+
+    # ── Confirmations ─────────────────────────────────────────────────────────
+    if ! confirm "Restore this configuration?"; then
+        [[ $_BACK -eq 1 ]] && return 1
+        print_info "Cancelled."
+        pause; return
+    fi
+
+    _warn_restart "after the configuration is restored."
+    if ! confirm "Proceed? (server will restart automatically)"; then
+        [[ $_BACK -eq 1 ]] && return 1
+        print_info "Cancelled."
+        return
+    fi
+
+    # ── Build and run chroot session ──────────────────────────────────────────
+    local enc_self
+    enc_self=$(base64 -w 0 < "$(realpath "$0" 2>/dev/null || echo "$0")")
+
+    local chroot_body
+    chroot_body="mkdir -p ${_STARTOS_DATA_DIR}
+"
+    if [[ -n "$crontab_b64" ]]; then
+        chroot_body+="printf '%s' '${crontab_b64}' | base64 -d | crontab -
+"
+    fi
+
+    for pi in "${!pnames[@]}"; do
+        local pn="${pnames[$pi]}"
+        local ps="${pscripts[$pi]}"
+        chroot_body+="printf '%s' '${ps}' | base64 -d > ${_POLLER_BIN_PREFIX}${pn}
+chmod +x ${_POLLER_BIN_PREFIX}${pn}
+"
+    done
+
+    chroot_body+="printf '%s' '${enc_self}' | base64 -d > /usr/local/bin/startos-admin
+chmod +x /usr/local/bin/startos-admin
+"
+
+    print_success "Restore staged. Entering persistence mode now."
+    echo ""
+    debug_log "Restoring: crontab=${cron_count} entries, pollers=${pcount}"
+
+    local chroot_exit=0
+    sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || chroot_exit=$?
+${chroot_body}exit
+EOF
+
+    if [[ $chroot_exit -eq 0 ]]; then
+        print_success "Configuration restored."
+        print_warn "The server will restart shortly — your SSH session will disconnect."
+        print_warn "After reconnecting, run: startos-admin"
+    else
+        print_error "chroot-and-upgrade failed (exit ${chroot_exit}). Configuration may not have been fully restored."
+        pause
+    fi
+}
+
+menu_config_backup_restore() {
+    while true; do
+        print_header
+        print_section "Backup / Restore Configuration"
+        echo ""
+        echo -e "    ${CYAN}${BOLD}1)${NC} Export (save configuration backup)"
+        echo -e "    ${CYAN}${BOLD}2)${NC} Restore (load configuration backup)"
+        echo ""
+        echo -e "    ${DIM}0) Back${NC}"
+        echo ""
+        _read sub_choice "  $(echo -e "${BOLD}Choice:${NC} ")" || return 1
+        case "$sub_choice" in
+            1) _config_export_flow  || { _BACK=0; continue; } ;;
+            2) _config_restore_flow || { _BACK=0; continue; } ;;
+            0) return ;;
+            *) print_warn "Enter 0-2." ; sleep 1 ;;
         esac
     done
 }
@@ -2961,6 +3295,8 @@ check_for_update() {
         echo ""
         print_info "This script is not yet installed persistently."
         print_info "Installing to /usr/local/bin/startos-admin lets you run 'startos-admin' from anywhere."
+        print_info "Tip: If you plan to restore a saved configuration right now, decline this —"
+        print_info "     the Restore option installs the script persistently as part of the same reboot."
         echo ""
         if confirm "Install persistently to /usr/local/bin/startos-admin now?"; then
             _warn_restart "after the script is installed."
@@ -3110,7 +3446,8 @@ main_menu() {
         echo -e "    ${CYAN}${BOLD}7)${NC} Schedule stay-alive curl"
         echo -e "    ${CYAN}${BOLD}8)${NC} Manage notification forwarders  ${DIM}(${_fwd_n})${NC}"
         echo -e "    ${CYAN}${BOLD}9)${NC} System Database"
-        echo -e "    ${CYAN}${BOLD}10)${NC} Debug mode  ${DIM}(${NC}${_dbg_label}${DIM})${NC}"
+        echo -e "    ${CYAN}${BOLD}10)${NC} Backup / Restore configuration"
+        echo -e "    ${CYAN}${BOLD}11)${NC} Debug mode  ${DIM}(${NC}${_dbg_label}${DIM})${NC}"
         echo ""
         echo -e "    ${DIM}0) Exit${NC}"
         echo ""
@@ -3126,8 +3463,9 @@ main_menu() {
             6) menu_schedule_backup        || { _BACK=0; continue; } ;;
             7) menu_schedule_stay_alive    || { _BACK=0; continue; } ;;
             8) menu_manage_notif_pollers   || { _BACK=0; continue; } ;;
-            9) menu_db_dump                || { _BACK=0; continue; } ;;
-            10) menu_toggle_debug          || { _BACK=0; continue; } ;;
+            9) menu_db_dump                   || { _BACK=0; continue; } ;;
+            10) menu_config_backup_restore    || { _BACK=0; continue; } ;;
+            11) menu_toggle_debug             || { _BACK=0; continue; } ;;
             0)
                 echo ""
                 print_info "Goodbye."
@@ -3135,7 +3473,7 @@ main_menu() {
                 exit 0
                 ;;
             *)
-                print_warn "Invalid choice. Enter 0-10."
+                print_warn "Invalid choice. Enter 0-11."
                 sleep 1
                 ;;
         esac

@@ -331,7 +331,45 @@ Use cases:
 ---
 
 <details>
-<summary><strong>9. Debug Mode</strong></summary>
+<summary><strong>9. Backup / Restore Configuration</strong></summary>
+
+Exports your installed cron jobs and notification forwarders as a single AES-256 encrypted backup file, and can restore them after an OS upgrade or reflash.
+
+**Export saves:**
+- All root cron entries
+- All notification forwarder scripts (including embedded webhook URLs and schedules)
+
+**Restore reinstalls** everything in a single reboot — including the `startos-admin` script itself at `/usr/local/bin/startos-admin`. This means after a reflash you need only one reboot to recover the full configuration.
+
+**Encryption:** The backup is encrypted with AES-256-CBC (OpenSSL, PBKDF2 key derivation). The passphrase you set at export time is required to restore. There is no passphrase recovery option — a forgotten passphrase makes the backup permanently unreadable.
+
+**Transfer workflow:**
+
+After export, the encrypted file is saved to `/tmp/startos-config-backup.enc` and the full contents are printed to the terminal. An `scp` command is shown to pull the file off the server from your local machine:
+
+```
+scp root@<server-ip>:/tmp/startos-config-backup.enc ./
+```
+
+Before restore, an `scp` command is shown to push the file back onto a freshly reflashed server:
+
+```
+scp ./startos-config-backup.enc root@<server-ip>:/tmp/
+```
+
+**Post-reflash restore workflow:**
+1. SSH into the fresh server
+2. Download `startos-admin.sh` (see Install section above)
+3. Run it — when prompted to install persistently, you may decline; the Restore step handles it
+4. Navigate to **10) Backup / Restore configuration → 2) Restore**
+5. Follow the prompts; server restarts once with everything restored
+
+</details>
+
+---
+
+<details>
+<summary><strong>10. Debug Mode</strong></summary>
 
 Toggles debug mode on or off.
 
