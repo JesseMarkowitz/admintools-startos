@@ -3046,17 +3046,16 @@ _config_export_flow() {
     printf '%s\n' "$passphrase" > "$pass_file"
     unset passphrase
 
-    local enc_exit=0 enc_err=""
-    enc_err=$(printf '%s' "$bundle" \
+    local enc_exit=0
+    printf '%s' "$bundle" \
         | openssl enc -aes-256-cbc -pbkdf2 -salt -a \
-            -passin "file:${pass_file}" > "$_CONFIG_BACKUP_FILE" 2>&1) \
+            -passin "file:${pass_file}" > "$_CONFIG_BACKUP_FILE" \
         || enc_exit=$?
     rm -f "$pass_file"
 
     if [[ $enc_exit -ne 0 ]]; then
         rm -f "$_CONFIG_BACKUP_FILE"
         print_error "Encryption failed (openssl exit ${enc_exit}). Backup not written."
-        [[ -n "$enc_err" ]] && echo -e "${RED}${enc_err}${NC}"
         pause; return
     fi
 
