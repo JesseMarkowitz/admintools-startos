@@ -23,6 +23,7 @@ This tool is intended for StartOS Administrators who:
 
 - SSH access to your StartOS server as the Start9 user
 - This was written for StartOS 040 (NOT 0351)
+- `jq`, `curl`, and `openssl` (all preinstalled on StartOS; the script checks at startup)
   
 </details>
 
@@ -116,35 +117,13 @@ After making a change that will be persistent startos-admin will confirm you wan
 
 ### Actions
 
-The script presents an interactive menu with the following options.
+The script presents an interactive menu with the following options, grouped into **Display**, **Create**, and **Manage**.
 
 
 ---
 
 <details>
-<summary><strong>1. Create a StartOS Notification</strong></summary>
-
-Creates a one-time notification using StartOS command line interface  `start-cli`.
-
-This notification appears in the StartOS UI under the standard notification panel.
-
-You may specify:
-- Service name (optional)
-- Priority level: `info`, `warning`, or `error`
-- Title
-- Message
-
-Use cases:
-- Manual status reporting
-- Custom system alerts
-- Testing notification forwarders
-
-</details>
-
----
-
-<details>
-<summary><strong>2. Display Disk Usage by Services</strong></summary>
+<summary><strong>1. Display Disk Used by Services</strong></summary>
 
 Displays disk usage using shell command  'du' 
 
@@ -166,139 +145,7 @@ Use cases:
 ---
 
 <details>
-<summary><strong>3. Display Memory Usage by Services</strong></summary>
-
-Displays memory usage using start-cli package stats
-
-Displays:
-
-- Per-service memory usage
-- Percentage of total memory consumed by each service
-
-Use cases:
-
-- Diagnosing performance issues
-- Identifying memory-heavy services
-- Capacity planning
-
-</details>
-
----
-
-<details>
-<summary><strong>4. Manage Cron Jobs</strong></summary>
-
-Displays entire crontab file including comments with all root level cron jobs configured on the system.  Gives option to delete one or more jobs as well as option to add a job.
-
-Options:
-
-- View / Delete existing cron entries
-- Add new entry (allows specification of schedule, command and post command notifications)
-
-Post command notifications can be StartOS notifications or any shell command (e.g., curl with parameters to NTFY or a webhook).
-
-There are tools online to assist with interpreting the cron scheduling - such as: [crontab.guru](https://crontab.guru/).  
-
-**Recommendation:** only keep jobs that are actively required.
-
-Use cases:
-
-- Schedule automated reminders
-- Schedule other recurring activities
-
-  NOTE: For scheduling backups and heartbeats specific actions are available, see below: 
-
-</details>
-
----
-
-<details>
-<summary><strong>5. Schedule Backups</strong></summary>
-
-Creates a cron entry that triggers StartOS backups on a defined schedule using StartOS command line interface  `start-cli` and cron.  This requires the backup target(s) be configured (and preferably tested) in advance.
-
-Configuration options:
-
-- Backup target
-- Services (individual selection or all)
-- Schedule (cron syntax)
-- Post-backup actions:
-  - Optional shell command — enter the full command, e.g.: `curl -d "Backup to CIFs-0 for Nextcloud and Vaultwarden started" https://ntfy.sh/StartOS-adjective-noun-Alerts`
-  - Optional StartOS standard UI notification
-
-Your StartOS primary password is saved to a root-only file (`/root/.startos-admin/backup-pass-<target>`, mode 600) that the cron job reads at backup time — it does not appear in the crontab.
-
-> **Note:** StartOS already generates a notification when a backup completes. Combining a kickoff notification with the completion notification can help estimate time it takes for backups to complete
-
-</details>
-
----
-
-<details>
-<summary><strong>6. Schedule Stay-Alive Curl</strong></summary>
-
-Creates a cron job that periodically uses curl to perform a HTTP request to a specified URL.
-
-
-Configuration options:
-
-- URL to send to
-- Schedule (cron syntax)
- 
-Use cases:
-
-- Monitoring services such as [healthchecks.io](https://healthchecks.io/)
-- Dead-man switch alerting systems
-
-If your server goes offline (hardware failure, ISP outage, power loss), it cannot self-report. An external service can detect missed check-ins and alert you.
-
-
-</details>
-
----
-
-<details>
-<summary><strong>7. Manage Notification Pollers </strong></summary>
-
-Creates persistent pollers that forward StartOS notifications to external systems. Each poller periodically runs `start-cli notification list`, filters by level and/or keyword, and performs an HTTP request to forward matching entries.
-
-Log files: `/usr/local/share/startos-admin/startos-notif-poller-<name>.log`
-State files: `/usr/local/share/startos-admin/startos-admin-poller-state-<name>`
-
-Multiple pollers may be installed simultaneously (e.g., one for all warnings, one for backup-related errors only).
-
-**Limitations**
-- **State is volatile**: State and log files are stored in StartOS's runtime layer and are lost on each reboot. On first run after each reboot, the forwarder silently re-seeds its state from the current notification list.
-- **Notifications during downtime are not forwarded**: If a notification occurs while the server is offline or rebooting, it will not be forwarded. Only notifications that arrive after the first post-boot cron run will be sent.
-
-
-Options:
-- Create / Update Poller
-- List Pollers
-- Remove Poller
-- View Poller Log
-
-Configuration options when creating / updating a new poller:
-
-- Name of Poller
-- Name of URL to send to
-- Notification Level Filter
-- Notification Keyword Filter
-- Schedule (cron syntax)
-
-**Message format**
-
-Forwarded messages are sent as plain text:
-
-<pre><code>2026.02.25 10:15:00  [Warning]  btcpayserver  |  Backup Complete — Your backup completed, but some package(s) failed</code></pre>
-
-
-</details>
-
----
-
-<details>
-<summary><strong>8. System Database</strong></summary>
+<summary><strong>2. Display System Data</strong></summary>
 
 Reads the full system database via `start-cli db dump` and presents it through several focused views.
 
@@ -336,46 +183,209 @@ Use cases:
 ---
 
 <details>
-<summary><strong>9. Backup / Restore Configuration</strong></summary>
+<summary><strong>3. Display Memory Used by Services</strong></summary>
 
-Exports your installed cron jobs and notification forwarders as a single AES-256 encrypted backup file, and can restore them after an OS upgrade or reflash.
+Displays memory usage using start-cli package stats
 
-**Export saves:**
-- All root cron entries
-- All notification forwarder scripts (including embedded webhook URLs and schedules)
-- All scheduled-backup password files (root-only secrets, carried inside the encrypted bundle)
+Displays:
 
-**Restore reinstalls** everything in a single reboot: cron jobs, notification forwarder scripts, backup password files, and the `startos-admin` script itself (downloaded fresh from GitHub and **signature-verified** before install — if verification fails, the rest of the restore proceeds but the script is not reinstalled).
+- Per-service memory usage
+- Percentage of total memory consumed by each service
 
-**Encryption:** The backup is encrypted with AES-256-CBC (OpenSSL, PBKDF2 key derivation) and protected by an HMAC-SHA256 integrity check that detects tampering or corruption before any restore begins. The passphrase you set at export time is required to restore. There is no passphrase recovery option — a forgotten passphrase makes the backup permanently unreadable. Backups exported by versions ≤ 56 (no integrity check) can still be restored; a warning is shown.
+Use cases:
 
-**Transfer workflow:**
-
-After export, the encrypted file is saved to `/tmp/startos-config-backup.enc` and the full contents are printed to the terminal. An `scp` command is shown to pull the file off the server from your local machine:
-
-```
-scp start9@<server-ip>:/tmp/startos-config-backup.enc ./
-```
-
-Before restore, an `scp` command is shown to push the file back onto a freshly reflashed server:
-
-```
-scp ./startos-config-backup.enc start9@<server-ip>:/tmp/
-```
-
-**Post-reflash restore workflow:**
-1. SSH into the fresh server
-2. Download `startos-admin.sh` (see Install section above)
-3. Run it — when prompted to install persistently, you may decline; the Restore step installs the latest version as part of the same reboot
-4. Navigate to **9) Backup / Restore configuration → 2) Restore**
-5. Follow the prompts; server restarts once with everything restored
+- Diagnosing performance issues
+- Identifying memory-heavy services
+- Capacity planning
 
 </details>
 
 ---
 
 <details>
-<summary><strong>10. Debug Mode</strong></summary>
+<summary><strong>4. Create a StartOS Notification</strong></summary>
+
+Creates a one-time notification using StartOS command line interface  `start-cli`.
+
+This notification appears in the StartOS UI under the standard notification panel.
+
+You may specify:
+- Service name (optional)
+- Priority level: `info`, `warning`, or `error`
+- Title
+- Message
+
+Use cases:
+- Manual status reporting
+- Custom system alerts
+- Testing notification forwarders
+
+</details>
+
+---
+
+<details>
+<summary><strong>5. Create a Backup Schedule</strong></summary>
+
+Creates a cron entry that triggers StartOS backups on a defined schedule using StartOS command line interface  `start-cli` and cron.  This requires the backup target(s) be configured (and preferably tested) in advance.
+
+Configuration options:
+
+- Backup target
+- Services (individual selection or all)
+- Schedule (cron syntax)
+- Post-backup actions:
+  - Optional shell command — enter the full command, e.g.: `curl -d "Backup to CIFs-0 for Nextcloud and Vaultwarden started" https://ntfy.sh/StartOS-adjective-noun-Alerts`
+  - Optional StartOS standard UI notification
+
+Your StartOS primary password is saved to a root-only file (`/root/.startos-admin/backup-pass-<target>`, mode 600) that the cron job reads at backup time — it does not appear in the crontab.
+
+> **Note:** StartOS already generates a notification when a backup completes. Combining a kickoff notification with the completion notification can help estimate time it takes for backups to complete
+
+</details>
+
+---
+
+<details>
+<summary><strong>6. Create a Stay-Alive Curl</strong></summary>
+
+Creates a cron job that periodically uses curl to perform a HTTP request to a specified URL.
+
+
+Configuration options:
+
+- URL to send to
+- Schedule (cron syntax)
+ 
+Use cases:
+
+- Monitoring services such as [healthchecks.io](https://healthchecks.io/)
+- Dead-man switch alerting systems
+
+If your server goes offline (hardware failure, ISP outage, power loss), it cannot self-report. An external service can detect missed check-ins and alert you.
+
+
+</details>
+
+---
+
+<details>
+<summary><strong>7. Manage Cron Jobs</strong></summary>
+
+Displays entire crontab file including comments with all root level cron jobs configured on the system.  Gives option to delete one or more jobs as well as option to add a job.
+
+Options:
+
+- View / Delete existing cron entries
+- Add new entry (allows specification of schedule, command and post command notifications)
+
+Post command notifications can be StartOS notifications or any shell command (e.g., curl with parameters to NTFY or a webhook).
+
+There are tools online to assist with interpreting the cron scheduling - such as: [crontab.guru](https://crontab.guru/).  
+
+**Recommendation:** only keep jobs that are actively required.
+
+Use cases:
+
+- Schedule automated reminders
+- Schedule other recurring activities
+
+  NOTE: For scheduling backups and heartbeats specific actions are available, see above.
+
+</details>
+
+---
+
+<details>
+<summary><strong>8. Manage Notification Forwarders</strong></summary>
+
+Creates persistent forwarders that forward StartOS notifications to external systems. Each forwarder periodically runs `start-cli notification list`, filters by level and/or keyword, and performs an HTTP request to forward matching entries.
+
+Log files: `/usr/local/share/startos-admin/startos-notif-poller-<name>.log`
+State files: `/usr/local/share/startos-admin/startos-admin-poller-state-<name>`
+
+Multiple forwarders may be installed simultaneously (e.g., one for all warnings, one for backup-related errors only).
+
+**Limitations**
+- **State is volatile**: State and log files are stored in StartOS's runtime layer and are lost on each reboot. On first run after each reboot, the forwarder silently re-seeds its state from the current notification list.
+- **Notifications during downtime are not forwarded**: If a notification occurs while the server is offline or rebooting, it will not be forwarded. Only notifications that arrive after the first post-boot cron run will be sent.
+
+
+Options:
+- Create / Update Forwarder
+- List Forwarders
+- Remove Forwarder
+- View Forwarder Log
+
+Configuration options when creating / updating a forwarder:
+
+- Name of Forwarder
+- URL to send to
+- Notification Level Filter
+- Notification Keyword Filter
+- Schedule (cron syntax)
+
+**Message format**
+
+Forwarded messages are sent as plain text:
+
+<pre><code>2026.02.25 10:15:00  [Warning]  btcpayserver  |  Backup Complete — Your backup completed, but some package(s) failed</code></pre>
+
+
+</details>
+
+---
+
+<details>
+<summary><strong>9. Save / Load Configuration</strong></summary>
+
+Saves your installed cron jobs and notification forwarders as a single AES-256 encrypted configuration file, and can load them back after an OS upgrade or reflash.
+
+**Save stores:**
+- All root cron entries
+- All notification forwarder scripts (including embedded webhook URLs and schedules)
+- All scheduled-backup password files (root-only secrets, carried inside the encrypted file)
+
+**Load reinstalls** everything in a single reboot: cron jobs, notification forwarder scripts, backup password files, and the `startos-admin` script itself (downloaded fresh from GitHub and **signature-verified** before install — if verification fails, the rest of the load proceeds but the script is not reinstalled).
+
+**Encryption:** The configuration file is encrypted with AES-256-CBC (OpenSSL, PBKDF2 key derivation) and protected by an HMAC-SHA256 integrity check that detects tampering or corruption before any load begins. The passphrase you set when saving is required to load. There is no passphrase recovery option — a forgotten passphrase makes the file permanently unreadable. Files saved by versions ≤ 56 (no integrity check) can still be loaded; a warning is shown.
+
+**Transfer workflow:**
+
+After saving, the encrypted file is written to `/tmp/startos-config-backup.enc` and the full contents are printed to the terminal. An `scp` command is shown to pull the file off the server from your local machine:
+
+```
+scp start9@<server-ip>:/tmp/startos-config-backup.enc ./
+```
+
+Before loading, an `scp` command is shown to push the file back onto a freshly reflashed server:
+
+```
+scp ./startos-config-backup.enc start9@<server-ip>:/tmp/
+```
+
+**Post-reflash load workflow:**
+1. SSH into the fresh server
+2. Download `startos-admin.sh` (see Install section above)
+3. Run it — when prompted to install persistently, you may decline; the Load step installs the latest version as part of the same reboot
+4. Navigate to **9) Save / Load configuration → 2) Load configuration**
+5. Follow the prompts; server restarts once with everything loaded
+
+</details>
+
+---
+
+<details>
+<summary><strong>10. Documentation</strong></summary>
+
+Built-in documentation for every menu action, in the same order as the main menu, plus a troubleshooting guide.
+
+</details>
+
+---
+
+<details>
+<summary><strong>11. Debug Mode</strong></summary>
 
 Toggles debug mode on or off.
 

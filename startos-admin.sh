@@ -1,18 +1,15 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2154  # menu-choice variables are assigned via _read's nameref
 # startos-admin.sh — Interactive admin menu for StartOS servers
 # Usage: chmod +x startos-admin.sh && ./startos-admin.sh
 #
-# Features:
-#   1. Create StartOS notification      — fire a one-time notification via start-cli
-#   2. Disk usage                       — per-service disk breakdown
-#   3. Memory usage                     — per-service memory breakdown
-#   4. Manage cron jobs                 — view, delete, and add persistent cron entries
-#   5. Schedule backups                 — cron-based automated backup with notification
-#   6. Schedule stay-alive curl         — periodic curl to keep an external monitor alive
-#   7. Manage notification forwarders   — poll start-cli notifications, forward via webhook
-#   8. System database viewer           — browse start-cli db dump by category
+# Menu:
+#   Display:  1. Disk used by services    2. System data    3. Memory used by services
+#   Create:   4. StartOS notification     5. Backup schedule    6. Stay-alive curl
+#   Manage:   7. Cron jobs                8. Notification forwarders
+#   Other:    9. Save / Load configuration   10. Documentation   11. Debug mode
 
-VERSION="57"   # integer — increment on each release
+VERSION="58"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -135,7 +132,7 @@ print_section() {
 pause() {
     echo ""
     local _p_reply
-    read -rp "$(echo -e "${DIM}  Press Enter to continue (or type 'exit' to quit)...${NC}")" _p_reply
+    read -rp "$(echo -e "${DIM}  Press Enter to return (or type 'exit' to quit)...${NC}")" _p_reply
     if [[ "${_p_reply,,}" == "exit" ]]; then exit 0; fi
 }
 
@@ -169,44 +166,19 @@ _warn_restart() {
     echo ""
 }
 
-# Run a command, show colored output, return its exit code
-run_cmd() {
-    local output exit_code=0
-    output=$("$@" 2>&1) || exit_code=$?
-    if [[ $exit_code -eq 0 ]]; then
-        echo "$output"
-    else
-        print_error "Command failed (exit $exit_code)"
-        echo -e "${RED}${output}${NC}"
-    fi
-    return $exit_code
-}
-
 # Extract package IDs from start-cli package list JSON output.
-# Uses jq if available, falls back to grep+sed.
 parse_package_ids() {
-    local json="$1"
-    if command -v jq &>/dev/null; then
-        echo "$json" | jq -r '.[].id'
-    else
-        echo "$json" | grep '"id":' | sed 's/.*"id": *"\([^"]*\)".*/\1/'
-    fi
+    echo "$1" | jq -r '.[].id'
 }
 
 # Extract backup targets from start-cli backup target list JSON output.
 # Outputs one line per target: "id  (hostname/path)"
 # The ID is always the first whitespace-delimited field on each line.
 parse_backup_targets() {
-    local json="$1"
-    if command -v jq &>/dev/null; then
-        echo "$json" | jq -r '
-            to_entries[] |
-            "\(.key)  (\(.value.hostname // .value.type // "unknown")\(.value.path // ""))"
-        '
-    else
-        # Top-level keys sit at exactly 2-space indent: '  "cifs-0": {'
-        echo "$json" | grep -E '^  "[^"]+": \{' | sed 's/  "\([^"]*\)": {.*/\1/'
-    fi
+    echo "$1" | jq -r '
+        to_entries[] |
+        "\(.key)  (\(.value.hostname // .value.type // "unknown")\(.value.path // ""))"
+    '
 }
 
 # Quote a string for safe single-quoted embedding in a shell command line.
@@ -524,7 +496,7 @@ menu_disk_usage() {
 
         if [[ "$unit" == "G" ]] || [[ "$unit" == "T" ]]; then
             echo -e "  ${RED}${BOLD}${line}${NC}"
-        elif [[ "$unit" == "M" ]] && (( $(echo "$num >= 100" | bc -l 2>/dev/null || echo 0) )); then
+        elif [[ "$unit" == "M" && "${num%%.*}" =~ ^[0-9]+$ ]] && (( ${num%%.*} >= 100 )); then
             echo -e "  ${YELLOW}${line}${NC}"
         else
             echo -e "  ${line}"
@@ -827,7 +799,7 @@ EOF
                     debug_log "chroot-and-upgrade NOT found or not executable at: $_c_path"
                 fi
             else
-                print_info "Enable debug mode (main menu → 10) and retry for more detail."
+                print_info "Enable debug mode (main menu → 11) and retry for more detail."
             fi
             pause
         fi
@@ -1421,6 +1393,37 @@ _pick_notif_startos() {
     done
 }
 
+# Prompt for a post-action shell command (with example, % check, and an
+# optional test run). Sets the nameref to the entered command.
+# Returns 1 on 'back'/'exit' so callers can propagate with || return 1.
+_ppa_read_shell_cmd() {
+    local -n _prc_cmd="$1"
+    echo -e "  ${DIM}Enter the full command to run. Example:${NC}"
+    echo -e "  ${DIM}curl -d \"Backup started\" https://ntfy.sh/Your-Topic${NC}"
+    echo -e "  ${DIM}Hint: no need for >/dev/null; avoid bare & (use && to chain commands).${NC}"
+    while true; do
+        _read _prc_cmd "  Shell command: " || return 1
+        [[ -z "$_prc_cmd" ]] && { print_warn "Command cannot be empty."; continue; }
+        _check_cron_percent "$_prc_cmd" && break
+    done
+    echo ""
+    local _prc_test
+    _read _prc_test "  Test this command now? [y/N]: " || return 1
+    if [[ "${_prc_test,,}" == "y" ]]; then
+        echo ""
+        print_info "Running: $_prc_cmd"
+        local _prc_exit=0
+        bash -c "$_prc_cmd" || _prc_exit=$?
+        echo ""
+        if [[ $_prc_exit -eq 0 ]]; then
+            print_success "Command exited 0 (success)."
+        else
+            print_warn "Command exited $_prc_exit. Check the output above before continuing."
+        fi
+    fi
+    return 0
+}
+
 # Post-action picker: curl / StartOS notification / both / none.
 # $1 = section header text (displayed as bold label)
 # $2 = nameref variable to receive the built notif_cmd string (empty = none)
@@ -1452,51 +1455,13 @@ _pick_post_action() {
         case "$_ppa_choice" in
             5) [[ -n "$_ppa_def_cmd" ]] && { _ppa_notif_cmd="$_ppa_def_cmd"; return 0; } ;;&
             1)
-                echo -e "  ${DIM}Enter the full command to run. Example:${NC}"
-                echo -e "  ${DIM}curl -d \"Backup started\" https://ntfy.sh/Your-Topic${NC}"
-                echo -e "  ${DIM}Hint: no need for >/dev/null; avoid bare & (use && to chain commands).${NC}"
-                _read _ppa_cmd "  Shell command: " || return 1
-                [[ -z "$_ppa_cmd" ]] && { print_warn "Command cannot be empty."; continue; }
-                _check_cron_percent "$_ppa_cmd" || continue
-                echo ""
-                _read _ppa_test "  Test this command now? [y/N]: " || return 1
-                if [[ "${_ppa_test,,}" == "y" ]]; then
-                    echo ""
-                    print_info "Running: $_ppa_cmd"
-                    local _ppa_test_exit=0
-                    bash -c "$_ppa_cmd" || _ppa_test_exit=$?
-                    echo ""
-                    if [[ $_ppa_test_exit -eq 0 ]]; then
-                        print_success "Command exited 0 (success)."
-                    else
-                        print_warn "Command exited $_ppa_test_exit. Check the output above before continuing."
-                    fi
-                fi
+                _ppa_read_shell_cmd _ppa_cmd || return 1
                 _ppa_mode="1"; break ;;
             2)
                 _pick_notif_startos _ppa_svc _ppa_level _ppa_title _ppa_body || return 1
                 _ppa_mode="2"; break ;;
             3)
-                echo -e "  ${DIM}Enter the full command to run. Example:${NC}"
-                echo -e "  ${DIM}curl -d \"Backup started\" https://ntfy.sh/Your-Topic${NC}"
-                echo -e "  ${DIM}Hint: no need for >/dev/null; avoid bare & (use && to chain commands).${NC}"
-                _read _ppa_cmd "  Shell command: " || return 1
-                [[ -z "$_ppa_cmd" ]] && { print_warn "Command cannot be empty."; continue; }
-                _check_cron_percent "$_ppa_cmd" || continue
-                echo ""
-                _read _ppa_test "  Test this command now? [y/N]: " || return 1
-                if [[ "${_ppa_test,,}" == "y" ]]; then
-                    echo ""
-                    print_info "Running: $_ppa_cmd"
-                    local _ppa_test_exit=0
-                    bash -c "$_ppa_cmd" || _ppa_test_exit=$?
-                    echo ""
-                    if [[ $_ppa_test_exit -eq 0 ]]; then
-                        print_success "Command exited 0 (success)."
-                    else
-                        print_warn "Command exited $_ppa_test_exit. Check the output above before continuing."
-                    fi
-                fi
+                _ppa_read_shell_cmd _ppa_cmd || return 1
                 _pick_notif_startos _ppa_svc _ppa_level _ppa_title _ppa_body || return 1
                 _ppa_mode="3"; break ;;
             4) _ppa_mode="4"; break ;;
@@ -1849,7 +1814,7 @@ _poller_install_flow() {
     echo ""
 
     local _tw_yn
-    _read _tw_yn "  Test this webhook now? [y/N]: "
+    _read _tw_yn "  Test this webhook now? [y/N]: " || return 1
     [[ "${_tw_yn,,}" == "y" ]] && _test_webhook "$poller_name" "$webhook_url"
 
     if ! confirm "Install this forwarder?"; then
@@ -1994,7 +1959,7 @@ _poller_edit_flow() {
     echo ""
 
     local _tw_yn
-    _read _tw_yn "  Test this webhook now? [y/N]: "
+    _read _tw_yn "  Test this webhook now? [y/N]: " || return 1
     [[ "${_tw_yn,,}" == "y" ]] && _test_webhook "$poller_name" "$webhook_url"
 
     if ! confirm "Apply changes? (server will restart automatically)"; then
@@ -2018,7 +1983,7 @@ install_notif_poller() {
     config_block="#!/bin/bash
 # StartOS Notification Forwarder — generated by startos-admin.sh
 # Poller: ${name}
-# Re-run startos-admin.sh option 7 to update this configuration.
+# Re-run startos-admin (main menu → 8, Notification forwarders) to update this configuration.
 POLLER_NAME=\"${name}\"
 WEBHOOK_URL=\"${url}\"
 LEVELS=\"${levels}\"
@@ -2838,7 +2803,7 @@ _db_interfaces() {
 
 menu_db_dump() {
     print_header
-    print_section "System Database"
+    print_section "System Data"
     echo ""
     print_info "Fetching database dump..."
     debug_log "Running: start-cli db dump"
@@ -2855,7 +2820,7 @@ menu_db_dump() {
 
     while true; do
         print_header
-        print_section "System Database"
+        print_section "System Data"
         echo ""
         echo -e "    ${CYAN}${BOLD}1)${NC} Server Info"
         echo -e "    ${CYAN}${BOLD}2)${NC} Network"
@@ -2887,22 +2852,22 @@ menu_documentation() {
         print_header
         print_section "Documentation"
         echo ""
-        echo -e "    ${CYAN}${BOLD}1)${NC} Create a StartOS notification"
-        echo -e "    ${CYAN}${BOLD}2)${NC} Display disk used by services"
-        echo -e "    ${CYAN}${BOLD}3)${NC} Display memory used by services"
-        echo -e "    ${CYAN}${BOLD}4)${NC} Manage cron jobs"
-        echo -e "    ${CYAN}${BOLD}5)${NC} Schedule backups"
-        echo -e "    ${CYAN}${BOLD}6)${NC} Schedule stay-alive curl"
-        echo -e "    ${CYAN}${BOLD}7)${NC} Manage notification forwarders"
-        echo -e "    ${CYAN}${BOLD}8)${NC} System Database"
-        echo -e "    ${CYAN}${BOLD}9)${NC} Troubleshooting"
-        echo -e "    ${CYAN}${BOLD}10)${NC} Backup / Restore configuration"
+        echo -e "    ${CYAN}${BOLD}1)${NC} Disk used by services"
+        echo -e "    ${CYAN}${BOLD}2)${NC} System data"
+        echo -e "    ${CYAN}${BOLD}3)${NC} Memory used by services"
+        echo -e "    ${CYAN}${BOLD}4)${NC} StartOS notification"
+        echo -e "    ${CYAN}${BOLD}5)${NC} Backup schedule"
+        echo -e "    ${CYAN}${BOLD}6)${NC} Stay-alive curl"
+        echo -e "    ${CYAN}${BOLD}7)${NC} Cron jobs"
+        echo -e "    ${CYAN}${BOLD}8)${NC} Notification forwarders"
+        echo -e "    ${CYAN}${BOLD}9)${NC} Save / Load configuration"
+        echo -e "    ${CYAN}${BOLD}10)${NC} Troubleshooting"
         echo ""
         echo -e "    ${DIM}0) Back${NC}"
         echo ""
         _read doc_choice "  $(echo -e "${BOLD}Choice:${NC} ")" || return 1
         case "$doc_choice" in
-            1)
+            4)
                 print_header
                 print_section "Create a StartOS Notification"
                 echo ""
@@ -2918,7 +2883,7 @@ menu_documentation() {
                 echo -e "    ${CYAN}•${NC} Message body"
                 echo ""
                 pause ;;
-            2)
+            1)
                 print_header
                 print_section "Display Disk Used by Services"
                 echo ""
@@ -2935,7 +2900,7 @@ menu_documentation() {
                 echo -e "  memory used by each of your services."
                 echo ""
                 pause ;;
-            4)
+            7)
                 print_header
                 print_section "Manage Cron Jobs"
                 echo ""
@@ -3003,7 +2968,7 @@ menu_documentation() {
                 echo -e "  detect the silence and send that alert."
                 echo ""
                 pause ;;
-            7)
+            8)
                 print_header
                 print_section "Manage Notification Forwarders"
                 echo ""
@@ -3050,9 +3015,9 @@ menu_documentation() {
                 echo -e "    ${DIM}Log:     ${_POLLER_LOG_PREFIX}<name>.log${NC}"
                 echo ""
                 pause ;;
-            8)
+            2)
                 print_header
-                print_section "System Database"
+                print_section "System Data"
                 echo ""
                 echo -e "  This fetches a full dump of the StartOS system database and lets you"
                 echo -e "  browse it by category."
@@ -3065,7 +3030,7 @@ menu_documentation() {
                 echo -e "    ${CYAN}•${NC} ${BOLD}Service Detail${NC} — full detail for a single service"
                 echo ""
                 pause ;;
-            9)
+            10)
                 print_header
                 print_section "Troubleshooting"
                 echo ""
@@ -3099,31 +3064,31 @@ menu_documentation() {
                 echo -e "  via this tool, it will be lost on next reboot."
                 echo ""
                 pause ;;
-            10)
+            9)
                 print_header
-                print_section "Backup / Restore Configuration"
+                print_section "Save / Load Configuration"
                 echo ""
-                echo -e "  Exports your installed cron jobs and notification forwarders as a"
-                echo -e "  single AES-256 encrypted backup file, and can restore them after"
-                echo -e "  an OS upgrade or reflash."
+                echo -e "  Saves your installed cron jobs and notification forwarders as a"
+                echo -e "  single AES-256 encrypted configuration file, and can load them back"
+                echo -e "  after an OS upgrade or reflash."
                 echo ""
-                echo -e "  ${BOLD}Export${NC} saves:"
+                echo -e "  ${BOLD}Save${NC} stores:"
                 echo ""
                 echo -e "    ${CYAN}•${NC} All root cron entries"
                 echo -e "    ${CYAN}•${NC} All notification forwarder scripts  ${DIM}(including embedded webhook URLs)${NC}"
+                echo -e "    ${CYAN}•${NC} All scheduled-backup password files  ${DIM}(root-only secrets)${NC}"
                 echo ""
-                echo -e "  ${BOLD}Restore${NC} reinstalls everything in a single reboot — including the"
+                echo -e "  ${BOLD}Load${NC} reinstalls everything in a single reboot — including the"
                 echo -e "  ${CYAN}startos-admin${NC} script itself at ${DIM}/usr/local/bin/startos-admin${NC}."
                 echo ""
-                echo -e "  The backup file is encrypted with AES-256-CBC using a passphrase you"
-                echo -e "  provide, plus an HMAC-SHA256 integrity check that detects tampering"
-                echo -e "  or corruption before restore. Backup passwords for scheduled backups"
-                echo -e "  are included. ${YELLOW}The passphrase cannot be recovered.${NC} A forgotten"
-                echo -e "  passphrase makes the backup permanently unreadable."
+                echo -e "  The configuration file is encrypted with AES-256-CBC using a passphrase"
+                echo -e "  you provide, plus an HMAC-SHA256 integrity check that detects tampering"
+                echo -e "  or corruption before loading. ${YELLOW}The passphrase cannot be recovered.${NC}"
+                echo -e "  A forgotten passphrase makes the file permanently unreadable."
                 echo ""
                 echo -e "  The encrypted file is saved to ${DIM}${_CONFIG_BACKUP_FILE}${NC}."
-                echo -e "  An ${CYAN}scp${NC} command is shown after export to transfer it off the server."
-                echo -e "  The same command (reversed) is shown at the start of the restore flow."
+                echo -e "  An ${CYAN}scp${NC} command is shown after saving to transfer it off the server."
+                echo -e "  The same command (reversed) is shown at the start of the load flow."
                 echo ""
                 pause ;;
             0) return ;;
@@ -3133,18 +3098,18 @@ menu_documentation() {
 }
 
 # ─────────────────────────────────────────────
-# Configuration Backup / Restore
+# Save / Load Configuration
 # ─────────────────────────────────────────────
 
 _config_export_flow() {
     print_header
-    print_section "Export Configuration Backup"
+    print_section "Save Configuration"
     echo ""
     _nav_tip
 
     # ── Preflight ─────────────────────────────────────────────────────────────
     if ! command -v openssl &>/dev/null; then
-        print_error "openssl not found. Cannot create encrypted backup."
+        print_error "openssl not found. Cannot create encrypted configuration file."
         pause; return
     fi
 
@@ -3155,7 +3120,7 @@ _config_export_flow() {
     [[ -e "${poller_scripts[0]}" ]] && has_pollers=1
 
     if [[ -z "$crontab_out" && $has_pollers -eq 0 ]]; then
-        print_warn "Nothing to back up: no cron jobs and no forwarders are installed."
+        print_warn "Nothing to save: no cron jobs and no forwarders are installed."
         pause; return
     fi
 
@@ -3165,7 +3130,7 @@ _config_export_flow() {
     echo -e "  ${RED}${BOLD}│  WARNING: ENCRYPTION PASSPHRASE CANNOT          │${NC}"
     echo -e "  ${RED}${BOLD}│  BE RECOVERED.                                  │${NC}"
     echo -e "  ${RED}${BOLD}│                                                 │${NC}"
-    echo -e "  ${RED}${BOLD}│  If you forget the passphrase, this backup      │${NC}"
+    echo -e "  ${RED}${BOLD}│  If you forget the passphrase, this saved       │${NC}"
     echo -e "  ${RED}${BOLD}│  file will be permanently unreadable.           │${NC}"
     echo -e "  ${RED}${BOLD}│  There is no reset or recovery option.          │${NC}"
     echo -e "  ${RED}${BOLD}└─────────────────────────────────────────────────┘${NC}"
@@ -3254,18 +3219,18 @@ _config_export_flow() {
     [[ -n "$crontab_out" ]] && \
         cron_count=$(echo "$crontab_out" | grep -c '^# startos-admin v' 2>/dev/null || true)
 
-    ${_START_CLI} notification create info "StartOS Admin" "StartOS Admin Configuration Backed Up" 2>/dev/null || true
+    ${_START_CLI} notification create info "StartOS Admin" "StartOS Admin Configuration Saved" 2>/dev/null || true
 
     echo ""
-    print_success "Backup written to: ${_CONFIG_BACKUP_FILE}"
+    print_success "Configuration saved to: ${_CONFIG_BACKUP_FILE}"
     echo ""
-    print_section "Backup Summary"
+    print_section "Save Summary"
     echo ""
     echo -e "  ${BOLD}Cron entries:${NC} ${cron_count} startos-admin managed entries"
     echo -e "  ${BOLD}Forwarders:${NC}   ${pcount}"
     echo -e "  ${BOLD}Backup passwords:${NC} ${scount} (root-only secret files)"
     echo ""
-    print_section "Encrypted backup file contents"
+    print_section "Encrypted configuration file contents"
     echo ""
     cat "$_CONFIG_BACKUP_FILE"
     echo ""
@@ -3284,14 +3249,14 @@ _config_export_flow() {
 
 _config_restore_flow() {
     print_header
-    print_section "Restore Configuration Backup"
+    print_section "Load Configuration"
     echo ""
     _nav_tip
 
     # ── scp instructions ──────────────────────────────────────────────────────
     local server_ip
     server_ip=$(hostname -I | awk '{print $1}')
-    print_section "Copy the backup file to this server first"
+    print_section "Copy the saved configuration file to this server first"
     echo ""
     echo -e "  Run this command from your ${BOLD}local machine${NC} before continuing:"
     echo ""
@@ -3305,7 +3270,7 @@ _config_restore_flow() {
     # ── File path ─────────────────────────────────────────────────────────────
     echo ""
     local backup_path
-    _read backup_path "  Path to backup file [${_CONFIG_BACKUP_FILE}]: " || return 1
+    _read backup_path "  Path to configuration file [${_CONFIG_BACKUP_FILE}]: " || return 1
     [[ -z "$backup_path" ]] && backup_path="$_CONFIG_BACKUP_FILE"
 
     if [[ ! -f "$backup_path" ]]; then
@@ -3315,7 +3280,7 @@ _config_restore_flow() {
 
     # ── Preflight ─────────────────────────────────────────────────────────────
     if ! command -v openssl &>/dev/null; then
-        print_error "openssl not found. Cannot decrypt backup."
+        print_error "openssl not found. Cannot decrypt configuration file."
         pause; return
     fi
 
@@ -3337,12 +3302,12 @@ _config_restore_flow() {
         if [[ -z "$stored_hmac" || "$computed_hmac" != "$stored_hmac" ]]; then
             unset passphrase
             print_error "Integrity check FAILED — wrong passphrase, or the file was corrupted or tampered with."
-            print_warn "Restore aborted. Nothing was changed."
+            print_warn "Load aborted. Nothing was changed."
             pause; return
         fi
         print_success "Integrity check passed."
     else
-        print_warn "Legacy (v1) backup format — no integrity protection. Proceeding."
+        print_warn "Legacy (v1) file format — no integrity protection. Proceeding."
     fi
 
     local pass_file
@@ -3370,7 +3335,7 @@ _config_restore_flow() {
     local header
     header=$(printf '%s' "$bundle" | head -1)
     if [[ "$header" != "STARTOS_ADMIN_BACKUP_V1" ]]; then
-        print_error "Unrecognized backup format. Cannot restore."
+        print_error "Unrecognized file format. Cannot load."
         pause; return
     fi
 
@@ -3405,35 +3370,35 @@ _config_restore_flow() {
     # the same charsets enforced at creation time (blocks path traversal in a
     # hand-crafted or corrupted bundle).
     if [[ -n "$crontab_b64" ]] && ! printf '%s' "$crontab_b64" | base64 -d >/dev/null 2>&1; then
-        print_error "Backup crontab is not valid base64. Restore aborted."
+        print_error "Saved crontab is not valid base64. Load aborted."
         pause; return
     fi
     for pi in "${!pnames[@]}"; do
         if ! [[ "${pnames[$pi]}" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]*$ ]]; then
-            print_error "Backup contains an invalid forwarder name: '${pnames[$pi]}'. Restore aborted."
+            print_error "Saved file contains an invalid forwarder name: '${pnames[$pi]}'. Load aborted."
             pause; return
         fi
         if ! printf '%s' "${pscripts[$pi]}" | base64 -d >/dev/null 2>&1; then
-            print_error "Forwarder script '${pnames[$pi]}' is not valid base64. Restore aborted."
+            print_error "Forwarder script '${pnames[$pi]}' is not valid base64. Load aborted."
             pause; return
         fi
     done
     for si in "${!snames[@]}"; do
         if ! [[ "${snames[$si]}" =~ ^backup-pass-[A-Za-z0-9._-]+$ ]]; then
-            print_error "Backup contains an invalid secret file name: '${snames[$si]}'. Restore aborted."
+            print_error "Saved file contains an invalid secret file name: '${snames[$si]}'. Load aborted."
             pause; return
         fi
         if ! printf '%s' "${svals[$si]}" | base64 -d >/dev/null 2>&1; then
-            print_error "Secret '${snames[$si]}' is not valid base64. Restore aborted."
+            print_error "Secret '${snames[$si]}' is not valid base64. Load aborted."
             pause; return
         fi
     done
 
     # ── Show restore summary ──────────────────────────────────────────────────
     print_header
-    print_section "Restore Summary"
+    print_section "Load Summary"
     echo ""
-    echo -e "  ${BOLD}Backup date:${NC}  ${backup_date}"
+    echo -e "  ${BOLD}Saved on:${NC}     ${backup_date}"
     echo ""
 
     local cron_count=0
@@ -3446,29 +3411,29 @@ _config_restore_flow() {
     for pi in "${!pnames[@]}"; do
         echo -e "    ${DIM}• ${pnames[$pi]}${NC}"
     done
-    echo -e "  ${BOLD}Backup passwords:${NC} ${scount} (restored root-only to ${_SECRET_DIR})"
+    echo -e "  ${BOLD}Backup passwords:${NC} ${scount} (loaded root-only to ${_SECRET_DIR})"
     echo ""
-    print_warn "Your current crontab will be REPLACED with the backed-up version."
+    print_warn "Your current crontab will be REPLACED with the saved version."
     [[ $pcount -gt 0 ]] && \
         print_warn "Forwarder scripts with matching names will be overwritten."
     print_info "The latest startos-admin script will also be downloaded, signature-verified, and installed persistently."
     echo ""
 
     # ── Confirmations ─────────────────────────────────────────────────────────
-    if ! confirm "Restore this configuration?"; then
+    if ! confirm "Load this configuration?"; then
         [[ $_BACK -eq 1 ]] && return 1
         print_info "Cancelled."
         pause; return
     fi
 
-    _warn_restart "after the configuration is restored."
+    _warn_restart "after the configuration is loaded."
     if ! confirm "Proceed? (server will restart automatically)"; then
         [[ $_BACK -eq 1 ]] && return 1
         print_info "Cancelled."
         return
     fi
 
-    ${_START_CLI} notification create info "StartOS Admin" "StartOS Admin Configuration Restored" 2>/dev/null || true
+    ${_START_CLI} notification create info "StartOS Admin" "StartOS Admin Configuration Loaded" 2>/dev/null || true
 
     # ── Download + verify the latest script BEFORE entering the chroot ───────
     # If the download fails or the signature does not verify, the restore
@@ -3480,10 +3445,10 @@ _config_restore_flow() {
         rm -rf "$(dirname "$verified_path")"
     elif [[ $fetch_rc -eq 2 ]]; then
         print_error "Downloaded script FAILED signature verification — startos-admin will NOT be reinstalled."
-        print_warn "This may indicate a compromised repository. The rest of the restore will proceed."
+        print_warn "This may indicate a compromised repository. The rest of the load will proceed."
     else
         print_warn "Could not download the latest script — startos-admin will NOT be reinstalled."
-        print_warn "Re-run the install command from the README after the restore completes."
+        print_warn "Re-run the install command from the README after the load completes."
     fi
 
     # ── Build and run chroot session ──────────────────────────────────────────
@@ -3521,9 +3486,9 @@ chmod 600 ${_SECRET_DIR}/${sn}
         done
     fi
 
-    print_success "Restore staged. Entering persistence mode now."
+    print_success "Load staged. Entering persistence mode now."
     echo ""
-    debug_log "Restoring: crontab=${cron_count} entries, pollers=${pcount}"
+    debug_log "Loading: crontab=${cron_count} entries, pollers=${pcount}"
 
     local chroot_exit=0
     sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || chroot_exit=$?
@@ -3531,11 +3496,11 @@ ${chroot_body}exit
 EOF
 
     if [[ $chroot_exit -eq 0 ]]; then
-        print_success "Configuration restored."
+        print_success "Configuration loaded."
         print_warn "The server will restart shortly — your SSH session will disconnect."
         print_warn "After reconnecting, run: startos-admin"
     else
-        print_error "chroot-and-upgrade failed (exit ${chroot_exit}). Configuration may not have been fully restored."
+        print_error "chroot-and-upgrade failed (exit ${chroot_exit}). Configuration may not have been fully loaded."
         pause
     fi
 }
@@ -3543,10 +3508,10 @@ EOF
 menu_config_backup_restore() {
     while true; do
         print_header
-        print_section "Backup / Restore Configuration"
+        print_section "Save / Load Configuration"
         echo ""
-        echo -e "    ${CYAN}${BOLD}1)${NC} Export (save configuration backup)"
-        echo -e "    ${CYAN}${BOLD}2)${NC} Restore (load configuration backup)"
+        echo -e "    ${CYAN}${BOLD}1)${NC} Save configuration  ${DIM}(encrypted file)${NC}"
+        echo -e "    ${CYAN}${BOLD}2)${NC} Load configuration  ${DIM}(from a saved file)${NC}"
         echo ""
         echo -e "    ${DIM}0) Back${NC}"
         echo ""
@@ -3584,8 +3549,8 @@ check_for_update() {
         echo ""
         print_info "This script is not yet installed persistently."
         print_info "Installing to /usr/local/bin/startos-admin lets you run 'startos-admin' from anywhere."
-        print_info "Tip: If you plan to restore a saved configuration right now, decline this —"
-        print_info "     the Restore option installs the script persistently as part of the same reboot."
+        print_info "Tip: If you plan to load a saved configuration right now, decline this —"
+        print_info "     the Load option installs the script persistently as part of the same reboot."
         echo ""
         if confirm "Install persistently to /usr/local/bin/startos-admin now?"; then
             _warn_restart "after the script is installed."
@@ -3744,16 +3709,20 @@ main_menu() {
 
         echo -e "  ${BOLD}Select an action:${NC}"
         echo ""
-        echo -e "    ${CYAN}${BOLD}1)${NC} Documentation"
-        echo -e "    ${CYAN}${BOLD}2)${NC} Create a StartOS notification"
-        echo -e "    ${CYAN}${BOLD}3)${NC} Display disk used by services"
-        echo -e "    ${CYAN}${BOLD}4)${NC} Display memory used by services"
-        echo -e "    ${CYAN}${BOLD}5)${NC} Manage cron jobs  ${DIM}(${_cron_n})${NC}"
-        echo -e "    ${CYAN}${BOLD}6)${NC} Schedule backups"
-        echo -e "    ${CYAN}${BOLD}7)${NC} Schedule stay-alive curl"
-        echo -e "    ${CYAN}${BOLD}8)${NC} Manage notification forwarders  ${DIM}(${_fwd_n})${NC}"
-        echo -e "    ${CYAN}${BOLD}9)${NC} System Database"
-        echo -e "    ${CYAN}${BOLD}10)${NC} Backup / Restore configuration"
+        echo -e "  ${DIM}Display${NC}"
+        echo -e "    ${CYAN}${BOLD}1)${NC} Disk used by services"
+        echo -e "    ${CYAN}${BOLD}2)${NC} System data"
+        echo -e "    ${CYAN}${BOLD}3)${NC} Memory used by services"
+        echo -e "  ${DIM}Create${NC}"
+        echo -e "    ${CYAN}${BOLD}4)${NC} StartOS notification"
+        echo -e "    ${CYAN}${BOLD}5)${NC} Backup schedule"
+        echo -e "    ${CYAN}${BOLD}6)${NC} Stay-alive curl"
+        echo -e "  ${DIM}Manage${NC}"
+        echo -e "    ${CYAN}${BOLD}7)${NC} Cron jobs  ${DIM}(${_cron_n})${NC}"
+        echo -e "    ${CYAN}${BOLD}8)${NC} Notification forwarders  ${DIM}(${_fwd_n})${NC}"
+        echo -e "  ${DIM}Other${NC}"
+        echo -e "    ${CYAN}${BOLD}9)${NC} Save / Load configuration"
+        echo -e "    ${CYAN}${BOLD}10)${NC} Documentation"
         echo -e "    ${CYAN}${BOLD}11)${NC} Debug mode  ${DIM}(${NC}${_dbg_label}${DIM})${NC}"
         echo ""
         echo -e "    ${DIM}0) Exit${NC}"
@@ -3762,17 +3731,17 @@ main_menu() {
         _read choice "  $(echo -e "${BOLD}Choice:${NC} ")" || { _BACK=0; continue; }
 
         case "$choice" in
-            1) menu_documentation          || { _BACK=0; continue; } ;;
-            2) menu_create_notification    || { _BACK=0; continue; } ;;
-            3) menu_disk_usage             || { _BACK=0; continue; } ;;
-            4) menu_memory_usage           || { _BACK=0; continue; } ;;
-            5) menu_manage_crontab         || { _BACK=0; continue; } ;;
-            6) menu_schedule_backup        || { _BACK=0; continue; } ;;
-            7) menu_schedule_stay_alive    || { _BACK=0; continue; } ;;
+            1) menu_disk_usage             || { _BACK=0; continue; } ;;
+            2) menu_db_dump                || { _BACK=0; continue; } ;;
+            3) menu_memory_usage           || { _BACK=0; continue; } ;;
+            4) menu_create_notification    || { _BACK=0; continue; } ;;
+            5) menu_schedule_backup        || { _BACK=0; continue; } ;;
+            6) menu_schedule_stay_alive    || { _BACK=0; continue; } ;;
+            7) menu_manage_crontab         || { _BACK=0; continue; } ;;
             8) menu_manage_notif_pollers   || { _BACK=0; continue; } ;;
-            9) menu_db_dump                   || { _BACK=0; continue; } ;;
-            10) menu_config_backup_restore    || { _BACK=0; continue; } ;;
-            11) menu_toggle_debug             || { _BACK=0; continue; } ;;
+            9) menu_config_backup_restore  || { _BACK=0; continue; } ;;
+            10) menu_documentation         || { _BACK=0; continue; } ;;
+            11) menu_toggle_debug          || { _BACK=0; continue; } ;;
             0)
                 echo ""
                 print_info "Goodbye."
@@ -3790,5 +3759,17 @@ main_menu() {
 # ─────────────────────────────────────────────
 # Entry Point
 # ─────────────────────────────────────────────
+
+# All required commands are preinstalled on StartOS; this guards against
+# running the script somewhere it doesn't belong.
+_missing=()
+for _dep in jq curl openssl; do
+    command -v "$_dep" >/dev/null 2>&1 || _missing+=("$_dep")
+done
+if [[ ${#_missing[@]} -gt 0 ]]; then
+    print_error "Missing required command(s): ${_missing[*]}"
+    print_info "This script is intended to run on a StartOS server."
+    exit 1
+fi
 
 main_menu
