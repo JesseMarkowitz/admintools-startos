@@ -1,3 +1,5 @@
 *.txt
 startos-admin-poller-state-*
 startos-notif-poller-*.log
+# Release signing private key — never commit (see RELEASING.md)
+release-signing-key.pem

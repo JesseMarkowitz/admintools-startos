@@ -12,7 +12,7 @@
 #   7. Manage notification forwarders   — poll start-cli notifications, forward via webhook
 #   8. System database viewer           — browse start-cli db dump by category
 
-VERSION="56"   # integer — increment on each release
+VERSION="57"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -39,6 +39,17 @@ _POLLER_LOG_PREFIX="${_STARTOS_DATA_DIR}/startos-notif-poller-"
 # embed the absolute path and don't depend on cron's minimal PATH.
 _START_CLI=$(command -v start-cli 2>/dev/null || echo "start-cli")
 _CONFIG_BACKUP_FILE="/tmp/startos-config-backup.enc"
+# Root-only directory for secrets (backup passwords). Created mode 700 inside
+# chroot-and-upgrade so it persists across reboots; files inside are mode 600.
+_SECRET_DIR="/root/.startos-admin"
+# Single source of truth for the published script location.
+_REPO_RAW_URL="https://raw.githubusercontent.com/JesseMarkowitz/admintools-startos/refs/heads/main/startos-admin.sh"
+# Public key used to verify release signatures (startos-admin.sh.sig) before
+# any downloaded script is installed. See RELEASING.md in the repo.
+_UPDATE_PUBKEY="-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE6QTyEtKX+mGBZVQnD55TJkslhMap
+8qXTMWhsevn0ft1ltYVRL2IGM4ALSy+EhBEouByyTXiwmrvpYjc4qbX7KA==
+-----END PUBLIC KEY-----"
 
 # ─────────────────────────────────────────────
 # Navigation — "exit" / "back" support
@@ -198,6 +209,84 @@ parse_backup_targets() {
     fi
 }
 
+# Quote a string for safe single-quoted embedding in a shell command line.
+# Replaces each ' with '\'' and wraps the result in single quotes.
+_sq() {
+    local q="'\\''"
+    printf "'%s'" "${1//\'/$q}"
+}
+
+# Validate a URL for safe embedding in generated cron lines and scripts.
+# Rejects quotes, spaces, $, backticks, backslashes, and % (cron treats
+# unescaped % as a newline). Returns 0 if valid, 1 with message if not.
+_validate_url() {
+    local url="$1"
+    if ! [[ "$url" =~ ^https?://[A-Za-z0-9:/?\&=._~#@+,-]+$ ]]; then
+        print_warn "URL must start with http:// or https:// and contain only letters, digits, and : / ? & = . _ ~ # @ + , -"
+        print_warn "Quotes, spaces, \$, %, and backslashes are not supported."
+        return 1
+    fi
+    return 0
+}
+
+# Validate a keyword filter for safe embedding in a generated poller script.
+# Letters, digits, spaces, . _ , - only. Empty is allowed (= no filter).
+_validate_keyword() {
+    local kw="$1"
+    if ! [[ "$kw" =~ ^[A-Za-z0-9\ ._,-]*$ ]]; then
+        print_warn "Keyword may only contain letters, digits, spaces, and . _ , -"
+        return 1
+    fi
+    return 0
+}
+
+# Reject text containing an unescaped % — cron treats % as a newline and
+# everything after it becomes stdin to the command, breaking it silently.
+# Returns 0 if safe, 1 with message if not.
+_check_cron_percent() {
+    local _pct_re='(^|[^\])%'
+    if [[ "$1" =~ $_pct_re ]]; then
+        print_warn "Unescaped % is not supported — cron treats % as a newline."
+        print_warn "If you really need a literal %, escape it as \\% yourself."
+        return 1
+    fi
+    return 0
+}
+
+# Download the published script + its signature and verify before use.
+# $1 = nameref — set to the path of the verified script file on success.
+#      The caller must remove the containing temp dir when done:
+#      rm -rf "$(dirname "$path")"
+# Returns: 0 = verified, 1 = download/network failure, 2 = BAD SIGNATURE.
+_fetch_verified_script() {
+    local -n _fvs_path="$1"
+    local tmpdir
+    tmpdir=$(mktemp -d) || return 1
+    if ! curl -fsSL --max-time 10 "$_REPO_RAW_URL" -o "${tmpdir}/startos-admin.sh" 2>/dev/null \
+       || ! curl -fsSL --max-time 10 "${_REPO_RAW_URL}.sig" -o "${tmpdir}/sig.b64" 2>/dev/null; then
+        rm -rf "$tmpdir"
+        return 1
+    fi
+    printf '%s\n' "$_UPDATE_PUBKEY" > "${tmpdir}/pub.pem"
+    if ! base64 -d "${tmpdir}/sig.b64" > "${tmpdir}/sig.bin" 2>/dev/null \
+       || ! openssl dgst -sha256 -verify "${tmpdir}/pub.pem" \
+              -signature "${tmpdir}/sig.bin" "${tmpdir}/startos-admin.sh" >/dev/null 2>&1; then
+        rm -rf "$tmpdir"
+        return 2
+    fi
+    _fvs_path="${tmpdir}/startos-admin.sh"
+}
+
+# Compute the HMAC-SHA256 of a config-backup ciphertext (hex output).
+# The MAC key is derived one-way from the passphrase via stdin so the
+# passphrase itself never appears on a command line.
+# Usage: _backup_hmac "passphrase" "ciphertext-b64"
+_backup_hmac() {
+    local hmac_key
+    hmac_key=$(printf '%s' "$1" | openssl dgst -sha256 -hmac "startos-admin-backup-v2" -r | awk '{print $1}')
+    printf '%s' "$2" | openssl dgst -sha256 -mac HMAC -macopt "hexkey:${hmac_key}" -r | awk '{print $1}'
+}
+
 # ─────────────────────────────────────────────
 # Cron Installation (Persistence via chroot-and-upgrade)
 # ─────────────────────────────────────────────
@@ -207,12 +296,16 @@ parse_backup_targets() {
 #   1. Writes the merged crontab (existing + new line) to a temp file in /tmp
 #   2. Enters chroot-and-upgrade and installs the crontab from that file
 #   3. Exits the chroot session (which triggers the automatic server restart)
+# Optional $3/$4: path + content of a root-only secret file (e.g. backup
+# password) written mode 600 inside the same chroot session as the cron line.
 install_cron_job() {
     local cron_line="$1"
     local action_label="${2:-startos-admin}"
+    local secret_path="${3:-}"
+    local secret_value="${4:-}"
 
     # Duplicate check
-    if crontab -u root -l 2>/dev/null | grep -qF "$cron_line"; then
+    if sudo crontab -u root -l 2>/dev/null | grep -qF "$cron_line"; then
         print_warn "An identical cron job already exists. Skipping install."
         return 0
     fi
@@ -235,6 +328,19 @@ install_cron_job() {
     encoded_comment=$(printf '%s' "$comment_line" | base64 -w 0)
     encoded_line=$(printf '%s' "$cron_line" | base64 -w 0)
 
+    # Optional secret file — written root-only in the same chroot session.
+    # The encoded value is alphanumeric base64, safe to embed.
+    local secret_cmds=""
+    if [[ -n "$secret_path" ]]; then
+        local encoded_secret
+        encoded_secret=$(printf '%s' "$secret_value" | base64 -w 0)
+        secret_cmds="mkdir -p ${_SECRET_DIR}
+chmod 700 ${_SECRET_DIR}
+printf '%s' \"${encoded_secret}\" | base64 -d > ${secret_path}
+chmod 600 ${secret_path}
+"
+    fi
+
     print_success "Cron job staged. Entering persistence mode now."
     echo ""
     debug_log "Installing cron entry: $cron_line"
@@ -244,7 +350,7 @@ install_cron_job() {
     # The trailing `echo` after each base64 -d adds the required newline.
     local chroot_exit=0
     sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || chroot_exit=$?
-{ crontab -l 2>/dev/null; printf '%s' "$encoded_comment" | base64 -d; echo; printf '%s' "$encoded_line" | base64 -d; echo; } | crontab -
+${secret_cmds}{ crontab -l 2>/dev/null; printf '%s' "$encoded_comment" | base64 -d; echo; printf '%s' "$encoded_line" | base64 -d; echo; } | crontab -
 exit
 EOF
     debug_log "chroot-and-upgrade exit: $chroot_exit"
@@ -790,6 +896,7 @@ _cron_add_flow() {
     while true; do
         _read cron_cmd "  Command: " || return 1
         [[ -z "$cron_cmd" ]] && { print_warn "Command cannot be empty."; continue; }
+        _check_cron_percent "$cron_cmd" || continue
         local syntax_err
         if ! syntax_err=$(bash -nc "$cron_cmd" 2>&1); then
             print_warn "Possible syntax error: $syntax_err"
@@ -828,8 +935,8 @@ _cron_add_flow() {
         echo ""
         print_info "Running: $cron_cmd"
         echo ""
-        bash -c "$cron_cmd"
-        local run_exit=$?
+        local run_exit=0
+        bash -c "$cron_cmd" || run_exit=$?
         echo ""
         if [[ $run_exit -eq 0 ]]; then
             print_success "Command exited 0."
@@ -897,7 +1004,7 @@ _pick_backup_schedule() {
                 _read CRON_SCHEDULE "  Enter cron expression (e.g. 0 2 * * 1-5): " || return 1
                 if [[ -z "$CRON_SCHEDULE" ]]; then
                     print_warn "Cron expression cannot be empty."
-                else
+                elif _validate_cron_expr "$CRON_SCHEDULE"; then
                     return 0
                 fi
                 ;;
@@ -908,17 +1015,19 @@ _pick_backup_schedule() {
 }
 
 # Run the backup setup wizard (steps 1–5, preview). Populates namerefs
-# full_line_ref and password_ref. Does NOT install or confirm restart.
-# Optional defaults (pass from edit flow): $3=target $4=schedule $5=pkg_ids $6=notif_cmd
+# full_line_ref, password_ref, and secret_path_ref (root-only file the cron
+# line reads the password from). Does NOT install or confirm restart.
+# Optional defaults (pass from edit flow): $4=target $5=schedule $6=pkg_ids $7=notif_cmd
 #   pkg_ids: empty string = all packages; non-empty = comma-separated IDs.
-#   Pass sentinel "__NONE__" for $5 to indicate no package default.
+#   Pass sentinel "__NONE__" for $6 to indicate no package default.
 _backup_wizard() {
     local -n _bwfl="$1"
     local -n _bwpw="$2"
-    local _bw_def_target="${3:-}"
-    local _bw_def_sched="${4:-}"
-    local _bw_def_pkg="${5-__NONE__}"   # no-colon: distinguish unset from empty ("")
-    local _bw_def_notif="${6:-}"
+    local -n _bwsp="$3"
+    local _bw_def_target="${4:-}"
+    local _bw_def_sched="${5:-}"
+    local _bw_def_pkg="${6-__NONE__}"   # no-colon: distinguish unset from empty ("")
+    local _bw_def_notif="${7:-}"
     _nav_tip
 
     # ── Step 1: Select backup target ────────────────────────────────────────
@@ -964,6 +1073,13 @@ _backup_wizard() {
         fi
         print_warn "Enter a number between 1 and $((i-1))${_bw_def_target:+, or Enter to keep current}."
     done
+
+    # Target ID becomes part of a root-owned file path and a cron line —
+    # restrict to a safe charset before going any further.
+    if ! [[ "$backup_target" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        print_error "Backup target id '${backup_target}' contains unexpected characters. Aborting."
+        pause; return 1
+    fi
 
     # ── Step 2: Password ─────────────────────────────────────────────────────
     echo ""
@@ -1051,11 +1167,16 @@ _backup_wizard() {
     _pick_post_action "Post-backup notification:" notif_cmd "$_bw_def_notif" || return 1
 
     # ── Build cron line ──────────────────────────────────────────────────────
-    local backup_cmd="${_START_CLI} backup create ${backup_target} '${backup_password}'"
+    # The password is NOT embedded in the cron line. It is written to a
+    # root-only file (mode 600) at install time and read at backup time, so it
+    # never appears in the crontab, crontab listings, or config exports.
+    local pass_path="${_SECRET_DIR}/backup-pass-${backup_target}"
+    local backup_cmd="${_START_CLI} backup create ${backup_target} \"\$(cat ${pass_path})\""
     [[ -n "$pkg_ids_arg" ]] && backup_cmd+=" --package-ids ${pkg_ids_arg}"
     _bwfl="$CRON_SCHEDULE $backup_cmd"
     [[ -n "$notif_cmd" ]] && _bwfl+=" && $notif_cmd"
     _bwpw="$backup_password"
+    _bwsp="$pass_path"
 
     # ── Preview ──────────────────────────────────────────────────────────────
     echo ""
@@ -1065,10 +1186,10 @@ _backup_wizard() {
     echo -e "  ${BOLD}Packages:${NC}  $packages_display"
     echo -e "  ${BOLD}Schedule:${NC}  $CRON_SCHEDULE"
     [[ -n "$notif_cmd" ]] && echo -e "  ${BOLD}Notify:${NC}    $notif_cmd"
+    echo -e "  ${BOLD}Password:${NC}  stored root-only at ${pass_path} (not in the crontab)"
     echo ""
     echo -e "  ${DIM}Cron line:${NC}"
-    local preview_line="${_bwfl//${backup_password}/********}"
-    echo -e "  ${DIM}${preview_line}${NC}"
+    echo -e "  ${DIM}${_bwfl}${NC}"
     echo ""
 }
 
@@ -1076,8 +1197,8 @@ _backup_install_flow() {
     print_header
     print_section "Schedule Backups"
     echo ""
-    local bw_full_line bw_password
-    _backup_wizard bw_full_line bw_password || return 1
+    local bw_full_line bw_password bw_secret_path
+    _backup_wizard bw_full_line bw_password bw_secret_path || return 1
 
     if ! confirm "Install this backup schedule?"; then
         [[ $_BACK -eq 1 ]] && return 1
@@ -1085,7 +1206,7 @@ _backup_install_flow() {
         pause; return
     fi
 
-    install_cron_job "$bw_full_line" "Schedule Backups" || return 1
+    install_cron_job "$bw_full_line" "Schedule Backups" "$bw_secret_path" "$bw_password" || return 1
     # NOTE: server restarts after this — nothing below executes
 }
 
@@ -1159,8 +1280,8 @@ _backup_edit_flow() {
     print_header
     print_section "Edit Backup Schedule"
     echo ""
-    local bw_full_line bw_password
-    _backup_wizard bw_full_line bw_password "$def_target" "$def_sched" "$def_pkg" "$def_notif" || return 1
+    local bw_full_line bw_password bw_secret_path
+    _backup_wizard bw_full_line bw_password bw_secret_path "$def_target" "$def_sched" "$def_pkg" "$def_notif" || return 1
 
     if ! confirm "Replace existing schedule with this?"; then
         [[ $_BACK -eq 1 ]] && return 1
@@ -1187,8 +1308,14 @@ _backup_edit_flow() {
     print_success "Replacement staged. Entering persistence mode now."
     echo ""
     debug_log "Replacing backup schedule. Old comment: $old_comment"
+    local enc_secret
+    enc_secret=$(printf '%s' "$bw_password" | base64 -w 0)
     local chroot_exit=0
     sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || chroot_exit=$?
+mkdir -p ${_SECRET_DIR}
+chmod 700 ${_SECRET_DIR}
+printf '%s' "$enc_secret" | base64 -d > ${bw_secret_path}
+chmod 600 ${bw_secret_path}
 old_c=\$(printf '%s' "$enc_old_c" | base64 -d)
 old_l=\$(printf '%s' "$enc_old_l" | base64 -d)
 { crontab -l 2>/dev/null | grep -vxF "\$old_c" | grep -vxF "\$old_l"; printf '%s' "$enc_new_c" | base64 -d; echo; printf '%s' "$enc_new_l" | base64 -d; echo; } | crontab -
@@ -1282,9 +1409,16 @@ _pick_notif_startos() {
         esac
     done
 
+    # Title/body end up inside a cron command line — reject unescaped %.
     echo ""
-    _read _title "  Notification title: " || return 1
-    _read _body "  Notification message: " || return 1
+    while true; do
+        _read _title "  Notification title: " || return 1
+        _check_cron_percent "$_title" && break
+    done
+    while true; do
+        _read _body "  Notification message: " || return 1
+        _check_cron_percent "$_body" && break
+    done
 }
 
 # Post-action picker: curl / StartOS notification / both / none.
@@ -1323,13 +1457,14 @@ _pick_post_action() {
                 echo -e "  ${DIM}Hint: no need for >/dev/null; avoid bare & (use && to chain commands).${NC}"
                 _read _ppa_cmd "  Shell command: " || return 1
                 [[ -z "$_ppa_cmd" ]] && { print_warn "Command cannot be empty."; continue; }
+                _check_cron_percent "$_ppa_cmd" || continue
                 echo ""
                 _read _ppa_test "  Test this command now? [y/N]: " || return 1
                 if [[ "${_ppa_test,,}" == "y" ]]; then
                     echo ""
                     print_info "Running: $_ppa_cmd"
                     local _ppa_test_exit=0
-                    bash -c "$_ppa_cmd"; _ppa_test_exit=$?
+                    bash -c "$_ppa_cmd" || _ppa_test_exit=$?
                     echo ""
                     if [[ $_ppa_test_exit -eq 0 ]]; then
                         print_success "Command exited 0 (success)."
@@ -1347,13 +1482,14 @@ _pick_post_action() {
                 echo -e "  ${DIM}Hint: no need for >/dev/null; avoid bare & (use && to chain commands).${NC}"
                 _read _ppa_cmd "  Shell command: " || return 1
                 [[ -z "$_ppa_cmd" ]] && { print_warn "Command cannot be empty."; continue; }
+                _check_cron_percent "$_ppa_cmd" || continue
                 echo ""
                 _read _ppa_test "  Test this command now? [y/N]: " || return 1
                 if [[ "${_ppa_test,,}" == "y" ]]; then
                     echo ""
                     print_info "Running: $_ppa_cmd"
                     local _ppa_test_exit=0
-                    bash -c "$_ppa_cmd"; _ppa_test_exit=$?
+                    bash -c "$_ppa_cmd" || _ppa_test_exit=$?
                     echo ""
                     if [[ $_ppa_test_exit -eq 0 ]]; then
                         print_success "Command exited 0 (success)."
@@ -1368,12 +1504,14 @@ _pick_post_action() {
         esac
     done
 
+    # Title/body are single-quote escaped (_sq) so quotes, $, and backticks in
+    # user text cannot break out of the generated cron command.
     local _ppa_pkg_flag=""
     [[ -n "$_ppa_svc" && "$_ppa_svc" != "blank" ]] && _ppa_pkg_flag="--package ${_ppa_svc} "
     case "$_ppa_mode" in
         1) _ppa_notif_cmd="${_ppa_cmd}" ;;
-        2) _ppa_notif_cmd="${_START_CLI} notification create ${_ppa_pkg_flag}${_ppa_level} \"${_ppa_title}\" \"${_ppa_body}\"" ;;
-        3) _ppa_notif_cmd="${_ppa_cmd} && ${_START_CLI} notification create ${_ppa_pkg_flag}${_ppa_level} \"${_ppa_title}\" \"${_ppa_body}\"" ;;
+        2) _ppa_notif_cmd="${_START_CLI} notification create ${_ppa_pkg_flag}${_ppa_level} $(_sq "$_ppa_title") $(_sq "$_ppa_body")" ;;
+        3) _ppa_notif_cmd="${_ppa_cmd} && ${_START_CLI} notification create ${_ppa_pkg_flag}${_ppa_level} $(_sq "$_ppa_title") $(_sq "$_ppa_body")" ;;
         4) _ppa_notif_cmd="" ;;
     esac
 }
@@ -1393,11 +1531,12 @@ menu_schedule_stay_alive() {
     print_header
     print_section "Schedule Stay-Alive Curl"
     echo ""
-    _read stay_url "  URL to curl: " || return 1
-    if [[ -z "$stay_url" ]]; then
-        print_error "URL cannot be empty."
-        pause; return
-    fi
+    local stay_url=""
+    while true; do
+        _read stay_url "  URL to curl: " || return 1
+        [[ -z "$stay_url" ]] && { print_warn "URL cannot be empty."; continue; }
+        _validate_url "$stay_url" && break
+    done
 
     local CRON_SCHEDULE
     _pick_poll_frequency || return 1
@@ -1466,8 +1605,11 @@ _pick_poll_frequency() {
             4) CRON_SCHEDULE="0 * * * *";    return 0 ;;
             5)
                 _read CRON_SCHEDULE "  Enter cron expression (e.g. 0 2 * * 1-5): " || return 1
-                [[ -n "$CRON_SCHEDULE" ]] && return 0
-                print_warn "Expression cannot be empty."
+                if [[ -z "$CRON_SCHEDULE" ]]; then
+                    print_warn "Expression cannot be empty."
+                elif _validate_cron_expr "$CRON_SCHEDULE"; then
+                    return 0
+                fi
                 ;;
             *) print_warn "Enter 1 through 5." ;;
         esac
@@ -1633,8 +1775,8 @@ _poller_install_flow() {
     local webhook_url=""
     while true; do
         _read webhook_url "  Webhook URL: " || return 1
-        [[ -n "$webhook_url" ]] && break
-        print_warn "URL cannot be empty."
+        [[ -z "$webhook_url" ]] && { print_warn "URL cannot be empty."; continue; }
+        _validate_url "$webhook_url" && break
     done
 
     # Step 2: Level filter
@@ -1677,7 +1819,10 @@ _poller_install_flow() {
     echo ""
     echo -e "  ${DIM}Case-insensitive. Searches both the notification title and message body.${NC}"
     local keyword=""
-    _read keyword "  Keyword filter — forward only if title/message contains (blank = none): " || return 1
+    while true; do
+        _read keyword "  Keyword filter — forward only if title/message contains (blank = none): " || return 1
+        _validate_keyword "$keyword" && break
+    done
 
     # Step 4: Frequency
     local CRON_SCHEDULE
@@ -1757,9 +1902,13 @@ _poller_edit_flow() {
     # Step 1: URL
     echo -e "  ${DIM}Current URL: ${cur_url}${NC}"
     local webhook_url
-    _read webhook_url "  New URL [Enter to keep]: " || return 1
-    webhook_url="${webhook_url:-$cur_url}"
-    [[ -z "$webhook_url" ]] && { print_warn "URL cannot be empty."; pause; return; }
+    while true; do
+        _read webhook_url "  New URL [Enter to keep]: " || return 1
+        webhook_url="${webhook_url:-$cur_url}"
+        [[ -z "$webhook_url" ]] && { print_warn "URL cannot be empty."; continue; }
+        _validate_url "$webhook_url" && break
+        cur_url=""   # current value failed validation — force a new entry
+    done
 
     # Step 2: Levels
     echo ""
@@ -1807,11 +1956,18 @@ _poller_edit_flow() {
         if [[ "${kw_clear,,}" == "y" ]]; then
             keyword=""
         else
-            _read keyword "  New keyword [Enter to keep '${cur_keyword}']: " || return 1
-            keyword="${keyword:-$cur_keyword}"
+            while true; do
+                _read keyword "  New keyword [Enter to keep '${cur_keyword}']: " || return 1
+                keyword="${keyword:-$cur_keyword}"
+                _validate_keyword "$keyword" && break
+                cur_keyword=""   # current value failed validation — force a new entry
+            done
         fi
     else
-        _read keyword "  Keyword filter — forward only if title/message contains (blank = none): " || return 1
+        while true; do
+            _read keyword "  Keyword filter — forward only if title/message contains (blank = none): " || return 1
+            _validate_keyword "$keyword" && break
+        done
     fi
 
     # Step 4: Schedule
@@ -1989,7 +2145,7 @@ while IFS= read -r notif; do
         continue
     fi
 
-    if [ -n "$KEYWORD" ] && ! echo "$title $msg" | grep -qi "$KEYWORD"; then
+    if [ -n "$KEYWORD" ] && ! echo "$title $msg" | grep -Fqi "$KEYWORD"; then
         echo "$(_ts): skip id=$id level=$level — keyword '$KEYWORD' not found in: $title"
         continue
     fi
@@ -2046,8 +2202,9 @@ POLLER_BODY_END
 
     # Remove any existing entry for this poller name, then write the new script
     # and add the tagged comment + cron line. All in one chroot session.
-    # mkdir -p here creates the data dir in the persistent root-fs overlay so that
-    # cron jobs writing state/log files there survive across reboots.
+    # mkdir -p here ensures the data dir exists so cron runs can write state/log
+    # files. NOTE: files written there at runtime live in the volatile overlay
+    # and are LOST on reboot — the forwarder re-seeds on its first post-boot run.
     # \$0 in the heredoc → $0 for awk (the outer bash escapes \$ → $).
     local chroot_exit=0
     sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || chroot_exit=$?
@@ -2268,7 +2425,7 @@ _poller_state_flow() {
         1)
             if confirm "Delete state file for '${pname}'?"; then
                 if sudo rm -f "$state_file" && [[ ! -e "$state_file" ]]; then
-                    print_success "State file deleted. Next run will forward only the most recent notification."
+                    print_success "State file deleted. Next run silently re-seeds — only notifications after that run are forwarded."
                 else
                     print_error "Failed to delete state file."
                 fi
@@ -2825,6 +2982,10 @@ menu_documentation() {
                 echo -e "      Since StartOS already notifies you when a backup completes, combining"
                 echo -e "      a kickoff notification with the completion one gives you elapsed time."
                 echo ""
+                echo -e "  ${BOLD}Password storage:${NC} your StartOS primary password is saved to a root-only"
+                echo -e "  file (${DIM}${_SECRET_DIR}/backup-pass-<target>${NC}, mode 600) — it does NOT appear"
+                echo -e "  in the crontab. It is briefly visible in the process list while a backup runs."
+                echo ""
                 pause ;;
             6)
                 print_header
@@ -2877,16 +3038,16 @@ menu_documentation() {
                 echo -e "  Fields: timestamp  [forwarder-name]  [Level]  #id  package  |  title — message"
                 echo ""
                 echo -e "  ${BOLD}First run behavior:${NC}"
-                echo -e "  On the first poll after install, the forwarder forwards only the"
-                echo -e "  single most recent notification at that moment. All older notifications"
-                echo -e "  are skipped to prevent a historical flood. Subsequent runs forward"
-                echo -e "  only notifications newer than the last one seen."
+                echo -e "  On the first poll after install (and after every reboot), the forwarder"
+                echo -e "  silently seeds its state to the current newest notification — nothing is"
+                echo -e "  forwarded. Subsequent runs forward only notifications newer than the"
+                echo -e "  last one seen."
                 echo ""
                 echo -e "  ${BOLD}Files created per forwarder:${NC}"
                 echo ""
                 echo -e "    ${DIM}Script:  /usr/local/bin/startos-notif-poller-<name>${NC}"
-                echo -e "    ${DIM}State:   /media/startos/data/startos-admin/startos-admin-poller-state-<name>${NC}"
-                echo -e "    ${DIM}Log:     /media/startos/data/startos-admin/startos-notif-poller-<name>.log${NC}"
+                echo -e "    ${DIM}State:   ${_POLLER_STATE_PREFIX}<name>${NC}"
+                echo -e "    ${DIM}Log:     ${_POLLER_LOG_PREFIX}<name>.log${NC}"
                 echo ""
                 pause ;;
             8)
@@ -2955,8 +3116,10 @@ menu_documentation() {
                 echo -e "  ${CYAN}startos-admin${NC} script itself at ${DIM}/usr/local/bin/startos-admin${NC}."
                 echo ""
                 echo -e "  The backup file is encrypted with AES-256-CBC using a passphrase you"
-                echo -e "  provide. ${YELLOW}The passphrase cannot be recovered.${NC} A forgotten passphrase"
-                echo -e "  makes the backup permanently unreadable."
+                echo -e "  provide, plus an HMAC-SHA256 integrity check that detects tampering"
+                echo -e "  or corruption before restore. Backup passwords for scheduled backups"
+                echo -e "  are included. ${YELLOW}The passphrase cannot be recovered.${NC} A forgotten"
+                echo -e "  passphrase makes the backup permanently unreadable."
                 echo ""
                 echo -e "  The encrypted file is saved to ${DIM}${_CONFIG_BACKUP_FILE}${NC}."
                 echo -e "  An ${CYAN}scp${NC} command is shown after export to transfer it off the server."
@@ -3043,25 +3206,48 @@ _config_export_flow() {
     fi
     bundle+="POLLER_COUNT=${pcount}"$'\n'
 
-    # ── Encrypt to file ───────────────────────────────────────────────────────
+    # Backup-password secret files (root-only) — carried inside the encrypted
+    # bundle so scheduled backups work again after a restore.
+    local scount=0
+    local -a secret_files=()
+    mapfile -t secret_files < <(sudo find "$_SECRET_DIR" -maxdepth 1 -name 'backup-pass-*' -type f 2>/dev/null)
+    local sf
+    for sf in "${secret_files[@]}"; do
+        [[ -n "$sf" ]] || continue
+        bundle+="SECRET_${scount}_NAME=$(basename "$sf")"$'\n'
+        bundle+="SECRET_${scount}_B64=$(sudo base64 -w 0 "$sf")"$'\n'
+        (( scount++ ))
+    done
+    bundle+="SECRET_COUNT=${scount}"$'\n'
+
+    # ── Encrypt (V2: ciphertext + HMAC-SHA256 integrity check) ───────────────
     local pass_file
     pass_file=$(mktemp)
     chmod 600 "$pass_file"
     printf '%s\n' "$passphrase" > "$pass_file"
-    unset passphrase
 
-    local enc_exit=0
-    printf '%s' "$bundle" \
+    local ct enc_exit=0
+    ct=$(printf '%s' "$bundle" \
         | openssl enc -aes-256-cbc -pbkdf2 -salt -a \
-            -pass "file:${pass_file}" > "$_CONFIG_BACKUP_FILE" \
+            -pass "file:${pass_file}") \
         || enc_exit=$?
     rm -f "$pass_file"
 
-    if [[ $enc_exit -ne 0 ]]; then
-        rm -f "$_CONFIG_BACKUP_FILE"
+    if [[ $enc_exit -ne 0 || -z "$ct" ]]; then
+        unset passphrase
         print_error "Encryption failed (openssl exit ${enc_exit}). Backup not written."
         pause; return
     fi
+
+    local hmac
+    hmac=$(_backup_hmac "$passphrase" "$ct")
+    unset passphrase
+
+    {
+        echo "STARTOS_ADMIN_BACKUP_V2"
+        printf '%s\n' "$ct"
+        echo "HMAC:${hmac}"
+    } > "$_CONFIG_BACKUP_FILE"
 
     # ── Display results ───────────────────────────────────────────────────────
     local cron_count=0
@@ -3077,6 +3263,7 @@ _config_export_flow() {
     echo ""
     echo -e "  ${BOLD}Cron entries:${NC} ${cron_count} startos-admin managed entries"
     echo -e "  ${BOLD}Forwarders:${NC}   ${pcount}"
+    echo -e "  ${BOLD}Backup passwords:${NC} ${scount} (root-only secret files)"
     echo ""
     print_section "Encrypted backup file contents"
     echo ""
@@ -3137,6 +3324,27 @@ _config_restore_flow() {
     local passphrase
     _read_silent passphrase "  Enter backup passphrase: " || return 1
 
+    # V2 format: marker line, base64 ciphertext, trailing HMAC line.
+    # Verify the HMAC before feeding anything to openssl. V1 files (raw
+    # openssl base64) are still accepted, with a warning.
+    local file_format ct=""
+    file_format=$(head -1 "$backup_path")
+    if [[ "$file_format" == "STARTOS_ADMIN_BACKUP_V2" ]]; then
+        ct=$(sed -n '2,$p' "$backup_path" | grep -v '^HMAC:')
+        local stored_hmac computed_hmac
+        stored_hmac=$(grep '^HMAC:' "$backup_path" | head -1 | cut -d: -f2 | tr -d '[:space:]')
+        computed_hmac=$(_backup_hmac "$passphrase" "$ct")
+        if [[ -z "$stored_hmac" || "$computed_hmac" != "$stored_hmac" ]]; then
+            unset passphrase
+            print_error "Integrity check FAILED — wrong passphrase, or the file was corrupted or tampered with."
+            print_warn "Restore aborted. Nothing was changed."
+            pause; return
+        fi
+        print_success "Integrity check passed."
+    else
+        print_warn "Legacy (v1) backup format — no integrity protection. Proceeding."
+    fi
+
     local pass_file
     pass_file=$(mktemp)
     chmod 600 "$pass_file"
@@ -3144,8 +3352,13 @@ _config_restore_flow() {
     unset passphrase
 
     local bundle dec_exit=0
-    bundle=$(openssl enc -d -aes-256-cbc -pbkdf2 -a \
-        -pass "file:${pass_file}" -in "$backup_path") || dec_exit=$?
+    if [[ -n "$ct" ]]; then
+        bundle=$(printf '%s\n' "$ct" | openssl enc -d -aes-256-cbc -pbkdf2 -a \
+            -pass "file:${pass_file}") || dec_exit=$?
+    else
+        bundle=$(openssl enc -d -aes-256-cbc -pbkdf2 -a \
+            -pass "file:${pass_file}" -in "$backup_path") || dec_exit=$?
+    fi
     rm -f "$pass_file"
 
     if [[ $dec_exit -ne 0 || -z "$bundle" ]]; then
@@ -3175,6 +3388,47 @@ _config_restore_flow() {
         pscripts+=("$(printf '%s' "$bundle" | grep "^POLLER_${pi}_SCRIPT_B64=" | head -1 | cut -d= -f2-)")
     done
 
+    local scount
+    scount=$(printf '%s' "$bundle" | grep '^SECRET_COUNT=' | head -1 | cut -d= -f2-)
+    scount="${scount//[^0-9]/}"
+    [[ -z "$scount" ]] && scount=0
+
+    local -a snames=() svals=()
+    local si
+    for (( si=0; si<scount; si++ )); do
+        snames+=("$(printf '%s' "$bundle" | grep "^SECRET_${si}_NAME=" | head -1 | cut -d= -f2-)")
+        svals+=("$(printf '%s'  "$bundle" | grep "^SECRET_${si}_B64="  | head -1 | cut -d= -f2-)")
+    done
+
+    # ── Validate every parsed field before it touches a root-owned path ──────
+    # Names become file paths written as root inside the chroot — restrict to
+    # the same charsets enforced at creation time (blocks path traversal in a
+    # hand-crafted or corrupted bundle).
+    if [[ -n "$crontab_b64" ]] && ! printf '%s' "$crontab_b64" | base64 -d >/dev/null 2>&1; then
+        print_error "Backup crontab is not valid base64. Restore aborted."
+        pause; return
+    fi
+    for pi in "${!pnames[@]}"; do
+        if ! [[ "${pnames[$pi]}" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]*$ ]]; then
+            print_error "Backup contains an invalid forwarder name: '${pnames[$pi]}'. Restore aborted."
+            pause; return
+        fi
+        if ! printf '%s' "${pscripts[$pi]}" | base64 -d >/dev/null 2>&1; then
+            print_error "Forwarder script '${pnames[$pi]}' is not valid base64. Restore aborted."
+            pause; return
+        fi
+    done
+    for si in "${!snames[@]}"; do
+        if ! [[ "${snames[$si]}" =~ ^backup-pass-[A-Za-z0-9._-]+$ ]]; then
+            print_error "Backup contains an invalid secret file name: '${snames[$si]}'. Restore aborted."
+            pause; return
+        fi
+        if ! printf '%s' "${svals[$si]}" | base64 -d >/dev/null 2>&1; then
+            print_error "Secret '${snames[$si]}' is not valid base64. Restore aborted."
+            pause; return
+        fi
+    done
+
     # ── Show restore summary ──────────────────────────────────────────────────
     print_header
     print_section "Restore Summary"
@@ -3192,11 +3446,12 @@ _config_restore_flow() {
     for pi in "${!pnames[@]}"; do
         echo -e "    ${DIM}• ${pnames[$pi]}${NC}"
     done
+    echo -e "  ${BOLD}Backup passwords:${NC} ${scount} (restored root-only to ${_SECRET_DIR})"
     echo ""
     print_warn "Your current crontab will be REPLACED with the backed-up version."
     [[ $pcount -gt 0 ]] && \
         print_warn "Forwarder scripts with matching names will be overwritten."
-    print_info "The latest startos-admin script will also be downloaded and installed persistently."
+    print_info "The latest startos-admin script will also be downloaded, signature-verified, and installed persistently."
     echo ""
 
     # ── Confirmations ─────────────────────────────────────────────────────────
@@ -3215,12 +3470,31 @@ _config_restore_flow() {
 
     ${_START_CLI} notification create info "StartOS Admin" "StartOS Admin Configuration Restored" 2>/dev/null || true
 
+    # ── Download + verify the latest script BEFORE entering the chroot ───────
+    # If the download fails or the signature does not verify, the restore
+    # proceeds without reinstalling startos-admin (nothing unverified is run).
+    local verified_path="" fetch_rc=0 script_b64=""
+    _fetch_verified_script verified_path || fetch_rc=$?
+    if [[ $fetch_rc -eq 0 ]]; then
+        script_b64=$(base64 -w 0 < "$verified_path")
+        rm -rf "$(dirname "$verified_path")"
+    elif [[ $fetch_rc -eq 2 ]]; then
+        print_error "Downloaded script FAILED signature verification — startos-admin will NOT be reinstalled."
+        print_warn "This may indicate a compromised repository. The rest of the restore will proceed."
+    else
+        print_warn "Could not download the latest script — startos-admin will NOT be reinstalled."
+        print_warn "Re-run the install command from the README after the restore completes."
+    fi
+
     # ── Build and run chroot session ──────────────────────────────────────────
     local chroot_body
     chroot_body="mkdir -p ${_STARTOS_DATA_DIR}
-curl -fsSL https://raw.githubusercontent.com/JesseMarkowitz/admintools-startos/refs/heads/main/startos-admin.sh -o /usr/local/bin/startos-admin
+"
+    if [[ -n "$script_b64" ]]; then
+        chroot_body+="printf '%s' '${script_b64}' | base64 -d > /usr/local/bin/startos-admin
 chmod +x /usr/local/bin/startos-admin
 "
+    fi
     if [[ -n "$crontab_b64" ]]; then
         chroot_body+="{ printf '%s' '${crontab_b64}' | base64 -d; echo; } | crontab -
 "
@@ -3233,6 +3507,19 @@ chmod +x /usr/local/bin/startos-admin
 chmod +x ${_POLLER_BIN_PREFIX}${pn}
 "
     done
+
+    if [[ $scount -gt 0 ]]; then
+        chroot_body+="mkdir -p ${_SECRET_DIR}
+chmod 700 ${_SECRET_DIR}
+"
+        for si in "${!snames[@]}"; do
+            local sn="${snames[$si]}"
+            local sv="${svals[$si]}"
+            chroot_body+="printf '%s' '${sv}' | base64 -d > ${_SECRET_DIR}/${sn}
+chmod 600 ${_SECRET_DIR}/${sn}
+"
+        done
+    fi
 
     print_success "Restore staged. Entering persistence mode now."
     echo ""
@@ -3280,14 +3567,15 @@ menu_config_backup_restore() {
 #   Phase 1 — Persistent install check: if the script is not running from
 #     /usr/local/bin/startos-admin, offer to install it there and return.
 #     Version comparison is skipped in this case.
-#   Phase 2 — Version check: fetch the remote script from GitHub, extract
-#     its VERSION, and offer an upgrade if the remote version is newer.
+#   Phase 2 — Version check: fetch the remote script + signature from GitHub,
+#     verify the signature against the embedded public key, extract VERSION,
+#     and offer an upgrade if the remote version is newer. A script that fails
+#     signature verification is never installed.
 #     Runs only when already installed persistently.
-# Both phases are silent on network failure (curl || return 0).
+# Both phases are silent on network failure.
 
 check_for_update() {
-    local raw_url="https://raw.githubusercontent.com/JesseMarkowitz/admintools-startos/refs/heads/main/startos-admin.sh"
-    local remote_version remote_script
+    local remote_version
 
     # ── First-run: not yet installed persistently ────────────────────────────
     local _script_path
@@ -3326,39 +3614,57 @@ EOF
     fi
 
     # ── Normal update check (only runs when already persistent) ─────────────
-    # Fetch with short timeout — fail silently if offline or unreachable
-    debug_log "Fetching remote version from: $raw_url"
-    remote_script=$(curl -fsSL --max-time 5 "$raw_url" 2>/dev/null) || {
+    # Fetch script + signature; fail silently if offline, loudly if the
+    # signature does not verify.
+    debug_log "Fetching remote script + signature from: $_REPO_RAW_URL"
+    local verified_path="" fetch_rc=0
+    _fetch_verified_script verified_path || fetch_rc=$?
+    if [[ $fetch_rc -eq 1 ]]; then
         debug_log "Remote fetch failed or timed out — skipping update check"
         return 0
-    }
+    elif [[ $fetch_rc -eq 2 ]]; then
+        echo ""
+        print_error "Update check: the published script FAILED signature verification."
+        print_warn "Refusing to update. This may indicate a compromised repository."
+        print_warn "Your installed version is unaffected."
+        pause
+        return 0
+    fi
 
-    remote_version=$(echo "$remote_script" | grep '^VERSION=' | head -1 | tr -d '"' | cut -d= -f2 | awk '{print $1}')
-    [[ -z "$remote_version" ]] && return 0
+    remote_version=$(grep '^VERSION=' "$verified_path" | head -1 | tr -d '"' | cut -d= -f2 | awk '{print $1}') || true
+    if [[ -z "$remote_version" ]]; then
+        rm -rf "$(dirname "$verified_path")"
+        return 0
+    fi
     debug_log "Remote version: $remote_version  Local: $VERSION"
 
     # Compare as integers; skip if already current
     if [[ "$remote_version" -le "$VERSION" ]] 2>/dev/null; then
+        rm -rf "$(dirname "$verified_path")"
         return 0
     fi
 
     echo ""
     print_info "A newer version is available: v${remote_version}  (you have v${VERSION})"
+    print_info "Signature verified."
     echo ""
     if ! confirm "Download and install v${remote_version} persistently to /usr/local/bin/startos-admin?"; then
-        [[ $_BACK -eq 1 ]] && { _BACK=0; return 0; }
+        [[ $_BACK -eq 1 ]] && _BACK=0
+        rm -rf "$(dirname "$verified_path")"
         return 0
     fi
 
     _warn_restart "after the update is installed."
     if ! confirm "Proceed? (server will restart automatically)"; then
-        [[ $_BACK -eq 1 ]] && { _BACK=0; return 0; }
+        [[ $_BACK -eq 1 ]] && _BACK=0
+        rm -rf "$(dirname "$verified_path")"
         return 0
     fi
     echo ""
 
     local encoded
-    encoded=$(printf '%s' "$remote_script" | base64 -w 0)
+    encoded=$(base64 -w 0 < "$verified_path")
+    rm -rf "$(dirname "$verified_path")"
 
     local chroot_exit=0
     sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || chroot_exit=$?

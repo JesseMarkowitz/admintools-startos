@@ -37,9 +37,9 @@ Key risks and cautions:
 
 - **Root-level impact:** If you run this script as `root` (or via `sudo`), it can modify system state (e.g., write to `/usr/local/bin`, create/edit cron entries, create state files, make outbound HTTP requests). Mistakes or malicious changes could cause system damage or data loss.
 - **Not formally vetted or approved:** This project has **not** been heavily security-audited, formally reviewed, or approved by Start9/StartOS. It may contain bugs or unsafe assumptions.
-- **Backup password stored in plaintext cron entry (S1):** When you schedule a backup, your StartOS primary password is written into the root crontab in plaintext as part of the `start-cli backup create` command. This means it is visible to anyone who can run `sudo crontab -l`, and it may appear in system logs. Evaluate whether this is acceptable in your threat model before scheduling backups. You can remove a backup cron entry at any time from the Manage Cron Jobs menu.
-- **Auto-update has no integrity verification (S2):** When the script checks for and installs updates, it fetches the new version from GitHub over HTTPS. No checksum, GPG signature, or other integrity mechanism is applied to verify the downloaded content. While HTTPS prevents most network-level attacks, a compromised GitHub account or repository could serve malicious code. Always review the script after an update, or disable auto-update by declining the prompt at startup.
-- **Supply-chain / update risk:** Any workflow that fetches and executes code from the internet increases supply-chain risk. See the auto-update note above.
+- **Backup password storage (S1 — mitigated):** When you schedule a backup, your StartOS primary password is stored in a root-only file (`/root/.startos-admin/backup-pass-<target>`, mode 600) that the cron job reads at backup time. It does **not** appear in the crontab. Residual exposure: the password is briefly visible in the process list (`ps`) while a backup is running, and the file remains if you later delete the backup cron entry (remove it manually with `sudo rm` if desired). Backups scheduled with versions ≤ 56 still have the password inline in the crontab — edit the schedule once to migrate it to the new format.
+- **Update integrity verification (S2 — mitigated):** Updates and restore-time downloads are verified against a signature (`startos-admin.sh.sig`) using a public key embedded in the script before anything is installed. A script that fails verification is never installed. Trust is anchored at first install (review the script you initially download); a compromised repository cannot push executable code without the private signing key, which is not stored in the repository.
+- **Input validation:** Webhook/stay-alive URLs and keyword filters are restricted to conservative character sets, and notification titles/messages are shell-escaped, so user input cannot inject commands into the root crontab or generated forwarder scripts. `%` is rejected in values that end up in cron lines (cron treats it as a newline).
 - **Outbound webhook/URL risk:** Features that `curl` a URL or POST to a webhook can leak metadata (timestamps, service names, notification text). Only use endpoints you trust, and prefer HTTPS.
 - **Use at your own risk:** You are responsible for reviewing the code and deciding whether to run it in your environment.
 
@@ -63,7 +63,7 @@ This will download the script from github, set it to executable and run it the f
 On first run:
 
 - The script checks GitHub for a newer version.
-- If a newer version exists, you will be prompted to install the newer version persistently.
+- If a newer version exists, you will be prompted to install the newer version persistently. Downloaded updates are signature-verified against a public key embedded in the script before they are installed.
 - Persistent installation places the script at: `/usr/local/bin/startos-admin`
 - Also, if it was not run from the persistent installed location (such as on first run as part of curl command above) it will offer to install persistently.
 
@@ -97,6 +97,9 @@ Cron jobs (created by scheduling actions):
 - Backup schedules
 - Stay-alive URL checks
 - Notification forwarder poll schedules
+
+Backup passwords (created by Schedule Backups):
+- Stored root-only at `/root/.startos-admin/backup-pass-<target>` (mode 600, persistent via chroot)
 
 Notification Forwarders
 - Forwarding executables are installed in `/usr/local/bin/` (persistent via chroot)
@@ -223,6 +226,8 @@ Configuration options:
   - Optional shell command — enter the full command, e.g.: `curl -d "Backup to CIFs-0 for Nextcloud and Vaultwarden started" https://ntfy.sh/StartOS-adjective-noun-Alerts`
   - Optional StartOS standard UI notification
 
+Your StartOS primary password is saved to a root-only file (`/root/.startos-admin/backup-pass-<target>`, mode 600) that the cron job reads at backup time — it does not appear in the crontab.
+
 > **Note:** StartOS already generates a notification when a backup completes. Combining a kickoff notification with the completion notification can help estimate time it takes for backups to complete
 
 </details>
@@ -338,10 +343,11 @@ Exports your installed cron jobs and notification forwarders as a single AES-256
 **Export saves:**
 - All root cron entries
 - All notification forwarder scripts (including embedded webhook URLs and schedules)
+- All scheduled-backup password files (root-only secrets, carried inside the encrypted bundle)
 
-**Restore reinstalls** everything in a single reboot: cron jobs, notification forwarder scripts, and the `startos-admin` script itself (downloaded fresh from GitHub — always the latest version).
+**Restore reinstalls** everything in a single reboot: cron jobs, notification forwarder scripts, backup password files, and the `startos-admin` script itself (downloaded fresh from GitHub and **signature-verified** before install — if verification fails, the rest of the restore proceeds but the script is not reinstalled).
 
-**Encryption:** The backup is encrypted with AES-256-CBC (OpenSSL, PBKDF2 key derivation). The passphrase you set at export time is required to restore. There is no passphrase recovery option — a forgotten passphrase makes the backup permanently unreadable.
+**Encryption:** The backup is encrypted with AES-256-CBC (OpenSSL, PBKDF2 key derivation) and protected by an HMAC-SHA256 integrity check that detects tampering or corruption before any restore begins. The passphrase you set at export time is required to restore. There is no passphrase recovery option — a forgotten passphrase makes the backup permanently unreadable. Backups exported by versions ≤ 56 (no integrity check) can still be restored; a warning is shown.
 
 **Transfer workflow:**
 
