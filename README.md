@@ -406,9 +406,9 @@ Three monitors that run on a cron schedule and alert you via a shell command (e.
 
 **Re-alert policy:** alert on first detection, immediately when the list of affected services changes, and at most one reminder per 24 hours while the condition persists. No recovery (all-clear) message is sent. Alert state is volatile — after a reboot, an ongoing condition re-alerts once.
 
-Each alert is a single instance — re-running its wizard updates it. Alerts are included in Save / Load configuration.
+**Named instances:** you can install several alerts of the same type, each with its own name, threshold, notification route, and schedule — e.g. `disk [warn50]` sending an ntfy info at 50% **plus** `disk [crit85]` raising a StartOS error at 85%, or two backup staleness alerts watching different targets. Instances are fully independent: with disk at 87%, both of those example alerts are in alert state, each with its own daily reminder. Re-running an alert's wizard updates it; alerts installed before naming existed are migrated to a named instance the first time you edit them. Alerts are included in Save / Load configuration.
 
-Files: scripts at `/usr/local/bin/startos-monitor-<type>`; state and logs (volatile) under `/usr/local/share/startos-admin/`.
+Files: scripts at `/usr/local/bin/startos-monitor-<type>-<name>`; state and logs (volatile) under `/usr/local/share/startos-admin/`.
 
 </details>
 
