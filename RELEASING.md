@@ -45,3 +45,11 @@ the new key. Users must reinstall once via the curl command in the README.
 
 6. Commit `startos-admin.sh` and `startos-admin.sh.sig` together, push to
    `main`. Installed copies pick the release up at next launch.
+
+## CI safety net
+
+Every push runs `.github/workflows/ci.yml`, which verifies
+`startos-admin.sh.sig` against the public key embedded in the script (plus a
+shellcheck gate). If you change the script and forget step 4, the
+`release-signature` job goes red — fix it by re-signing and pushing the new
+`.sig`. Installed copies refuse unsigned releases, so never leave that job red.

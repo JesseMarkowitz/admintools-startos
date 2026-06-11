@@ -6,10 +6,11 @@
 # Menu:
 #   Display:  1. Disk used by services    2. System data    3. Memory used by services
 #   Create:   4. StartOS notification     5. Backup schedule    6. Stay-alive curl
-#   Manage:   7. Cron jobs                8. Notification forwarders
-#   Other:    9. Save / Load configuration   10. Documentation   11. Debug mode
+#   Manage:   7. Cron jobs                8. Notification forwarders   9. Staged changes
+#   Other:    10. Save / Load configuration   11. Documentation   12. Debug mode
+# CLI:        --version --help --update [--yes] --no-update-check | disk memory interfaces [svc]
 
-VERSION="58"   # integer — increment on each release
+VERSION="59"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -39,6 +40,10 @@ _CONFIG_BACKUP_FILE="/tmp/startos-config-backup.enc"
 # Root-only directory for secrets (backup passwords). Created mode 700 inside
 # chroot-and-upgrade so it persists across reboots; files inside are mode 600.
 _SECRET_DIR="/root/.startos-admin"
+# Staged-changes queue: blocks of chroot commands waiting to be applied in one
+# restart. Root-only (blocks can contain backup-password base64). Survives
+# script exit; lost on reboot (applying always reboots anyway).
+_STAGED_FILE="${_SECRET_DIR}/staged-changes"
 # Single source of truth for the published script location.
 _REPO_RAW_URL="https://raw.githubusercontent.com/JesseMarkowitz/admintools-startos/refs/heads/main/startos-admin.sh"
 # Public key used to verify release signatures (startos-admin.sh.sig) before
@@ -260,39 +265,264 @@ _backup_hmac() {
 }
 
 # ─────────────────────────────────────────────
+# Staged Changes (batch apply with one restart)
+# ─────────────────────────────────────────────
+# Each staged change is a block of fully-expanded shell commands — the exact
+# text the chroot-and-upgrade shell should execute — preceded by a marker line
+# "### STAGE: <label> | <timestamp>".
+
+# Number of staged change blocks in the queue.
+_staged_count() {
+    local c
+    c=$(sudo grep -c '^### STAGE: ' "$_STAGED_FILE" 2>/dev/null) || true
+    echo "${c:-0}"
+}
+
+# Print staged changes, one per line: "<n>. <label> | <timestamp>"
+_staged_labels() {
+    sudo grep '^### STAGE: ' "$_STAGED_FILE" 2>/dev/null | sed 's/^### STAGE: //' | nl -w2 -s'. '
+}
+
+# Append a change block to the queue.
+_stage_change() {
+    local label="$1" commands="$2"
+    local ts
+    ts=$(date '+%Y.%m.%d %H:%M:%S %Z')
+    sudo mkdir -p "$_SECRET_DIR"
+    sudo chmod 700 "$_SECRET_DIR"
+    { printf '### STAGE: %s | %s\n' "$label" "$ts"; printf '%s\n' "$commands"; } \
+        | sudo tee -a "$_STAGED_FILE" >/dev/null
+    sudo chmod 600 "$_STAGED_FILE"
+}
+
+_staged_clear() {
+    sudo rm -f "$_STAGED_FILE"
+}
+
+# Remove staged blocks by 1-based indices (comma-separated, pre-validated).
+_staged_delete() {
+    local indices="$1" tmp
+    tmp=$(mktemp)
+    # shellcheck disable=SC2024  # redirect target is our own mktemp file; sudo is only needed to READ the root-owned queue
+    sudo awk -v del="$indices" '
+        BEGIN { n=split(del,a,","); for(i=1;i<=n;i++) skip[a[i]]=1; blk=0 }
+        /^### STAGE: / { blk++ }
+        !(blk in skip) { print }
+    ' "$_STAGED_FILE" > "$tmp"
+    if [[ -s "$tmp" ]]; then
+        sudo cp "$tmp" "$_STAGED_FILE"
+        sudo chmod 600 "$_STAGED_FILE"
+    else
+        _staged_clear
+    fi
+    rm -f "$tmp"
+}
+
+# Run all staged blocks (+optional extra block) in ONE chroot session.
+# Blocks are stored fully expanded, so they are piped to the chroot shell
+# verbatim — never through an unquoted heredoc (no double expansion).
+# Clears the queue on success. Returns the chroot exit code.
+_staged_run_chroot() {
+    local extra="${1:-}"
+    local all
+    all=$(sudo cat "$_STAGED_FILE" 2>/dev/null) || true
+    if [[ -n "$extra" ]]; then
+        [[ -n "$all" ]] && all+=$'\n'
+        all+="$extra"
+    fi
+    local chroot_exit=0
+    printf '%s\nexit\n' "$all" | sudo /usr/lib/startos/scripts/chroot-and-upgrade || chroot_exit=$?
+    debug_log "chroot-and-upgrade exit: $chroot_exit"
+    if [[ $chroot_exit -eq 0 ]]; then
+        _staged_clear
+    fi
+    return $chroot_exit
+}
+
+# Chooser shown at the end of every mutating flow.
+# $1 = human-readable label, $2 = fully-expanded command block.
+# Returns 0 if applied or staged; 1 on cancel/back (callers: || return 1).
+_apply_or_stage() {
+    local label="$1" cmds="$2"
+    local pending
+    pending=$(_staged_count)
+
+    echo ""
+    echo -e "  ${BOLD}How do you want to apply this change?${NC}"
+    if [[ $pending -gt 0 ]]; then
+        echo -e "    ${BOLD}1)${NC} Apply now — includes your ${pending} staged change(s)  ${DIM}(server restarts)${NC}"
+    else
+        echo -e "    ${BOLD}1)${NC} Apply now  ${DIM}(server restarts)${NC}"
+    fi
+    echo -e "    ${BOLD}2)${NC} Stage for later  ${DIM}(apply several changes with one restart)${NC}"
+    echo ""
+    echo -e "    ${DIM}0) Cancel${NC}"
+    echo ""
+
+    local aos_choice
+    while true; do
+        _read aos_choice "  Choice [1/2/0]: " || return 1
+        case "$aos_choice" in
+            1)
+                _warn_restart "after the change(s) are applied."
+                if ! confirm "Proceed? (server will restart automatically)"; then
+                    [[ $_BACK -eq 1 ]] && return 1
+                    print_info "Cancelled."
+                    return 1
+                fi
+                print_success "Applying. Entering persistence mode now."
+                echo ""
+                local chroot_exit=0
+                _staged_run_chroot "$cmds" || chroot_exit=$?
+                if [[ $chroot_exit -eq 0 ]]; then
+                    print_success "Applied: ${label}"
+                    [[ $pending -gt 0 ]] && print_success "Also applied ${pending} previously staged change(s)."
+                    print_warn "The server will restart shortly — your SSH session will disconnect."
+                    return 0
+                fi
+                print_error "chroot-and-upgrade failed (exit $chroot_exit). Nothing was applied."
+                [[ $pending -gt 0 ]] && print_info "Previously staged change(s) remain queued; this change was not staged."
+                pause
+                return 1
+                ;;
+            2)
+                _stage_change "$label" "$cmds"
+                local n
+                n=$(_staged_count)
+                print_success "Staged: ${label}"
+                print_info "${n} change(s) pending — apply from main menu → 9) Staged changes."
+                print_warn "Staged changes are NOT active until applied, and are lost if the server reboots first."
+                pause
+                return 0
+                ;;
+            0)
+                print_info "Cancelled."
+                return 1
+                ;;
+            *) print_warn "Enter 1, 2, or 0." ;;
+        esac
+    done
+}
+
+# Staged-changes management submenu: view, apply all, delete selected.
+menu_staged_changes() {
+    while true; do
+        print_header
+        print_section "Staged Changes"
+        echo ""
+        local n
+        n=$(_staged_count)
+        if [[ $n -eq 0 ]]; then
+            print_info "No staged changes."
+            echo -e "  ${DIM}When finishing a change wizard, choose 'Stage for later' to queue it here.${NC}"
+            pause; return
+        fi
+
+        echo -e "  ${DIM}Staged changes are NOT active until applied. Applying restarts the server once.${NC}"
+        echo -e "  ${DIM}The queue survives exiting this script but is lost if the server reboots first.${NC}"
+        echo ""
+        _staged_labels | while IFS= read -r line; do
+            echo -e "  ${CYAN}${line}${NC}"
+        done
+        echo ""
+        echo -e "    ${BOLD}1)${NC} Apply all staged changes  ${DIM}(server restarts)${NC}"
+        echo -e "    ${BOLD}2)${NC} Delete staged change(s)"
+        echo ""
+        echo -e "    ${DIM}0) Back${NC}"
+        echo ""
+
+        local sc_choice
+        _read sc_choice "  $(echo -e "${BOLD}Choice:${NC} ")" || return 1
+        case "$sc_choice" in
+            1)
+                _warn_restart "after the staged changes are applied."
+                if ! confirm "Apply ${n} staged change(s)? (server will restart automatically)"; then
+                    [[ $_BACK -eq 1 ]] && return 1
+                    print_info "Cancelled."
+                    sleep 1; continue
+                fi
+                print_success "Applying staged changes. Entering persistence mode now."
+                echo ""
+                local chroot_exit=0
+                _staged_run_chroot "" || chroot_exit=$?
+                if [[ $chroot_exit -eq 0 ]]; then
+                    print_success "Applied ${n} staged change(s)."
+                    print_warn "The server will restart shortly — your SSH session will disconnect."
+                else
+                    print_error "chroot-and-upgrade failed (exit $chroot_exit). Staged changes remain queued."
+                fi
+                pause; return
+                ;;
+            2)
+                local del_sel
+                _read del_sel "  Delete which? [numbers comma-separated, or 'all']: " || return 1
+                if [[ "$del_sel" == "all" ]]; then
+                    if confirm "Delete ALL ${n} staged change(s)?"; then
+                        _staged_clear
+                        print_success "All staged changes deleted. (Nothing was applied.)"
+                    else
+                        [[ $_BACK -eq 1 ]] && return 1
+                    fi
+                    sleep 1; continue
+                fi
+                local valid=true sel_clean=()
+                IFS=',' read -ra parts <<< "$del_sel"
+                local part
+                for part in "${parts[@]}"; do
+                    part="${part// /}"
+                    if [[ "$part" =~ ^[0-9]+$ ]] && (( part >= 1 && part <= n )); then
+                        sel_clean+=("$part")
+                    else
+                        valid=false; break
+                    fi
+                done
+                if ! $valid || [[ ${#sel_clean[@]} -eq 0 ]]; then
+                    print_warn "Enter numbers 1-${n} comma-separated, or 'all'."
+                    sleep 1; continue
+                fi
+                local del_csv
+                del_csv=$(printf '%s\n' "${sel_clean[@]}" | sort -nu | paste -sd,)
+                if confirm "Delete staged change(s) ${del_csv}? (They will never be applied.)"; then
+                    _staged_delete "$del_csv"
+                    print_success "Deleted."
+                else
+                    [[ $_BACK -eq 1 ]] && return 1
+                fi
+                sleep 1
+                ;;
+            0) return ;;
+            *) print_warn "Enter 0-2." ; sleep 1 ;;
+        esac
+    done
+}
+
+# ─────────────────────────────────────────────
 # Cron Installation (Persistence via chroot-and-upgrade)
 # ─────────────────────────────────────────────
 
-# Install a cron job persistently using StartOS's chroot-and-upgrade mechanism.
-# Warns the user that the server will automatically restart, then:
-#   1. Writes the merged crontab (existing + new line) to a temp file in /tmp
-#   2. Enters chroot-and-upgrade and installs the crontab from that file
-#   3. Exits the chroot session (which triggers the automatic server restart)
+# Install a cron job persistently via _apply_or_stage (apply now or stage).
+# Builds the merged-crontab command block; values are base64-embedded so the
+# block is safe to store and to feed to the chroot shell verbatim.
 # Optional $3/$4: path + content of a root-only secret file (e.g. backup
-# password) written mode 600 inside the same chroot session as the cron line.
+# password) written mode 600 in the same chroot session as the cron line.
 install_cron_job() {
     local cron_line="$1"
     local action_label="${2:-startos-admin}"
     local secret_path="${3:-}"
     local secret_value="${4:-}"
 
-    # Duplicate check
+    # Duplicate check — active crontab AND the staged queue
     if sudo crontab -u root -l 2>/dev/null | grep -qF "$cron_line"; then
         print_warn "An identical cron job already exists. Skipping install."
         return 0
     fi
-
-    # Restart warning — shown before the point of no return
-    _warn_restart "after the cron job is installed."
-
-    if ! confirm "Proceed? (server will restart automatically)"; then
-        [[ $_BACK -eq 1 ]] && return 1
-        print_info "Cancelled."
-        return 1
+    if sudo grep -qF "$cron_line" "$_STAGED_FILE" 2>/dev/null; then
+        print_warn "An identical cron job is already staged. Skipping."
+        return 0
     fi
 
     # Build comment line, then base64-encode both comment and cron line so they
-    # can be safely embedded in the heredoc (no quoting issues with special chars).
+    # can be safely embedded in the command block (no quoting issues).
     local install_ts
     install_ts=$(date '+%Y.%m.%d %H:%M:%S %Z')
     local comment_line="# startos-admin v${VERSION} | Added: ${install_ts} | Action: ${action_label}"
@@ -301,7 +531,6 @@ install_cron_job() {
     encoded_line=$(printf '%s' "$cron_line" | base64 -w 0)
 
     # Optional secret file — written root-only in the same chroot session.
-    # The encoded value is alphanumeric base64, safe to embed.
     local secret_cmds=""
     if [[ -n "$secret_path" ]]; then
         local encoded_secret
@@ -313,29 +542,9 @@ chmod 600 ${secret_path}
 "
     fi
 
-    print_success "Cron job staged. Entering persistence mode now."
-    echo ""
-    debug_log "Installing cron entry: $cron_line"
-
-    # Feed commands into chroot-and-upgrade via heredoc.
-    # Encoded values are alphanumeric-only — safe in any shell context.
-    # The trailing `echo` after each base64 -d adds the required newline.
-    local chroot_exit=0
-    sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || chroot_exit=$?
-${secret_cmds}{ crontab -l 2>/dev/null; printf '%s' "$encoded_comment" | base64 -d; echo; printf '%s' "$encoded_line" | base64 -d; echo; } | crontab -
-exit
-EOF
-    debug_log "chroot-and-upgrade exit: $chroot_exit"
-
-    if [[ $chroot_exit -eq 0 ]]; then
-        print_success "Cron job installed persistently."
-        print_warn "The server will restart shortly — your SSH session will disconnect."
-        print_warn "After reconnecting, verify with: crontab -l"
-    else
-        print_error "chroot-and-upgrade failed (exit $chroot_exit). Cron job was not installed."
-        print_warn "Verify current crontab with: crontab -l"
-        pause
-    fi
+    debug_log "Cron entry: $cron_line"
+    local cmds="${secret_cmds}{ crontab -l 2>/dev/null; printf '%s' \"${encoded_comment}\" | base64 -d; echo; printf '%s' \"${encoded_line}\" | base64 -d; echo; } | crontab -"
+    _apply_or_stage "${action_label}: ${cron_line:0:60}" "$cmds" || return 1
 }
 
 # ─────────────────────────────────────────────
@@ -512,27 +721,11 @@ menu_disk_usage() {
 # Display Memory Used by Service
 # ─────────────────────────────────────────────
 
-# Display per-service memory usage and percentage of total RAM via start-cli package stats.
-menu_memory_usage() {
-    print_header
-    print_section "Memory Used by Service"
-    echo ""
-    print_info "Running: start-cli package stats"
-    debug_log "Running: start-cli package stats"
-    echo ""
-
-    local stats_output exit_code=0
-    stats_output=$(start-cli package stats 2>&1) || exit_code=$?
-    debug_log "start-cli package stats exit: $exit_code"
-
-    if [[ $exit_code -ne 0 ]]; then
-        print_error "Command failed (exit $exit_code)."
-        echo -e "${RED}${stats_output}${NC}"
-        pause; return
-    fi
-
-    # Reformat: strip table borders, drop Container ID column, sort by usage % desc, colorize
-    echo "$stats_output" | awk -v red="$RED" -v yellow="$YELLOW" -v nc="$NC" -v bold="$BOLD" '
+# Format `start-cli package stats` output: strip table borders, drop the
+# Container ID column, sort by usage % descending.
+# $1 = raw stats output; $2-$5 = red, yellow, nc, bold (empty = plain output).
+_format_pkg_stats() {
+    echo "$1" | awk -v red="${2:-}" -v yellow="${3:-}" -v nc="${4:-}" -v bold="${5:-}" '
     BEGIN { FS="|"; rc=0 }
     /^\+/ { next }
     /^\|/ {
@@ -562,6 +755,28 @@ menu_memory_usage() {
             printf "%s  %-22s %-12s %-14s %s%s\n", color, ns[i], us[i], ls[i], ps[i], nc
         }
     }'
+}
+
+# Display per-service memory usage and percentage of total RAM via start-cli package stats.
+menu_memory_usage() {
+    print_header
+    print_section "Memory Used by Service"
+    echo ""
+    print_info "Running: start-cli package stats"
+    debug_log "Running: start-cli package stats"
+    echo ""
+
+    local stats_output exit_code=0
+    stats_output=$(start-cli package stats 2>&1) || exit_code=$?
+    debug_log "start-cli package stats exit: $exit_code"
+
+    if [[ $exit_code -ne 0 ]]; then
+        print_error "Command failed (exit $exit_code)."
+        echo -e "${RED}${stats_output}${NC}"
+        pause; return
+    fi
+
+    _format_pkg_stats "$stats_output" "$RED" "$YELLOW" "$NC" "$BOLD"
     echo ""
     pause
 }
@@ -576,6 +791,12 @@ _cron_manage_flow() {
         print_header
         print_section "View / Edit Cron Jobs"
         echo ""
+        local _cm_pending
+        _cm_pending=$(_staged_count)
+        if [[ $_cm_pending -gt 0 ]]; then
+            print_warn "${_cm_pending} staged change(s) pending — not reflected below until applied."
+            echo ""
+        fi
 
         local cron_output exit_code=0
         cron_output=$(sudo crontab -u root -l 2>&1) || exit_code=$?
@@ -690,10 +911,12 @@ _cron_manage_flow() {
         done
         $bad && { sleep 1; continue; }
 
-        # Collect affected line numbers (including preceding comment tag for delete)
-        # For comment/uncomment, only the cron line itself is modified — tag line is untouched.
-        local -a affected_linenums=()
-        local -a target_linenums=()
+        # Build content-based command blocks (exact-line matching) so cron
+        # edits compose correctly when staged alongside other changes —
+        # line numbers would shift, exact text does not.
+        # cron_lines[] holds stripped text for disabled entries; the actual
+        # crontab line for those is "#" + text.
+        local cmds=""
         echo ""
         local action_verb
         case "$action_key" in
@@ -705,24 +928,47 @@ _cron_manage_flow() {
         for idx in "${selected_indices[@]}"; do
             local target_linenum="${cron_line_nums[$idx]}"
             local target_line="${cron_lines[$idx]}"
-            local prev_linenum=$(( target_linenum - 1 ))
-            local prev_line=""
-            [[ $prev_linenum -gt 0 ]] && prev_line=$(echo "$cron_output" | sed -n "${prev_linenum}p")
-            if [[ "$action_key" == "d" && "$prev_line" =~ ^# ]]; then
-                affected_linenums+=("$prev_linenum")
-                echo -e "  ${DIM}${prev_line}${NC}"
-            fi
-            affected_linenums+=("$target_linenum")
-            target_linenums+=("$target_linenum")
+            local actual_line="$target_line"
+            [[ "${cron_active[$idx]}" -eq 0 ]] && actual_line="#${target_line}"
+            local b64_actual b64_target
+            b64_actual=$(printf '%s' "$actual_line" | base64 -w 0)
+            b64_target=$(printf '%s' "$target_line" | base64 -w 0)
+
+            case "$action_key" in
+                d)
+                    # Also remove the preceding metadata comment, if any
+                    # (but never a disabled cron entry sitting above).
+                    local prev_linenum=$(( target_linenum - 1 ))
+                    local prev_line=""
+                    [[ $prev_linenum -gt 0 ]] && prev_line=$(echo "$cron_output" | sed -n "${prev_linenum}p")
+                    if [[ "$prev_line" =~ ^# && ! "$prev_line" =~ ^#[*/0-9] ]]; then
+                        local b64_prev
+                        b64_prev=$(printf '%s' "$prev_line" | base64 -w 0)
+                        cmds+="__t=\$(printf '%s' \"${b64_prev}\" | base64 -d); crontab -l 2>/dev/null | grep -vxF \"\$__t\" | crontab -
+"
+                        echo -e "  ${DIM}${prev_line}${NC}"
+                    fi
+                    cmds+="__t=\$(printf '%s' \"${b64_actual}\" | base64 -d); crontab -l 2>/dev/null | grep -vxF \"\$__t\" | crontab -
+"
+                    ;;
+                c)
+                    cmds+="__t=\$(printf '%s' \"${b64_actual}\" | base64 -d); crontab -l 2>/dev/null | while IFS= read -r __l; do if [ \"\$__l\" = \"\$__t\" ]; then printf '#%s\n' \"\$__l\"; else printf '%s\n' \"\$__l\"; fi; done | crontab -
+"
+                    ;;
+                e)
+                    cmds+="__t=\$(printf '%s' \"${b64_target}\" | base64 -d); crontab -l 2>/dev/null | while IFS= read -r __l; do if [ \"\$__l\" = \"#\$__t\" ]; then printf '%s\n' \"\$__t\"; else printf '%s\n' \"\$__l\"; fi; done | crontab -
+"
+                    ;;
+            esac
             echo -e "  ${CYAN}${target_line}${NC}"
         done
         echo ""
 
-        local confirm_msg
+        local confirm_msg label_verb
         case "$action_key" in
-            d) confirm_msg="Delete the selected cron job(s)?" ;;
-            c) confirm_msg="Comment out (disable) the selected cron job(s)?" ;;
-            e) confirm_msg="Enable (uncomment) the selected cron job(s)?" ;;
+            d) confirm_msg="Delete the selected cron job(s)?";              label_verb="Delete" ;;
+            c) confirm_msg="Comment out (disable) the selected cron job(s)?"; label_verb="Disable" ;;
+            e) confirm_msg="Enable (uncomment) the selected cron job(s)?";   label_verb="Enable" ;;
         esac
 
         if ! confirm "$confirm_msg"; then
@@ -732,77 +978,13 @@ _cron_manage_flow() {
             continue
         fi
 
-        local restart_verb
-        case "$action_key" in
-            d) restart_verb="the cron job(s) are deleted." ;;
-            c) restart_verb="the cron job(s) are disabled." ;;
-            e) restart_verb="the cron job(s) are enabled." ;;
-        esac
-        _warn_restart "after ${restart_verb}"
-
-        if ! confirm "Proceed? (server will restart automatically)"; then
-            [[ $_BACK -eq 1 ]] && return 1
-            print_info "Cancelled."
-            sleep 1
-            continue
-        fi
-
-        # Build sorted comma-separated line number strings for awk
-        local affected_lines target_lines
-        affected_lines=$(printf '%s\n' "${affected_linenums[@]}" | sort -nu | paste -sd,)
-        target_lines=$(printf '%s\n' "${target_linenums[@]}"   | sort -nu | paste -sd,)
-
-        local action_label chroot_exit=0
-        case "$action_key" in
-            d)
-                print_success "Deletion staged. Entering persistence mode now."
-                echo ""
-                debug_log "cron delete: line numbers=$affected_lines"
-                sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || chroot_exit=$?
-{ crontab -l 2>/dev/null || true; } | awk -v lines="$affected_lines" 'BEGIN{n=split(lines,a,",");for(i=1;i<=n;i++)skip[a[i]]=1} !(NR in skip){print}' | crontab -
-exit
-EOF
-                debug_log "chroot-and-upgrade exit: $chroot_exit"
-                action_label="deleted" ;;
-            c)
-                print_success "Disable staged. Entering persistence mode now."
-                echo ""
-                debug_log "cron disable: line numbers=$target_lines"
-                sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || chroot_exit=$?
-{ crontab -l 2>/dev/null || true; } | awk -v lines="$target_lines" 'BEGIN{n=split(lines,a,",");for(i=1;i<=n;i++)tog[a[i]]=1} NR in tog{print "#" $0;next} {print}' | crontab -
-exit
-EOF
-                debug_log "chroot-and-upgrade exit: $chroot_exit"
-                action_label="disabled" ;;
-            e)
-                print_success "Enable staged. Entering persistence mode now."
-                echo ""
-                debug_log "cron enable: line numbers=$target_lines"
-                sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || chroot_exit=$?
-{ crontab -l 2>/dev/null || true; } | awk -v lines="$target_lines" 'BEGIN{n=split(lines,a,",");for(i=1;i<=n;i++)tog[a[i]]=1} NR in tog{sub(/^#/,"");print;next} {print}' | crontab -
-exit
-EOF
-                debug_log "chroot-and-upgrade exit: $chroot_exit"
-                action_label="enabled" ;;
-        esac
-
-        if [[ $chroot_exit -eq 0 ]]; then
-            print_success "Cron job(s) ${action_label}."
-            print_warn "The server will restart shortly — your SSH session will disconnect."
+        local aos_label
+        if [[ ${#selected_indices[@]} -eq 1 ]]; then
+            aos_label="${label_verb} cron entry: ${cron_lines[${selected_indices[0]}]:0:50}"
         else
-            print_error "chroot-and-upgrade failed (exit $chroot_exit). Cron job(s) were not ${action_label}."
-            if [[ $_DEBUG -eq 1 ]]; then
-                local _c_path="/usr/lib/startos/scripts/chroot-and-upgrade"
-                if [[ -x "$_c_path" ]]; then
-                    debug_log "chroot-and-upgrade binary found and executable: $_c_path"
-                else
-                    debug_log "chroot-and-upgrade NOT found or not executable at: $_c_path"
-                fi
-            else
-                print_info "Enable debug mode (main menu → 11) and retry for more detail."
-            fi
-            pause
+            aos_label="${label_verb} ${#selected_indices[@]} cron entries"
         fi
+        _apply_or_stage "$aos_label" "$cmds" || return 1
         return
     done
 }
@@ -1264,44 +1446,25 @@ _backup_edit_flow() {
     local install_ts
     install_ts=$(date '+%Y.%m.%d %H:%M:%S %Z')
     local new_comment="# startos-admin v${VERSION} | Added: ${install_ts} | Action: Schedule Backups"
-    local enc_old_c enc_old_l enc_new_c enc_new_l
+    local enc_old_c enc_old_l enc_new_c enc_new_l enc_secret
     enc_old_c=$(printf '%s' "$old_comment"   | base64 -w 0)
     enc_old_l=$(printf '%s' "$old_cron_line" | base64 -w 0)
     enc_new_c=$(printf '%s' "$new_comment"   | base64 -w 0)
     enc_new_l=$(printf '%s' "$bw_full_line"  | base64 -w 0)
+    enc_secret=$(printf '%s' "$bw_password"  | base64 -w 0)
 
-    _warn_restart "after the backup schedule is updated."
-    if ! confirm "Proceed? (server will restart automatically)"; then
-        [[ $_BACK -eq 1 ]] && return 1
-        print_info "Cancelled."
-        return
-    fi
-
-    print_success "Replacement staged. Entering persistence mode now."
-    echo ""
     debug_log "Replacing backup schedule. Old comment: $old_comment"
-    local enc_secret
-    enc_secret=$(printf '%s' "$bw_password" | base64 -w 0)
-    local chroot_exit=0
-    sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || chroot_exit=$?
-mkdir -p ${_SECRET_DIR}
+    # old_c/old_l are expanded by the chroot shell at apply time (escaped \$);
+    # the encoded values are embedded now.
+    local cmds="mkdir -p ${_SECRET_DIR}
 chmod 700 ${_SECRET_DIR}
-printf '%s' "$enc_secret" | base64 -d > ${bw_secret_path}
+printf '%s' \"${enc_secret}\" | base64 -d > ${bw_secret_path}
 chmod 600 ${bw_secret_path}
-old_c=\$(printf '%s' "$enc_old_c" | base64 -d)
-old_l=\$(printf '%s' "$enc_old_l" | base64 -d)
-{ crontab -l 2>/dev/null | grep -vxF "\$old_c" | grep -vxF "\$old_l"; printf '%s' "$enc_new_c" | base64 -d; echo; printf '%s' "$enc_new_l" | base64 -d; echo; } | crontab -
-exit
-EOF
+old_c=\$(printf '%s' \"${enc_old_c}\" | base64 -d)
+old_l=\$(printf '%s' \"${enc_old_l}\" | base64 -d)
+{ crontab -l 2>/dev/null | grep -vxF \"\$old_c\" | grep -vxF \"\$old_l\"; printf '%s' \"${enc_new_c}\" | base64 -d; echo; printf '%s' \"${enc_new_l}\" | base64 -d; echo; } | crontab -"
 
-    if [[ $chroot_exit -eq 0 ]]; then
-        print_success "Backup schedule updated persistently."
-        print_warn "The server will restart shortly — your SSH session will disconnect."
-        print_warn "After reconnecting, verify with: crontab -l"
-    else
-        print_error "chroot-and-upgrade failed (exit $chroot_exit). Schedule may not have been updated."
-        pause
-    fi
+    _apply_or_stage "Edit backup schedule: ${bw_full_line:0:60}" "$cmds" || return 1
 }
 
 menu_schedule_backup() {
@@ -2153,43 +2316,21 @@ POLLER_BODY_END
     encoded_comment=$(printf '%s' "$cron_comment" | base64 -w 0)
     encoded_cron=$(printf '%s' "$cron_line" | base64 -w 0)
 
-    _warn_restart "after the forwarder is installed."
-
-    if ! confirm "Proceed? (server will restart automatically)"; then
-        [[ $_BACK -eq 1 ]] && return 1
-        print_info "Cancelled."
-        return 1
-    fi
-
-    print_success "Forwarder staged. Entering persistence mode now."
-    echo ""
     debug_log "Installing poller '$name' → ${_POLLER_BIN_PREFIX}${name}"
 
     # Remove any existing entry for this poller name, then write the new script
-    # and add the tagged comment + cron line. All in one chroot session.
+    # and add the tagged comment + cron line — all in one block.
     # mkdir -p here ensures the data dir exists so cron runs can write state/log
     # files. NOTE: files written there at runtime live in the volatile overlay
     # and are LOST on reboot — the forwarder re-seeds on its first post-boot run.
-    # \$0 in the heredoc → $0 for awk (the outer bash escapes \$ → $).
-    local chroot_exit=0
-    sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || chroot_exit=$?
-mkdir -p ${_STARTOS_DATA_DIR}
-{ crontab -l 2>/dev/null || true; } | awk -v t1="| Poller: ${name} |" -v t2="# startos-notif-poller-${name}" 'index(\$0,t1)||index(\$0,t2)==1{skip=1;next} skip{skip=0;next} {print}' | crontab -
-printf '%s' "$encoded_script" | base64 -d > ${_POLLER_BIN_PREFIX}${name}
+    # \$0 in the block → literal $0 for awk in the chroot shell.
+    local cmds="mkdir -p ${_STARTOS_DATA_DIR}
+{ crontab -l 2>/dev/null || true; } | awk -v t1=\"| Poller: ${name} |\" -v t2=\"# startos-notif-poller-${name}\" 'index(\$0,t1)||index(\$0,t2)==1{skip=1;next} skip{skip=0;next} {print}' | crontab -
+printf '%s' \"${encoded_script}\" | base64 -d > ${_POLLER_BIN_PREFIX}${name}
 chmod +x ${_POLLER_BIN_PREFIX}${name}
-{ crontab -l 2>/dev/null; printf '%s' "$encoded_comment" | base64 -d; echo; printf '%s' "$encoded_cron" | base64 -d; echo; } | crontab -
-exit
-EOF
-    debug_log "chroot-and-upgrade exit: $chroot_exit"
+{ crontab -l 2>/dev/null; printf '%s' \"${encoded_comment}\" | base64 -d; echo; printf '%s' \"${encoded_cron}\" | base64 -d; echo; } | crontab -"
 
-    if [[ $chroot_exit -eq 0 ]]; then
-        print_success "Forwarder '${name}' installed persistently."
-        print_warn "The server will restart shortly — your SSH session will disconnect."
-        print_warn "After reconnecting, test with: ${_POLLER_BIN_PREFIX}${name}"
-    else
-        print_error "chroot-and-upgrade failed (exit $chroot_exit). Forwarder was not installed."
-        pause
-    fi
+    _apply_or_stage "Install/update forwarder: ${name}" "$cmds" || return 1
 }
 
 # Wizard for removing a named poller
@@ -2249,15 +2390,8 @@ _poller_remove_flow() {
         pause; return
     fi
 
-    _warn_restart "after the forwarder(s) are removed."
-
-    if ! confirm "Proceed? (server will restart automatically)"; then
-        [[ $_BACK -eq 1 ]] && return 1
-        print_info "Cancelled."
-        return 1
-    fi
-
-    # Remove state files AFTER 2nd confirm — root-owned, not accessible inside chroot
+    # Remove state files now — they are volatile runtime files, wiped by the
+    # apply-reboot regardless, so removing early is harmless even when staging.
     for rname in "${names_to_remove[@]}"; do
         local state_file="${_POLLER_STATE_PREFIX}${rname}"
         if [[ -f "$state_file" ]]; then
@@ -2266,29 +2400,15 @@ _poller_remove_flow() {
         fi
     done
 
-    # Build chroot commands with names already substituted (avoids $0 escaping in heredoc)
-    local chroot_body=""
+    # Build the command block with names already substituted.
+    local cmds=""
     for rname in "${names_to_remove[@]}"; do
-        chroot_body+="crontab -l 2>/dev/null | grep -v 'startos-notif-poller-${rname}' | grep -Fv '| Poller: ${rname} |' | crontab -
+        cmds+="crontab -l 2>/dev/null | grep -v 'startos-notif-poller-${rname}' | grep -Fv '| Poller: ${rname} |' | crontab -
 rm -f ${_POLLER_BIN_PREFIX}${rname}
 "
     done
 
-    print_success "Removal staged. Entering persistence mode now."
-    echo ""
-
-    local chroot_exit=0
-    sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || chroot_exit=$?
-${chroot_body}exit
-EOF
-
-    if [[ $chroot_exit -eq 0 ]]; then
-        print_success "Removed: ${names_display}"
-        print_warn "The server will restart shortly — your SSH session will disconnect."
-    else
-        print_error "chroot-and-upgrade failed (exit $chroot_exit). Forwarder(s) may not have been fully removed."
-        pause
-    fi
+    _apply_or_stage "Remove forwarder(s): ${names_display}" "$cmds" || return 1
 }
 
 # Display the last 50 lines of a poller's log file.
@@ -2689,6 +2809,52 @@ _db_svc_detail() {
     pause
 }
 
+# Extract service interface URLs from a DB dump as TSV:
+# service<TAB>iface-name<TAB>type<TAB>network<TAB>url
+# $1 = db dump JSON, $2 = JSON array of service ids to include.
+_interfaces_tsv() {
+    echo "$1" | jq -r --argjson svcs "$2" '
+      .value.packageData | to_entries[] |
+      select(.key as $k | $svcs | index($k)) |
+      .key as $svc |
+      .value as $pkg |
+      $pkg.serviceInterfaces | to_entries[] |
+      .value as $iface |
+      $iface.addressInfo.hostId as $hostId |
+      $iface.addressInfo.suffix as $suffix |
+      $iface.addressInfo.scheme as $scheme |
+      $iface.addressInfo.sslScheme as $sslScheme |
+      # Walk bindings → addresses.available for the matched host
+      ($pkg.hosts[$hostId].bindings // {} | to_entries[].value.addresses.available[]?) as $a |
+      # Filter: skip loopback, internal bridge, link-local IPv6
+      select($a.metadata.gateway | . != "lo" and . != "lxcbr0") |
+      select(($a.metadata.kind == "ipv6" and ($a.hostname | startswith("fe80::"))) | not) |
+      # Wrap IPv6 in brackets
+      (if $a.metadata.kind == "ipv6" then "[" + $a.hostname + "]"
+       else $a.hostname end) as $host |
+      # Strip query params from suffix (hides embedded certs/macaroons)
+      ($suffix | split("?")[0]) as $safeSuffix |
+      # Build URL using ssl flag and interface scheme
+      (
+        if ($a.ssl and $sslScheme != null) then
+          $sslScheme + "://" + $host + ":" + ($a.port|tostring) + $safeSuffix
+        elif ($a.ssl | not) and ($scheme != null) then
+          $scheme + "://" + $host + ":" + ($a.port|tostring) + $safeSuffix
+        elif $a.ssl then
+          "ssl://" + $host + ":" + ($a.port|tostring) + $safeSuffix
+        else
+          "tcp://" + $host + ":" + ($a.port|tostring) + $safeSuffix
+        end
+      ) as $url |
+      # Network label
+      (if $a.metadata.gateway == "wg1" then "tunnel"
+       elif $a.metadata.gateway == null then "local"
+       else $a.metadata.gateway
+       end) as $net |
+      "\($svc)\t\($iface.name)\t\($iface.type)\t\($net)\t\($url)"
+    ' 2>/dev/null
+}
+
 # Display service interfaces (URLs) extracted from DB for selected services.
 _db_interfaces() {
     local db="$1"
@@ -2739,46 +2905,7 @@ _db_interfaces() {
 
     # Extract and display interfaces
     local output
-    output=$(echo "$db" | jq -r --argjson svcs "$jq_filter" '
-      .value.packageData | to_entries[] |
-      select(.key as $k | $svcs | index($k)) |
-      .key as $svc |
-      .value as $pkg |
-      $pkg.serviceInterfaces | to_entries[] |
-      .value as $iface |
-      $iface.addressInfo.hostId as $hostId |
-      $iface.addressInfo.suffix as $suffix |
-      $iface.addressInfo.scheme as $scheme |
-      $iface.addressInfo.sslScheme as $sslScheme |
-      # Walk bindings → addresses.available for the matched host
-      ($pkg.hosts[$hostId].bindings // {} | to_entries[].value.addresses.available[]?) as $a |
-      # Filter: skip loopback, internal bridge, link-local IPv6
-      select($a.metadata.gateway | . != "lo" and . != "lxcbr0") |
-      select(($a.metadata.kind == "ipv6" and ($a.hostname | startswith("fe80::"))) | not) |
-      # Wrap IPv6 in brackets
-      (if $a.metadata.kind == "ipv6" then "[" + $a.hostname + "]"
-       else $a.hostname end) as $host |
-      # Strip query params from suffix (hides embedded certs/macaroons)
-      ($suffix | split("?")[0]) as $safeSuffix |
-      # Build URL using ssl flag and interface scheme
-      (
-        if ($a.ssl and $sslScheme != null) then
-          $sslScheme + "://" + $host + ":" + ($a.port|tostring) + $safeSuffix
-        elif ($a.ssl | not) and ($scheme != null) then
-          $scheme + "://" + $host + ":" + ($a.port|tostring) + $safeSuffix
-        elif $a.ssl then
-          "ssl://" + $host + ":" + ($a.port|tostring) + $safeSuffix
-        else
-          "tcp://" + $host + ":" + ($a.port|tostring) + $safeSuffix
-        end
-      ) as $url |
-      # Network label
-      (if $a.metadata.gateway == "wg1" then "tunnel"
-       elif $a.metadata.gateway == null then "local"
-       else $a.metadata.gateway
-       end) as $net |
-      "\($svc)\t\($iface.name)\t\($iface.type)\t\($net)\t\($url)"
-    ' 2>/dev/null)
+    output=$(_interfaces_tsv "$db" "$jq_filter")
 
     if [[ -z "$output" ]]; then
         print_info "No interfaces found for selected services."
@@ -2860,8 +2987,10 @@ menu_documentation() {
         echo -e "    ${CYAN}${BOLD}6)${NC} Stay-alive curl"
         echo -e "    ${CYAN}${BOLD}7)${NC} Cron jobs"
         echo -e "    ${CYAN}${BOLD}8)${NC} Notification forwarders"
-        echo -e "    ${CYAN}${BOLD}9)${NC} Save / Load configuration"
-        echo -e "    ${CYAN}${BOLD}10)${NC} Troubleshooting"
+        echo -e "    ${CYAN}${BOLD}9)${NC} Staged changes"
+        echo -e "    ${CYAN}${BOLD}10)${NC} Save / Load configuration"
+        echo -e "    ${CYAN}${BOLD}11)${NC} Command line"
+        echo -e "    ${CYAN}${BOLD}12)${NC} Troubleshooting"
         echo ""
         echo -e "    ${DIM}0) Back${NC}"
         echo ""
@@ -3030,7 +3159,7 @@ menu_documentation() {
                 echo -e "    ${CYAN}•${NC} ${BOLD}Service Detail${NC} — full detail for a single service"
                 echo ""
                 pause ;;
-            10)
+            12)
                 print_header
                 print_section "Troubleshooting"
                 echo ""
@@ -3066,6 +3195,59 @@ menu_documentation() {
                 pause ;;
             9)
                 print_header
+                print_section "Staged Changes"
+                echo ""
+                echo -e "  Every change this tool makes (cron jobs, backup schedules, forwarders)"
+                echo -e "  requires a server restart to become persistent. Staging lets you queue"
+                echo -e "  several changes and apply them all with ${BOLD}one${NC} restart."
+                echo ""
+                echo -e "  At the end of each change wizard you choose:"
+                echo ""
+                echo -e "    ${CYAN}•${NC} ${BOLD}Apply now${NC} — restart immediately (any staged changes are included)"
+                echo -e "    ${CYAN}•${NC} ${BOLD}Stage for later${NC} — add to the queue, no restart yet"
+                echo ""
+                echo -e "  ${BOLD}From the Staged changes menu you can:${NC}"
+                echo ""
+                echo -e "    ${CYAN}•${NC} View the queue (label + when it was staged)"
+                echo -e "    ${CYAN}•${NC} Apply all staged changes  ${DIM}(one restart)${NC}"
+                echo -e "    ${CYAN}•${NC} Delete staged change(s)   ${DIM}(safe — they were never applied)${NC}"
+                echo ""
+                echo -e "  ${YELLOW}Important:${NC} staged changes are NOT active until applied. The queue"
+                echo -e "  survives exiting this script, but is ${BOLD}lost if the server reboots${NC}"
+                echo -e "  before you apply. Views (cron list, forwarder list) show only what is"
+                echo -e "  currently active — staged changes appear after they are applied."
+                echo ""
+                echo -e "  ${DIM}Queue file: ${_STAGED_FILE} (root-only)${NC}"
+                echo ""
+                pause ;;
+            11)
+                print_header
+                print_section "Command Line"
+                echo ""
+                echo -e "  startos-admin can be used non-interactively for scripting and monitoring:"
+                echo ""
+                echo -e "    ${CYAN}startos-admin --version${NC}            print version and exit"
+                echo -e "    ${CYAN}startos-admin --help${NC}               usage summary"
+                echo -e "    ${CYAN}startos-admin --no-update-check${NC}    skip the startup update check this launch"
+                echo -e "    ${CYAN}startos-admin --update${NC}             check for a signed update (does NOT install)"
+                echo -e "    ${CYAN}startos-admin --update --yes${NC}       install a verified update ${RED}(SERVER RESTARTS)${NC}"
+                echo ""
+                echo -e "  ${BOLD}Data commands${NC} (plain output, suitable for scripts):"
+                echo ""
+                echo -e "    ${CYAN}startos-admin disk${NC}                 disk usage by service"
+                echo -e "    ${CYAN}startos-admin memory${NC}               memory usage by service"
+                echo -e "    ${CYAN}startos-admin interfaces${NC}           all service interface URLs (tab-separated)"
+                echo -e "    ${CYAN}startos-admin interfaces nextcloud${NC} interfaces for one service"
+                echo ""
+                echo -e "  ${BOLD}--update exit codes:${NC}  0 up to date · 10 update available ·"
+                echo -e "  1 network failure · 3 signature verification failure"
+                echo ""
+                echo -e "  Updates installed via ${CYAN}--update --yes${NC} are signature-verified first, and"
+                echo -e "  include any staged changes in the same restart."
+                echo ""
+                pause ;;
+            10)
+                print_header
                 print_section "Save / Load Configuration"
                 echo ""
                 echo -e "  Saves your installed cron jobs and notification forwarders as a"
@@ -3092,7 +3274,7 @@ menu_documentation() {
                 echo ""
                 pause ;;
             0) return ;;
-            *) print_warn "Enter 0-10." ; sleep 1 ;;
+            *) print_warn "Enter 0-12." ; sleep 1 ;;
         esac
     done
 }
@@ -3417,6 +3599,13 @@ _config_restore_flow() {
     [[ $pcount -gt 0 ]] && \
         print_warn "Forwarder scripts with matching names will be overwritten."
     print_info "The latest startos-admin script will also be downloaded, signature-verified, and installed persistently."
+    local _lc_pending
+    _lc_pending=$(_staged_count)
+    if [[ $_lc_pending -gt 0 ]]; then
+        echo ""
+        print_warn "You have ${_lc_pending} staged change(s) pending. They will be LOST when the server"
+        print_warn "restarts for this load. Apply or delete them first (main menu → 9) if you need them."
+    fi
     echo ""
 
     # ── Confirmations ─────────────────────────────────────────────────────────
@@ -3542,6 +3731,12 @@ menu_config_backup_restore() {
 check_for_update() {
     local remote_version
 
+    # --no-update-check: skip the startup check entirely this launch
+    if [[ "${_SKIP_UPDATE_CHECK:-0}" -eq 1 ]]; then
+        debug_log "Update check skipped (--no-update-check)"
+        return 0
+    fi
+
     # ── First-run: not yet installed persistently ────────────────────────────
     local _script_path
     _script_path=$(realpath "$0" 2>/dev/null || echo "$0")
@@ -3559,14 +3754,14 @@ check_for_update() {
                 return 0
             fi
             echo ""
+            local _pending
+            _pending=$(_staged_count)
+            [[ $_pending -gt 0 ]] && print_info "Including ${_pending} staged change(s) in the same restart."
             local _encoded
             _encoded=$(base64 -w 0 < "$_script_path")
             local chroot_exit=0
-            sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || chroot_exit=$?
-printf '%s' "$_encoded" | base64 -d > /usr/local/bin/startos-admin
-chmod +x /usr/local/bin/startos-admin
-exit
-EOF
+            _staged_run_chroot "printf '%s' \"${_encoded}\" | base64 -d > /usr/local/bin/startos-admin
+chmod +x /usr/local/bin/startos-admin" || chroot_exit=$?
             if [[ $chroot_exit -eq 0 ]]; then
                 print_success "Installed. Server restarting — reconnect and run: startos-admin"
             else
@@ -3627,16 +3822,17 @@ EOF
     fi
     echo ""
 
+    local _pending
+    _pending=$(_staged_count)
+    [[ $_pending -gt 0 ]] && print_info "Including ${_pending} staged change(s) in the same restart."
+
     local encoded
     encoded=$(base64 -w 0 < "$verified_path")
     rm -rf "$(dirname "$verified_path")"
 
     local chroot_exit=0
-    sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || chroot_exit=$?
-printf '%s' "$encoded" | base64 -d > /usr/local/bin/startos-admin
-chmod +x /usr/local/bin/startos-admin
-exit
-EOF
+    _staged_run_chroot "printf '%s' \"${encoded}\" | base64 -d > /usr/local/bin/startos-admin
+chmod +x /usr/local/bin/startos-admin" || chroot_exit=$?
 
     if [[ $chroot_exit -eq 0 ]]; then
         print_success "Updated to v${remote_version}. Server restarting — reconnect and run: startos-admin"
@@ -3701,10 +3897,13 @@ main_menu() {
         print_header
         _nav_tip
         # Counts and labels for display
-        local _cron_n _fwd_arr _fwd_n _dbg_label
+        local _cron_n _fwd_arr _fwd_n _stg_n _dbg_label
         _cron_n=$(sudo crontab -u root -l 2>/dev/null | grep -c '^# startos-admin v' || true)
         _fwd_arr=("${_POLLER_BIN_PREFIX}"*)
         [[ -e "${_fwd_arr[0]}" ]] && _fwd_n=${#_fwd_arr[@]} || _fwd_n=0
+        _stg_n=$(_staged_count)
+        local _stg_label="${DIM}(${_stg_n})${NC}"
+        [[ $_stg_n -gt 0 ]] && _stg_label="${YELLOW}(${_stg_n} pending)${NC}"
         [[ $_DEBUG -eq 1 ]] && _dbg_label="${GREEN}ON${NC}" || _dbg_label="${DIM}OFF${NC}"
 
         echo -e "  ${BOLD}Select an action:${NC}"
@@ -3720,10 +3919,11 @@ main_menu() {
         echo -e "  ${DIM}Manage${NC}"
         echo -e "    ${CYAN}${BOLD}7)${NC} Cron jobs  ${DIM}(${_cron_n})${NC}"
         echo -e "    ${CYAN}${BOLD}8)${NC} Notification forwarders  ${DIM}(${_fwd_n})${NC}"
+        echo -e "    ${CYAN}${BOLD}9)${NC} Staged changes  ${_stg_label}"
         echo -e "  ${DIM}Other${NC}"
-        echo -e "    ${CYAN}${BOLD}9)${NC} Save / Load configuration"
-        echo -e "    ${CYAN}${BOLD}10)${NC} Documentation"
-        echo -e "    ${CYAN}${BOLD}11)${NC} Debug mode  ${DIM}(${NC}${_dbg_label}${DIM})${NC}"
+        echo -e "    ${CYAN}${BOLD}10)${NC} Save / Load configuration"
+        echo -e "    ${CYAN}${BOLD}11)${NC} Documentation"
+        echo -e "    ${CYAN}${BOLD}12)${NC} Debug mode  ${DIM}(${NC}${_dbg_label}${DIM})${NC}"
         echo ""
         echo -e "    ${DIM}0) Exit${NC}"
         echo ""
@@ -3739,21 +3939,143 @@ main_menu() {
             6) menu_schedule_stay_alive    || { _BACK=0; continue; } ;;
             7) menu_manage_crontab         || { _BACK=0; continue; } ;;
             8) menu_manage_notif_pollers   || { _BACK=0; continue; } ;;
-            9) menu_config_backup_restore  || { _BACK=0; continue; } ;;
-            10) menu_documentation         || { _BACK=0; continue; } ;;
-            11) menu_toggle_debug          || { _BACK=0; continue; } ;;
+            9) menu_staged_changes         || { _BACK=0; continue; } ;;
+            10) menu_config_backup_restore || { _BACK=0; continue; } ;;
+            11) menu_documentation         || { _BACK=0; continue; } ;;
+            12) menu_toggle_debug          || { _BACK=0; continue; } ;;
             0)
                 echo ""
+                if [[ $(_staged_count) -gt 0 ]]; then
+                    print_warn "$(_staged_count) staged change(s) are still pending. They survive exiting"
+                    print_warn "this script but are LOST if the server reboots before you apply them."
+                fi
                 print_info "Goodbye."
                 echo ""
                 exit 0
                 ;;
             *)
-                print_warn "Invalid choice. Enter 0-11."
+                print_warn "Invalid choice. Enter 0-12."
                 sleep 1
                 ;;
         esac
     done
+}
+
+# ─────────────────────────────────────────────
+# Non-Interactive CLI
+# ─────────────────────────────────────────────
+
+_usage() {
+    cat << EOF
+startos-admin v${VERSION} — StartOS server administration
+
+Usage:
+  startos-admin                     Interactive menu
+  startos-admin --version           Print version and exit
+  startos-admin --help              This help
+  startos-admin --no-update-check   Skip the startup update check this launch
+  startos-admin --update            Check for a signed update (does NOT install)
+  startos-admin --update --yes      Install a verified update (SERVER RESTARTS)
+  startos-admin disk                Disk usage by service (plain text)
+  startos-admin memory              Memory usage by service (plain text)
+  startos-admin interfaces [svc]    Service interface URLs (tab-separated:
+                                    service, interface, type, network, url)
+
+Exit codes for --update:
+  0 = up to date    10 = update available (not installed)
+  1 = network/download failure    3 = signature verification failure
+EOF
+}
+
+# Check for (and with --yes, install) a signed update. Never installs
+# anything that fails signature verification. Exits; never returns.
+_cli_update() {
+    local do_install="${1:-}"
+    local verified_path="" rc=0
+    _fetch_verified_script verified_path || rc=$?
+    if [[ $rc -eq 1 ]]; then
+        echo "ERROR: could not download the published script (network failure)." >&2
+        exit 1
+    elif [[ $rc -eq 2 ]]; then
+        echo "ERROR: published script FAILED signature verification — refusing to update." >&2
+        echo "This may indicate a compromised repository." >&2
+        exit 3
+    fi
+
+    local remote_version
+    remote_version=$(grep '^VERSION=' "$verified_path" | head -1 | tr -d '"' | cut -d= -f2 | awk '{print $1}') || true
+    if [[ -z "$remote_version" ]] || [[ "$remote_version" -le "$VERSION" ]] 2>/dev/null; then
+        rm -rf "$(dirname "$verified_path")"
+        echo "Up to date (v${VERSION})."
+        exit 0
+    fi
+
+    echo "Update available: v${remote_version} (you have v${VERSION}). Signature verified."
+    if [[ "$do_install" != "--yes" ]]; then
+        rm -rf "$(dirname "$verified_path")"
+        echo "Run 'startos-admin --update --yes' to install (server will restart)."
+        exit 10
+    fi
+
+    local encoded
+    encoded=$(base64 -w 0 < "$verified_path")
+    rm -rf "$(dirname "$verified_path")"
+    local pending
+    pending=$(_staged_count)
+    [[ $pending -gt 0 ]] && echo "Including ${pending} staged change(s) in the same restart."
+    local chroot_exit=0
+    _staged_run_chroot "printf '%s' \"${encoded}\" | base64 -d > /usr/local/bin/startos-admin
+chmod +x /usr/local/bin/startos-admin" || chroot_exit=$?
+    if [[ $chroot_exit -eq 0 ]]; then
+        echo "Updated to v${remote_version}. Server restarting."
+        exit 0
+    fi
+    echo "ERROR: install failed (chroot-and-upgrade exit ${chroot_exit})." >&2
+    exit 1
+}
+
+_cli_disk() {
+    local vol="/media/startos/data/package-data/volumes/"
+    df -h "$vol" 2>/dev/null || true
+    echo ""
+    sudo du -hd 1 "$vol" 2>/dev/null | sort -rh || true
+    exit 0
+}
+
+_cli_memory() {
+    local stats
+    if ! stats=$(start-cli package stats 2>&1); then
+        echo "ERROR: 'start-cli package stats' failed: ${stats}" >&2
+        exit 1
+    fi
+    _format_pkg_stats "$stats" "" "" "" ""
+    exit 0
+}
+
+_cli_interfaces() {
+    local svc="${1:-}"
+    local db
+    if ! db=$(start-cli db dump 2>&1); then
+        echo "ERROR: 'start-cli db dump' failed." >&2
+        exit 1
+    fi
+    local jq_filter
+    if [[ -n "$svc" ]]; then
+        jq_filter=$(printf '%s' "$svc" | jq -R . | jq -sc .)
+    else
+        jq_filter=$(echo "$db" | jq -c '.value.packageData | keys')
+    fi
+    local out
+    out=$(_interfaces_tsv "$db" "$jq_filter") || true
+    if [[ -z "$out" ]]; then
+        if [[ -n "$svc" ]]; then
+            echo "ERROR: no interfaces found for service '${svc}'." >&2
+            exit 1
+        fi
+        exit 0
+    fi
+    printf '%s\n' "$out"
+    exit 0
 }
 
 # ─────────────────────────────────────────────
@@ -3771,5 +4093,23 @@ if [[ ${#_missing[@]} -gt 0 ]]; then
     print_info "This script is intended to run on a StartOS server."
     exit 1
 fi
+
+_SKIP_UPDATE_CHECK=0
+case "${1:-}" in
+    "") : ;;
+    --version|-v)      echo "startos-admin v${VERSION}"; exit 0 ;;
+    --help|-h)         _usage; exit 0 ;;
+    --no-update-check) _SKIP_UPDATE_CHECK=1 ;;
+    --update)          _cli_update "${2:-}" ;;
+    disk)              _cli_disk ;;
+    memory)            _cli_memory ;;
+    interfaces)        _cli_interfaces "${2:-}" ;;
+    *)
+        echo "Unknown option: $1" >&2
+        echo "" >&2
+        _usage >&2
+        exit 2
+        ;;
+esac
 
 main_menu

@@ -9,7 +9,7 @@ Interactive administrative menu for StartOS servers.
 
 This tool is intended for StartOS Administrators who:
 
-- Want additional functionality not currently (February 2026) available in the graphical user interface
+- Want additional functionality not currently (June 2026) available in the graphical user interface
 - Prefer menu-driven administration over manual CLI use
 - Have SSH access to their server
 - For StartOS SSH information see: https://docs.start9.com/start-os/0.4.0.x/user-manual/ssh.html
@@ -23,7 +23,11 @@ This tool is intended for StartOS Administrators who:
 
 - SSH access to your StartOS server as the Start9 user
 - This was written for StartOS 040 (NOT 0351)
+- sudo privileges (the Start9 user has these by default)
+- `start-cli` available and authenticated (preinstalled on StartOS; most features use it)
 - `jq`, `curl`, and `openssl` (all preinstalled on StartOS; the script checks at startup)
+- bash 4.3 or newer (preinstalled on StartOS)
+- Outbound internet access — only needed for update checks, stay-alive curls, and webhook forwarding; everything else works offline
   
 </details>
 
@@ -39,7 +43,7 @@ Key risks and cautions:
 - **Root-level impact:** If you run this script as `root` (or via `sudo`), it can modify system state (e.g., write to `/usr/local/bin`, create/edit cron entries, create state files, make outbound HTTP requests). Mistakes or malicious changes could cause system damage or data loss.
 - **Not formally vetted or approved:** This project has **not** been heavily security-audited, formally reviewed, or approved by Start9/StartOS. It may contain bugs or unsafe assumptions.
 - **Backup password storage (S1 — mitigated):** When you schedule a backup, your StartOS primary password is stored in a root-only file (`/root/.startos-admin/backup-pass-<target>`, mode 600) that the cron job reads at backup time. It does **not** appear in the crontab. Residual exposure: the password is briefly visible in the process list (`ps`) while a backup is running, and the file remains if you later delete the backup cron entry (remove it manually with `sudo rm` if desired). Backups scheduled with versions ≤ 56 still have the password inline in the crontab — edit the schedule once to migrate it to the new format.
-- **Update integrity verification (S2 — mitigated):** Updates and restore-time downloads are verified against a signature (`startos-admin.sh.sig`) using a public key embedded in the script before anything is installed. A script that fails verification is never installed. Trust is anchored at first install (review the script you initially download); a compromised repository cannot push executable code without the private signing key, which is not stored in the repository.
+- **Update integrity verification (S2 — mitigated):** Updates and configuration-load downloads are verified against a signature (`startos-admin.sh.sig`) using a public key embedded in the script before anything is installed. A script that fails verification is never installed. Trust is anchored at first install (review the script you initially download); a compromised repository cannot push executable code without the private signing key, which is not stored in the repository.
 - **Input validation:** Webhook/stay-alive URLs and keyword filters are restricted to conservative character sets, and notification titles/messages are shell-escaped, so user input cannot inject commands into the root crontab or generated forwarder scripts. `%` is rejected in values that end up in cron lines (cron treats it as a newline).
 - **Outbound webhook/URL risk:** Features that `curl` a URL or POST to a webhook can leak metadata (timestamps, service names, notification text). Only use endpoints you trust, and prefer HTTPS.
 - **Use at your own risk:** You are responsible for reviewing the code and deciding whether to run it in your environment.
@@ -79,6 +83,30 @@ from anywhere on the system.
 ---
 
 <details>
+<summary><strong>Command-line usage</strong></summary>
+
+Besides the interactive menu, `startos-admin` can be used non-interactively:
+
+```
+startos-admin --version           Print version and exit
+startos-admin --help              Usage summary
+startos-admin --no-update-check   Skip the startup update check this launch
+startos-admin --update            Check for a signed update (does NOT install)
+startos-admin --update --yes      Install a verified update (SERVER RESTARTS)
+startos-admin disk                Disk usage by service (plain text)
+startos-admin memory              Memory usage by service (plain text)
+startos-admin interfaces [svc]    Service interface URLs (tab-separated)
+```
+
+`--update` exit codes: `0` up to date · `10` update available (not installed) · `1` network failure · `3` signature verification failure. Updates installed with `--update --yes` are signature-verified first and include any staged changes in the same restart.
+
+The data commands print plain/tab-separated output suitable for monitoring scripts, e.g. `startos-admin interfaces nextcloud | grep tor`.
+
+</details>
+
+---
+
+<details>
 <summary><strong>Persistence model</strong></summary>
 
 By default, StartOS does not persist changes across reboots.  This lets users easily recover from almost all issues by rebooting the server and the base StartOS code will execute cleanly.   
@@ -111,13 +139,16 @@ Notification Forwarders
 **Mandatory reboots**
 After making a change that will be persistent startos-admin will confirm you want to do this, then prompt again - reminding you that this will restart your StartOS server.
 
+**Staged changes (one reboot for many changes)**
+Instead of applying immediately, any change can be *staged*. Staged changes queue up (root-only file, not yet active) and are applied together with a single restart from the **Staged changes** menu. The queue survives exiting the script but is lost if the server reboots before you apply.
+
 </details>
 
 ---
 
 ### Actions
 
-The script presents an interactive menu with the following options, grouped into **Display**, **Create**, and **Manage**.
+The script presents an interactive menu with the following options, grouped into **Display**, **Create**, and **Manage**. Changes made by Create/Manage actions can be applied immediately (one restart each) or staged and applied together (see *Staged Changes*).
 
 
 ---
@@ -337,7 +368,28 @@ Forwarded messages are sent as plain text:
 ---
 
 <details>
-<summary><strong>9. Save / Load Configuration</strong></summary>
+<summary><strong>9. Staged Changes</strong></summary>
+
+Every change this tool makes (cron jobs, backup schedules, forwarders) requires a server restart to become persistent. Staging lets you queue several changes and apply them all with **one** restart.
+
+At the end of each change wizard you choose **Apply now** (restart immediately — any staged changes are included in the same restart) or **Stage for later** (add to the queue, no restart yet).
+
+From this menu you can:
+
+- View the queue (each entry shows what it does and when it was staged)
+- Apply all staged changes — one restart activates everything
+- Delete staged change(s) — safe, they were never applied
+
+**Important:** staged changes are NOT active until applied. Views (cron list, forwarder list) show only what is currently active. The queue survives exiting the script, but is **lost if the server reboots** before you apply.
+
+The queue is stored root-only at `/root/.startos-admin/staged-changes` (it can contain backup-password material).
+
+</details>
+
+---
+
+<details>
+<summary><strong>10. Save / Load Configuration</strong></summary>
 
 Saves your installed cron jobs and notification forwarders as a single AES-256 encrypted configuration file, and can load them back after an OS upgrade or reflash.
 
@@ -368,7 +420,7 @@ scp ./startos-config-backup.enc start9@<server-ip>:/tmp/
 1. SSH into the fresh server
 2. Download `startos-admin.sh` (see Install section above)
 3. Run it — when prompted to install persistently, you may decline; the Load step installs the latest version as part of the same reboot
-4. Navigate to **9) Save / Load configuration → 2) Load configuration**
+4. Navigate to **10) Save / Load configuration → 2) Load configuration**
 5. Follow the prompts; server restarts once with everything loaded
 
 </details>
@@ -376,7 +428,7 @@ scp ./startos-config-backup.enc start9@<server-ip>:/tmp/
 ---
 
 <details>
-<summary><strong>10. Documentation</strong></summary>
+<summary><strong>11. Documentation</strong></summary>
 
 Built-in documentation for every menu action, in the same order as the main menu, plus a troubleshooting guide.
 
@@ -385,7 +437,7 @@ Built-in documentation for every menu action, in the same order as the main menu
 ---
 
 <details>
-<summary><strong>11. Debug Mode</strong></summary>
+<summary><strong>12. Debug Mode</strong></summary>
 
 Toggles debug mode on or off.
 
