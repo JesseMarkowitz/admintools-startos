@@ -10,7 +10,7 @@
 #   Other:    11. Save / Load configuration   12. Documentation   13. Debug mode
 # CLI:        --version --help --update [--yes] --no-update-check | disk memory interfaces [svc]
 
-VERSION="62"   # integer — increment on each release
+VERSION="63"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -2010,11 +2010,14 @@ _poller_edit_flow() {
     done
     echo ""
 
+    echo -e "    ${DIM}0) Back${NC}"
+    echo ""
     local choice
     while true; do
-        _read choice "  Choice [1-$((i-1))]: " || return 1
+        _read choice "  Choice [1-$((i-1)), or 0 to go back]: " || return 1
+        [[ "$choice" == "0" ]] && return 0
         [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice < i )) && break
-        print_warn "Enter a number between 1 and $((i-1))."
+        print_warn "Enter a number between 1 and $((i-1)), or 0 to go back."
     done
     local poller_name="${script_names[$((choice-1))]}"
     local script_path="${_POLLER_BIN_PREFIX}${poller_name}"
@@ -2431,14 +2434,17 @@ _poller_view_log() {
     done
     echo ""
 
+    echo -e "    ${DIM}0) Back${NC}"
+    echo ""
     local log_choice
     while true; do
-        _read log_choice "  Choice [1-$((i-1))]: " || return 1
+        _read log_choice "  Choice [1-$((i-1)), or 0 to go back]: " || return 1
+        [[ "$log_choice" == "0" ]] && return 0
         if [[ "$log_choice" =~ ^[0-9]+$ ]] && \
            [[ "$log_choice" -ge 1 ]] && [[ "$log_choice" -lt "$i" ]]; then
             break
         fi
-        print_warn "Enter a number between 1 and $((i-1))."
+        print_warn "Enter a number between 1 and $((i-1)), or 0 to go back."
     done
 
     local log_name="${script_names[$((log_choice - 1))]}"
@@ -2480,11 +2486,14 @@ _poller_state_flow() {
     done
     echo ""
 
+    echo -e "    ${DIM}0) Back${NC}"
+    echo ""
     local choice
     while true; do
-        _read choice "  Choice [1-$((i-1))]: " || return 1
+        _read choice "  Choice [1-$((i-1)), or 0 to go back]: " || return 1
+        [[ "$choice" == "0" ]] && return 0
         [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice < i )) && break
-        print_warn "Enter a number between 1 and $((i-1))."
+        print_warn "Enter a number between 1 and $((i-1)), or 0 to go back."
     done
     local pname="${script_names[$((choice-1))]}"
     local state_file="${_POLLER_STATE_PREFIX}${pname}"
@@ -3403,11 +3412,14 @@ _monitor_edit_flow() {
     done <<< "$lines"
     echo ""
 
+    echo -e "    ${DIM}0) Back${NC}"
+    echo ""
     local choice
     while true; do
-        _read choice "  Choice [1-$((i-1))]: " || return 1
+        _read choice "  Choice [1-$((i-1)), or 0 to go back]: " || return 1
+        [[ "$choice" == "0" ]] && return 0
         [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice < i )) && break
-        print_warn "Enter a number between 1 and $((i-1))."
+        print_warn "Enter a number between 1 and $((i-1)), or 0 to go back."
     done
     local type="${e_types[$((choice-1))]}"
     local name="${e_names[$((choice-1))]}"
@@ -3527,11 +3539,14 @@ _monitor_view_log() {
         (( i++ ))
     done <<< "$lines"
     echo ""
+    echo -e "    ${DIM}0) Back${NC}"
+    echo ""
     local log_choice
     while true; do
-        _read log_choice "  Choice [1-$((i-1))]: " || return 1
+        _read log_choice "  Choice [1-$((i-1)), or 0 to go back]: " || return 1
+        [[ "$log_choice" == "0" ]] && return 0
         [[ "$log_choice" =~ ^[0-9]+$ ]] && (( log_choice >= 1 && log_choice < i )) && break
-        print_warn "Enter a number between 1 and $((i-1))."
+        print_warn "Enter a number between 1 and $((i-1)), or 0 to go back."
     done
     local log_idx=$((log_choice-1))
     local log_file="${_MONITOR_DATA_PREFIX}${l_suffixes[$log_idx]}.log"
