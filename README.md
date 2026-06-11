@@ -45,6 +45,7 @@ Key risks and cautions:
 - **Backup password storage (S1 — mitigated):** When you schedule a backup, your StartOS primary password is stored in a root-only file (`/root/.startos-admin/backup-pass-<target>`, mode 600) that the cron job reads at backup time. It does **not** appear in the crontab. Residual exposure: the password is briefly visible in the process list (`ps`) while a backup is running, and the file remains if you later delete the backup cron entry (remove it manually with `sudo rm` if desired). Backups scheduled with versions ≤ 56 still have the password inline in the crontab — edit the schedule once to migrate it to the new format.
 - **Update integrity verification (S2 — mitigated):** Updates and configuration-load downloads are verified against a signature (`startos-admin.sh.sig`) using a public key embedded in the script before anything is installed. A script that fails verification is never installed. Trust is anchored at first install (review the script you initially download); a compromised repository cannot push executable code without the private signing key, which is not stored in the repository.
 - **Input validation:** Webhook/stay-alive URLs and keyword filters are restricted to conservative character sets, and notification titles/messages are shell-escaped, so user input cannot inject commands into the root crontab or generated forwarder scripts. `%` is rejected in values that end up in cron lines (cron treats it as a newline).
+- **Alert/post-action shell commands run as root:** commands you configure for alerts and post-backup/cron actions execute as root via cron, by design. Only enter commands you trust — they have the same power as anything else you run with sudo.
 - **Outbound webhook/URL risk:** Features that `curl` a URL or POST to a webhook can leak metadata (timestamps, service names, notification text). Only use endpoints you trust, and prefer HTTPS.
 - **Use at your own risk:** You are responsible for reviewing the code and deciding whether to run it in your environment.
 
@@ -129,6 +130,10 @@ Cron jobs (created by scheduling actions):
 
 Backup passwords (created by Schedule Backups):
 - Stored root-only at `/root/.startos-admin/backup-pass-<target>` (mode 600, persistent via chroot)
+
+Alert monitors (created by Alerts):
+- Monitor executables are installed in `/usr/local/bin/` (persistent via chroot)
+- Alert state and log files are **volatile** — lost on reboot; an ongoing condition re-alerts once after a reboot
 
 Notification Forwarders
 - Forwarding executables are installed in `/usr/local/bin/` (persistent via chroot)
@@ -389,7 +394,28 @@ The queue is stored root-only at `/root/.startos-admin/staged-changes` (it can c
 ---
 
 <details>
-<summary><strong>10. Save / Load Configuration</strong></summary>
+<summary><strong>10. Alerts</strong></summary>
+
+Three monitors that run on a cron schedule and alert you via a shell command (e.g. webhook), a StartOS notification, or both:
+
+- **Disk usage alert** — fires when disk usage reaches your percent threshold.
+- **Backup staleness alert** — fires when any service has not been backed up within your day threshold. Services that have never been backed up count as stale; you can exclude services that are intentionally not backed up. One message lists **all** stale services, e.g. `Backup staleness: 2 service(s) exceed 7 day(s): nextcloud (9 days), vaultwarden (never)`.
+- **Service health watchdog** — fires when a service that should be running has failing health checks or is not running, only after the problem persists across two consecutive checks (avoids noise from restarts and updates).
+
+**Shell command contract:** the alert text is provided in the `$MSG` environment variable — e.g. `curl -d "$MSG" https://ntfy.sh/Your-Topic`. Commands run as root via cron (same trust level as your cron jobs).
+
+**Re-alert policy:** alert on first detection, immediately when the list of affected services changes, and at most one reminder per 24 hours while the condition persists. No recovery (all-clear) message is sent. Alert state is volatile — after a reboot, an ongoing condition re-alerts once.
+
+Each alert is a single instance — re-running its wizard updates it. Alerts are included in Save / Load configuration.
+
+Files: scripts at `/usr/local/bin/startos-monitor-<type>`; state and logs (volatile) under `/usr/local/share/startos-admin/`.
+
+</details>
+
+---
+
+<details>
+<summary><strong>11. Save / Load Configuration</strong></summary>
 
 Saves your installed cron jobs and notification forwarders as a single AES-256 encrypted configuration file, and can load them back after an OS upgrade or reflash.
 
@@ -397,6 +423,7 @@ Saves your installed cron jobs and notification forwarders as a single AES-256 e
 - All root cron entries
 - All notification forwarder scripts (including embedded webhook URLs and schedules)
 - All scheduled-backup password files (root-only secrets, carried inside the encrypted file)
+- All alert monitor scripts (disk usage, backup staleness, service health)
 
 **Load reinstalls** everything in a single reboot: cron jobs, notification forwarder scripts, backup password files, and the `startos-admin` script itself (downloaded fresh from GitHub and **signature-verified** before install — if verification fails, the rest of the load proceeds but the script is not reinstalled).
 
@@ -420,7 +447,7 @@ scp ./startos-config-backup.enc start9@<server-ip>:/tmp/
 1. SSH into the fresh server
 2. Download `startos-admin.sh` (see Install section above)
 3. Run it — when prompted to install persistently, you may decline; the Load step installs the latest version as part of the same reboot
-4. Navigate to **10) Save / Load configuration → 2) Load configuration**
+4. Navigate to **11) Save / Load configuration → 2) Load configuration**
 5. Follow the prompts; server restarts once with everything loaded
 
 </details>
@@ -428,7 +455,7 @@ scp ./startos-config-backup.enc start9@<server-ip>:/tmp/
 ---
 
 <details>
-<summary><strong>11. Documentation</strong></summary>
+<summary><strong>12. Documentation</strong></summary>
 
 Built-in documentation for every menu action, in the same order as the main menu, plus a troubleshooting guide.
 
@@ -437,7 +464,7 @@ Built-in documentation for every menu action, in the same order as the main menu
 ---
 
 <details>
-<summary><strong>12. Debug Mode</strong></summary>
+<summary><strong>13. Debug Mode</strong></summary>
 
 Toggles debug mode on or off.
 

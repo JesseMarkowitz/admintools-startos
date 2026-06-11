@@ -6,11 +6,11 @@
 # Menu:
 #   Display:  1. Disk used by services    2. System data    3. Memory used by services
 #   Create:   4. StartOS notification     5. Backup schedule    6. Stay-alive curl
-#   Manage:   7. Cron jobs                8. Notification forwarders   9. Staged changes
-#   Other:    10. Save / Load configuration   11. Documentation   12. Debug mode
+#   Manage:   7. Cron jobs   8. Notification forwarders   9. Staged changes   10. Alerts
+#   Other:    11. Save / Load configuration   12. Documentation   13. Debug mode
 # CLI:        --version --help --update [--yes] --no-update-check | disk memory interfaces [svc]
 
-VERSION="59"   # integer — increment on each release
+VERSION="60"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -33,6 +33,10 @@ _POLLER_BIN_PREFIX="/usr/local/bin/startos-notif-poller-"
 _STARTOS_DATA_DIR="/usr/local/share/startos-admin"
 _POLLER_STATE_PREFIX="${_STARTOS_DATA_DIR}/startos-admin-poller-state-"
 _POLLER_LOG_PREFIX="${_STARTOS_DATA_DIR}/startos-notif-poller-"
+# Alert monitors (disk / backup-age / health) — one singleton script per type.
+_MONITOR_BIN_PREFIX="/usr/local/bin/startos-monitor-"
+_MONITOR_DATA_PREFIX="${_STARTOS_DATA_DIR}/startos-monitor-"
+_MONITOR_VOLUMES_PATH="/media/startos/data/package-data/volumes/"
 # Full path to start-cli — resolved once so cron jobs and generated scripts
 # embed the absolute path and don't depend on cron's minimal PATH.
 _START_CLI=$(command -v start-cli 2>/dev/null || echo "start-cli")
@@ -2584,6 +2588,764 @@ menu_manage_notif_pollers() {
 }
 
 # ─────────────────────────────────────────────
+# Alerts (disk usage / backup staleness / service health)
+# ─────────────────────────────────────────────
+# Each alert is a singleton generated script /usr/local/bin/startos-monitor-<type>
+# run by a tagged cron entry. Re-alert policy: alert on first detection, on
+# offender-list change, and at most one reminder per 24h while the condition
+# persists. No recovery messages. State is volatile (one repeat after reboot).
+
+_MONITOR_TYPES=(disk backup-age health)
+
+_monitor_label() {
+    case "$1" in
+        disk)       echo "Disk usage alert" ;;
+        backup-age) echo "Backup staleness alert" ;;
+        health)     echo "Service health watchdog" ;;
+    esac
+}
+
+_monitor_title() {
+    case "$1" in
+        disk)       echo "Disk Usage Alert" ;;
+        backup-age) echo "Backup Staleness Alert" ;;
+        health)     echo "Service Health Alert" ;;
+    esac
+}
+
+# Read config vars from an installed monitor script.
+# Usage: _monitor_read_config path threshold_ref shellcmd_ref startos_ref level_ref excludes_ref
+_monitor_read_config() {
+    local _mrc_path="$1"
+    local -n _mrc_thr="$2" _mrc_cmd="$3" _mrc_sos="$4" _mrc_lvl="$5" _mrc_exc="$6"
+    _mrc_thr=$(grep '^THRESHOLD='        "$_mrc_path" 2>/dev/null | cut -d'"' -f2)
+    local _mrc_b64
+    _mrc_b64=$(grep '^NOTIFY_SHELL_B64=' "$_mrc_path" 2>/dev/null | cut -d'"' -f2)
+    _mrc_cmd=""
+    [[ -n "$_mrc_b64" ]] && _mrc_cmd=$(printf '%s' "$_mrc_b64" | base64 -d 2>/dev/null)
+    _mrc_sos=$(grep '^NOTIFY_STARTOS='   "$_mrc_path" 2>/dev/null | cut -d'"' -f2)
+    _mrc_lvl=$(grep '^NOTIF_LEVEL='      "$_mrc_path" 2>/dev/null | cut -d'"' -f2)
+    _mrc_exc=$(grep '^EXCLUDES='         "$_mrc_path" 2>/dev/null | cut -d'"' -f2)
+}
+
+# Current cron schedule for an installed monitor (empty if not found).
+_monitor_read_schedule() {
+    sudo crontab -u root -l 2>/dev/null \
+        | grep "^[^#]*${_MONITOR_BIN_PREFIX}${1}" \
+        | awk '{print $1,$2,$3,$4,$5}'
+}
+
+# Generic schedule preset picker.
+# $1 = nameref out; remaining args = alternating "label" "cron-expr" pairs.
+_pick_monitor_schedule() {
+    local -n _pms_out="$1"; shift
+    local -a labels=() exprs=()
+    while [[ $# -ge 2 ]]; do
+        labels+=("$1"); exprs+=("$2"); shift 2
+    done
+    local n=${#labels[@]}
+    echo ""
+    echo -e "  ${BOLD}Select check schedule:${NC}"
+    local i
+    for i in "${!labels[@]}"; do
+        echo -e "    ${BOLD}$((i+1)))${NC} ${labels[$i]}  ${DIM}(${exprs[$i]})${NC}"
+    done
+    echo -e "    ${BOLD}$((n+1)))${NC} Custom cron expression"
+    echo ""
+    local c
+    while true; do
+        _read c "  Choice [1-$((n+1))]: " || return 1
+        if [[ "$c" =~ ^[0-9]+$ ]] && (( c >= 1 && c <= n )); then
+            _pms_out="${exprs[$((c-1))]}"
+            return 0
+        elif [[ "$c" == "$((n+1))" ]]; then
+            _read _pms_out "  Enter cron expression (e.g. 0 */6 * * *): " || return 1
+            if [[ -z "$_pms_out" ]]; then
+                print_warn "Expression cannot be empty."
+            elif _validate_cron_expr "$_pms_out"; then
+                return 0
+            fi
+        else
+            print_warn "Enter 1-$((n+1))."
+        fi
+    done
+}
+
+# Notification method picker for monitors: shell command / StartOS / both.
+# The alert text is dynamic, so the shell command receives it as $MSG.
+# Sets namerefs: shell_cmd (raw, empty = none), startos (0/1), level.
+# Optional $4/$5/$6 = current values for prefill (edit flow).
+_pick_monitor_notify() {
+    local -n _pmn_cmd="$1" _pmn_sos="$2" _pmn_lvl="$3"
+    local _pmn_def_cmd="${4:-}" _pmn_def_sos="${5:-}" _pmn_def_lvl="${6:-}"
+    _pmn_cmd=""; _pmn_sos=0; _pmn_lvl="warning"
+
+    echo ""
+    echo -e "  ${BOLD}How should this alert notify you?${NC}"
+    echo -e "    ${BOLD}1)${NC} Shell command  ${DIM}(e.g. webhook)${NC}"
+    echo -e "    ${BOLD}2)${NC} StartOS notification"
+    echo -e "    ${BOLD}3)${NC} Both"
+    local _pmn_has_def=0
+    if [[ -n "$_pmn_def_cmd" || "$_pmn_def_sos" == "1" ]]; then
+        _pmn_has_def=1
+        local _pmn_desc=""
+        [[ -n "$_pmn_def_cmd" ]] && _pmn_desc="shell: ${_pmn_def_cmd:0:40}"
+        [[ "$_pmn_def_sos" == "1" ]] && _pmn_desc="${_pmn_desc}${_pmn_desc:+ + }StartOS ${_pmn_def_lvl}"
+        echo -e "    ${BOLD}4)${NC} Keep current  ${DIM}(${_pmn_desc})${NC}"
+    fi
+    echo ""
+
+    local _pmn_mode=""
+    while true; do
+        _read _pmn_mode "  Choice [1-3${_pmn_has_def:+/4}]: " || return 1
+        case "$_pmn_mode" in
+            1|2|3) break ;;
+            4) if [[ $_pmn_has_def -eq 1 ]]; then
+                   _pmn_cmd="$_pmn_def_cmd"
+                   _pmn_sos="${_pmn_def_sos:-0}"
+                   _pmn_lvl="${_pmn_def_lvl:-warning}"
+                   return 0
+               fi
+               print_warn "Enter 1, 2, or 3." ;;
+            *) print_warn "Enter 1, 2, or 3${_pmn_has_def:+, or 4 to keep current}." ;;
+        esac
+    done
+
+    if [[ "$_pmn_mode" == "1" || "$_pmn_mode" == "3" ]]; then
+        echo ""
+        echo -e "  ${DIM}The alert text is provided in the \$MSG environment variable.${NC}"
+        echo -e "  ${DIM}Example:  curl -d \"\$MSG\" https://ntfy.sh/Your-Topic${NC}"
+        while true; do
+            _read _pmn_cmd "  Shell command: " || return 1
+            [[ -n "$_pmn_cmd" ]] && break
+            print_warn "Command cannot be empty."
+        done
+        local _pmn_test
+        _read _pmn_test "  Test this command now with a sample message? [y/N]: " || return 1
+        if [[ "${_pmn_test,,}" == "y" ]]; then
+            echo ""
+            print_info "Running with MSG=\"TEST: sample alert from startos-admin\""
+            local _pmn_test_exit=0
+            MSG="TEST: sample alert from startos-admin" bash -c "$_pmn_cmd" || _pmn_test_exit=$?
+            echo ""
+            if [[ $_pmn_test_exit -eq 0 ]]; then
+                print_success "Command exited 0 (success)."
+            else
+                print_warn "Command exited $_pmn_test_exit. Check the output above."
+            fi
+        fi
+    fi
+
+    if [[ "$_pmn_mode" == "2" || "$_pmn_mode" == "3" ]]; then
+        _pmn_sos=1
+        echo ""
+        echo -e "  ${BOLD}StartOS notification level:${NC}"
+        echo -e "    ${BOLD}1)${NC} ${CYAN}info${NC}  ${BOLD}2)${NC} ${YELLOW}warning${NC}  ${BOLD}3)${NC} ${RED}error${NC}"
+        echo ""
+        local _pmn_lc
+        while true; do
+            _read _pmn_lc "  Choice [1-3, default 2]: " || return 1
+            case "${_pmn_lc:-2}" in
+                1) _pmn_lvl="info";    break ;;
+                2) _pmn_lvl="warning"; break ;;
+                3) _pmn_lvl="error";   break ;;
+                *) print_warn "Enter 1, 2, or 3." ;;
+            esac
+        done
+    fi
+    return 0
+}
+
+# Build the full generated-script content for a monitor type.
+# $1=type $2=threshold $3=excludes-csv $4=shell_cmd(raw) $5=startos(0/1) $6=level
+_monitor_script_content() {
+    local type="$1" threshold="$2" excludes="$3" shell_cmd="$4" startos="$5" level="$6"
+    local shell_b64=""
+    [[ -n "$shell_cmd" ]] && shell_b64=$(printf '%s' "$shell_cmd" | base64 -w 0)
+    local title
+    title=$(_monitor_title "$type")
+
+    # Config block — values are expanded NOW and embedded. All values are
+    # validated/derived (digits, csv of package ids, base64, fixed sets), so
+    # double-quoted embedding is safe.
+    printf '%s\n' "#!/bin/bash
+# StartOS Alert Monitor — generated by startos-admin.sh
+# Monitor: ${type}
+# Re-run startos-admin (main menu → 10, Alerts) to update this configuration.
+MONITOR_TYPE=\"${type}\"
+THRESHOLD=\"${threshold}\"
+EXCLUDES=\"${excludes}\"
+NOTIFY_SHELL_B64=\"${shell_b64}\"
+NOTIFY_STARTOS=\"${startos}\"
+NOTIF_LEVEL=\"${level}\"
+NOTIF_TITLE=\"${title}\"
+VOLUMES_PATH=\"${_MONITOR_VOLUMES_PATH}\"
+STATE_FILE=\"${_MONITOR_DATA_PREFIX}${type}.state\"
+LOG_FILE=\"${_MONITOR_DATA_PREFIX}${type}.log\"
+START_CLI=\"${_START_CLI}\"
+REMIND_SECS=86400
+LOG_MAX_LINES=2000
+DEBUG=0
+[ -f ${_STARTOS_DATA_DIR}/debug ] && DEBUG=1"
+
+    # Common preamble — PATH, timestamp, log self-truncation
+    cat << 'MON_PRE_END'
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+_ts() { date '+%Y.%m.%d %H:%M:%S %Z'; }
+if [ -f "$LOG_FILE" ]; then
+    _LC=$(wc -l < "$LOG_FILE" 2>/dev/null || echo 0)
+    if [ "$_LC" -gt "$LOG_MAX_LINES" ]; then
+        _TMP=$(mktemp)
+        tail -n "$LOG_MAX_LINES" "$LOG_FILE" > "$_TMP" && cat "$_TMP" > "$LOG_FILE"
+        rm -f "$_TMP"
+        echo "$(_ts): NOTICE log truncated to last $LOG_MAX_LINES lines (was $_LC)"
+    fi
+fi
+MON_PRE_END
+
+    # Type-specific check — must set CONDITION (0/1), MSG, FPRINT
+    case "$type" in
+        disk)
+            cat << 'MON_DISK_END'
+# ── Check: disk usage ───────────────────────────────────────────────────────
+PCT=$(df --output=pcent "$VOLUMES_PATH" 2>/dev/null | tail -1 | tr -d ' %')
+if ! [[ "$PCT" =~ ^[0-9]+$ ]]; then
+    echo "$(_ts): ERROR — could not read disk usage for $VOLUMES_PATH"
+    exit 0
+fi
+CONDITION=0; MSG=""; FPRINT=""
+if [ "$PCT" -ge "$THRESHOLD" ]; then
+    set -- $(df -h --output=size,used,avail "$VOLUMES_PATH" 2>/dev/null | tail -1)
+    SIZE="${1:-?}"; USED="${2:-?}"; AVAIL="${3:-?}"
+    CONDITION=1
+    FPRINT="over-${THRESHOLD}"
+    MSG="Disk usage ${PCT}% has reached your ${THRESHOLD}% alert threshold (used ${USED} of ${SIZE}, ${AVAIL} available)"
+fi
+echo "$(_ts): usage ${PCT}% / threshold ${THRESHOLD}%"
+MON_DISK_END
+            ;;
+        backup-age)
+            cat << 'MON_BAGE_END'
+# ── Check: backup staleness ──────────────────────────────────────────────────
+DB=$("$START_CLI" db dump 2>&1)
+if [ $? -ne 0 ] || [ -z "$DB" ]; then
+    echo "$(_ts): ERROR — start-cli db dump failed"
+    exit 0
+fi
+NOW=$(date +%s)
+OFFENDERS=$(echo "$DB" | jq -r --argjson now "$NOW" --argjson days "$THRESHOLD" --arg excl ",${EXCLUDES}," '
+  .value.packageData | to_entries[]
+  | .key as $k
+  | select(($excl | contains("," + $k + ",")) | not)
+  | {id: $k, lb: .value.lastBackup}
+  | if .lb == null then "\(.id)\tnever"
+    else (
+      (try (.lb | sub("\\..*Z$"; "Z") | fromdateiso8601) catch null) as $t
+      | if $t == null then "\(.id)\tbackup date unreadable"
+        else ((($now - $t) / 86400 | floor) as $age
+          | if $age > $days then "\(.id)\t\($age) days" else empty end)
+        end)
+    end')
+CONDITION=0; MSG=""; FPRINT=""
+if [ -n "$OFFENDERS" ]; then
+    CONDITION=1
+    COUNT=$(printf '%s\n' "$OFFENDERS" | wc -l)
+    LIST=$(printf '%s\n' "$OFFENDERS" | awk -F'\t' '{printf "%s%s (%s)", (NR>1?", ":""), $1, $2}')
+    FPRINT=$(printf '%s\n' "$OFFENDERS" | awk -F'\t' '{print $1}' | sort | paste -sd, -)
+    MSG="Backup staleness: ${COUNT} service(s) exceed ${THRESHOLD} day(s): ${LIST}"
+fi
+echo "$(_ts): stale services: ${FPRINT:-none}"
+MON_BAGE_END
+            ;;
+        health)
+            cat << 'MON_HEALTH_END'
+# ── Check: service health ────────────────────────────────────────────────────
+DB=$("$START_CLI" db dump 2>&1)
+if [ $? -ne 0 ] || [ -z "$DB" ]; then
+    echo "$(_ts): ERROR — start-cli db dump failed"
+    exit 0
+fi
+BAD_LINES=$(echo "$DB" | jq -r '
+  .value.packageData | to_entries[]
+  | .key as $id
+  | .value.statusInfo as $st
+  | (($st.desired // {}) | to_entries[0].value // "unknown") as $desired
+  | select($desired == "running")
+  | ([$st.health // {} | to_entries[] | select(.value.result == "failure" or .value.result == "error") | .value.name]) as $fails
+  | ((if $st.started == null then ["not running"] else [] end)
+     + (if ($fails | length) > 0 then ["health checks failing: " + ($fails | join(", "))] else [] end)) as $probs
+  | select(($probs | length) > 0)
+  | "\($id)\t\($probs | join("; "))"')
+BAD_NOW=$(printf '%s\n' "$BAD_LINES" | awk -F'\t' 'NF{print $1}' | sort)
+LASTBAD_FILE="${STATE_FILE}.lastbad"
+OLD_BAD=""
+[ -f "$LASTBAD_FILE" ] && OLD_BAD=$(cat "$LASTBAD_FILE")
+# Debounce: only services bad on two consecutive runs are alertable
+CONFIRMED=""
+for s in $BAD_NOW; do
+    if printf '%s\n' "$OLD_BAD" | grep -qx "$s"; then
+        CONFIRMED="${CONFIRMED}${CONFIRMED:+ }$s"
+    fi
+done
+mkdir -p "$(dirname "$LASTBAD_FILE")"
+if [ -n "$BAD_NOW" ]; then
+    printf '%s\n' "$BAD_NOW" > "$LASTBAD_FILE"
+else
+    rm -f "$LASTBAD_FILE"
+fi
+CONDITION=0; MSG=""; FPRINT=""
+if [ -n "$CONFIRMED" ]; then
+    CONDITION=1
+    FPRINT=$(printf '%s\n' $CONFIRMED | sort | paste -sd, -)
+    LIST=""
+    for s in $CONFIRMED; do
+        d=$(printf '%s\n' "$BAD_LINES" | awk -F'\t' -v id="$s" '$1==id{print $2; exit}')
+        LIST="${LIST}${LIST:+, }${s} (${d})"
+    done
+    MSG="Service health: ${LIST}"
+fi
+echo "$(_ts): bad now: $(printf '%s' "$BAD_NOW" | tr '\n' ' ')| confirmed: ${CONFIRMED:-none}"
+MON_HEALTH_END
+            ;;
+    esac
+
+    # Shared alert state machine + notification dispatch
+    cat << 'MON_TAIL_END'
+# ── Alert state machine ──────────────────────────────────────────────────────
+_now=$(date +%s)
+if [ "$CONDITION" -eq 0 ]; then
+    if [ -f "$STATE_FILE" ]; then
+        rm -f "$STATE_FILE"
+        echo "$(_ts): condition cleared — alert state reset (no recovery message by design)"
+    else
+        echo "$(_ts): OK"
+    fi
+    exit 0
+fi
+OLD_FP=""; OLD_TS=0
+if [ -f "$STATE_FILE" ]; then
+    OLD_FP=$(sed -n '1p' "$STATE_FILE")
+    OLD_TS=$(sed -n '2p' "$STATE_FILE")
+    case "$OLD_TS" in ''|*[!0-9]*) OLD_TS=0 ;; esac
+fi
+AGE=$(( _now - OLD_TS ))
+if [ "$FPRINT" = "$OLD_FP" ] && [ "$AGE" -lt "$REMIND_SECS" ]; then
+    echo "$(_ts): condition persists (last alert $((AGE/60)) min ago) — repeat suppressed"
+    exit 0
+fi
+echo "$(_ts): ALERT — $MSG"
+mkdir -p "$(dirname "$STATE_FILE")"
+{ printf '%s\n' "$FPRINT"; printf '%s\n' "$_now"; } > "$STATE_FILE"
+if [ -n "$NOTIFY_SHELL_B64" ]; then
+    _CMD=$(printf '%s' "$NOTIFY_SHELL_B64" | base64 -d)
+    [ "$DEBUG" -eq 1 ] && echo "$(_ts): DEBUG shell command: $_CMD"
+    MSG="$MSG" bash -c "$_CMD"
+    echo "$(_ts): shell command exit $?"
+fi
+if [ "$NOTIFY_STARTOS" = "1" ]; then
+    if "$START_CLI" notification create "$NOTIF_LEVEL" "$NOTIF_TITLE" "$MSG"; then
+        echo "$(_ts): StartOS notification created"
+    else
+        echo "$(_ts): StartOS notification FAILED"
+    fi
+fi
+MON_TAIL_END
+}
+
+# Install or update a monitor: write script + tagged cron entry via
+# _apply_or_stage. $1=type $2=threshold $3=excludes $4=shell_cmd $5=startos
+# $6=level $7=schedule
+install_monitor() {
+    local type="$1" threshold="$2" excludes="$3" shell_cmd="$4" startos="$5" level="$6" schedule="$7"
+
+    local script_content encoded_script
+    script_content=$(_monitor_script_content "$type" "$threshold" "$excludes" "$shell_cmd" "$startos" "$level")
+    encoded_script=$(printf '%s' "$script_content" | base64 -w 0)
+
+    local install_ts notify_desc=""
+    install_ts=$(date '+%Y.%m.%d %H:%M:%S %Z')
+    [[ -n "$shell_cmd" ]] && notify_desc="shell"
+    [[ "$startos" == "1" ]] && notify_desc="${notify_desc}${notify_desc:+ + }startos/${level}"
+    local cron_comment="# startos-admin v${VERSION} | Added: ${install_ts} | Action: Alerts | Monitor: ${type} | Threshold: ${threshold} | Notify: ${notify_desc}"
+    local cron_line="${schedule} ${_MONITOR_BIN_PREFIX}${type} >> ${_MONITOR_DATA_PREFIX}${type}.log 2>&1"
+    local encoded_comment encoded_cron
+    encoded_comment=$(printf '%s' "$cron_comment" | base64 -w 0)
+    encoded_cron=$(printf '%s' "$cron_line" | base64 -w 0)
+
+    debug_log "Installing monitor '$type' → ${_MONITOR_BIN_PREFIX}${type}"
+
+    # Remove any existing cron entry for this monitor, write the script,
+    # then add the tagged comment + cron line.
+    local cmds="mkdir -p ${_STARTOS_DATA_DIR}
+{ crontab -l 2>/dev/null || true; } | awk -v t1=\"| Monitor: ${type} |\" -v t2=\"# startos-monitor-${type}\" 'index(\$0,t1)||index(\$0,t2)==1{skip=1;next} skip{skip=0;next} {print}' | crontab -
+printf '%s' \"${encoded_script}\" | base64 -d > ${_MONITOR_BIN_PREFIX}${type}
+chmod +x ${_MONITOR_BIN_PREFIX}${type}
+{ crontab -l 2>/dev/null; printf '%s' \"${encoded_comment}\" | base64 -d; echo; printf '%s' \"${encoded_cron}\" | base64 -d; echo; } | crontab -"
+
+    _apply_or_stage "$(_monitor_label "$type"): threshold ${threshold}, ${schedule}" "$cmds" || return 1
+}
+
+# Wizard: install or update one monitor type (prefilled if installed).
+_monitor_install_flow() {
+    local type="$1"
+    local label
+    label=$(_monitor_label "$type")
+
+    print_header
+    print_section "$label"
+    echo ""
+    _nav_tip
+
+    # Prefill from an existing install
+    local cur_thr="" cur_cmd="" cur_sos="" cur_lvl="" cur_exc="" cur_sched=""
+    if [[ -f "${_MONITOR_BIN_PREFIX}${type}" ]]; then
+        _monitor_read_config "${_MONITOR_BIN_PREFIX}${type}" cur_thr cur_cmd cur_sos cur_lvl cur_exc
+        cur_sched=$(_monitor_read_schedule "$type")
+        print_info "Already installed — current values shown as defaults; this will update it."
+        echo ""
+    fi
+
+    # ── Step 1: Threshold ────────────────────────────────────────────────────
+    local threshold=""
+    case "$type" in
+        disk)
+            echo -e "  ${BOLD}Alert when disk usage reaches what percent?${NC}"
+            [[ -n "$cur_thr" ]] && echo -e "  ${DIM}Current: ${cur_thr}% — press Enter to keep${NC}"
+            while true; do
+                _read threshold "  Threshold % [1-99${cur_thr:+, Enter to keep}]: " || return 1
+                [[ -z "$threshold" && -n "$cur_thr" ]] && { threshold="$cur_thr"; break; }
+                [[ "$threshold" =~ ^[0-9]+$ ]] && (( threshold >= 1 && threshold <= 99 )) && break
+                print_warn "Enter a whole number between 1 and 99."
+            done
+            ;;
+        backup-age)
+            echo -e "  ${BOLD}Alert when a service has not been backed up for how many days?${NC}"
+            echo -e "  ${DIM}Services that have NEVER been backed up always count as stale.${NC}"
+            [[ -n "$cur_thr" ]] && echo -e "  ${DIM}Current: ${cur_thr} day(s) — press Enter to keep${NC}"
+            while true; do
+                _read threshold "  Days [1-365${cur_thr:+, Enter to keep}]: " || return 1
+                [[ -z "$threshold" && -n "$cur_thr" ]] && { threshold="$cur_thr"; break; }
+                [[ "$threshold" =~ ^[0-9]+$ ]] && (( threshold >= 1 && threshold <= 365 )) && break
+                print_warn "Enter a whole number between 1 and 365."
+            done
+            ;;
+        health)
+            threshold="0"
+            echo -e "  Alerts when a service that should be running has failing health checks"
+            echo -e "  or is not running — only after the problem persists across ${BOLD}two${NC}"
+            echo -e "  consecutive checks (avoids noise from restarts and updates)."
+            echo ""
+            ;;
+    esac
+
+    # ── Step 2 (backup-age only): exclude services ───────────────────────────
+    local excludes=""
+    if [[ "$type" == "backup-age" ]]; then
+        echo ""
+        print_info "Fetching installed services..."
+        local pkg_list
+        if pkg_list=$(start-cli package list 2>/dev/null); then
+            local -a packages=()
+            mapfile -t packages <<< "$(parse_package_ids "$pkg_list")"
+            echo ""
+            echo -e "  ${BOLD}Exclude services from this check?${NC} ${DIM}(e.g. intentionally not backed up)${NC}"
+            local i=1
+            local pkg
+            for pkg in "${packages[@]}"; do
+                echo -e "    ${BOLD}${i})${NC} ${pkg}"
+                (( i++ ))
+            done
+            [[ -n "$cur_exc" ]] && echo -e "  ${DIM}Current excludes: ${cur_exc} — press Enter to keep, or '-' for none${NC}"
+            echo ""
+            while true; do
+                local exc_sel
+                _read exc_sel "  Exclude (numbers comma-separated, blank = ${cur_exc:+keep current}${cur_exc:-none}, '-' = none): " || return 1
+                if [[ -z "$exc_sel" ]]; then
+                    excludes="$cur_exc"; break
+                elif [[ "$exc_sel" == "-" ]]; then
+                    excludes=""; break
+                elif [[ "$exc_sel" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+                    local valid=true sel=()
+                    IFS=',' read -ra parts <<< "$exc_sel"
+                    local part
+                    for part in "${parts[@]}"; do
+                        if (( part >= 1 && part <= ${#packages[@]} )); then
+                            sel+=("${packages[$((part-1))]}")
+                        else
+                            valid=false; break
+                        fi
+                    done
+                    if $valid; then
+                        excludes=$(IFS=','; echo "${sel[*]}")
+                        break
+                    fi
+                    print_warn "Numbers must be between 1 and ${#packages[@]}."
+                else
+                    print_warn "Enter numbers like 1,3 or blank or '-'."
+                fi
+            done
+        else
+            print_warn "Could not list services — no excludes configured."
+        fi
+    fi
+
+    # ── Step 3: Schedule ─────────────────────────────────────────────────────
+    [[ -n "$cur_sched" ]] && echo -e "\n  ${DIM}Current schedule: ${cur_sched}${NC}"
+    local CRON_SCHEDULE
+    case "$type" in
+        disk)
+            _pick_monitor_schedule CRON_SCHEDULE \
+                "Hourly" "0 * * * *" \
+                "Every 6 hours" "0 */6 * * *" \
+                "Daily at 9 AM" "0 9 * * *" || return 1 ;;
+        backup-age)
+            _pick_monitor_schedule CRON_SCHEDULE \
+                "Daily at 9 AM" "0 9 * * *" \
+                "Weekly (Mon 9 AM)" "0 9 * * 1" || return 1 ;;
+        health)
+            _pick_monitor_schedule CRON_SCHEDULE \
+                "Every 5 minutes" "*/5 * * * *" \
+                "Every 15 minutes" "*/15 * * * *" \
+                "Every 30 minutes" "*/30 * * * *" || return 1 ;;
+    esac
+
+    # ── Step 4: Notification method ──────────────────────────────────────────
+    local notify_cmd notify_sos notify_lvl
+    _pick_monitor_notify notify_cmd notify_sos notify_lvl "$cur_cmd" "$cur_sos" "$cur_lvl" || return 1
+
+    # ── Review ───────────────────────────────────────────────────────────────
+    echo ""
+    print_section "Review: ${label}"
+    echo ""
+    case "$type" in
+        disk)       echo -e "  ${BOLD}Threshold:${NC} ${threshold}% disk usage" ;;
+        backup-age) echo -e "  ${BOLD}Threshold:${NC} ${threshold} day(s) since last backup"
+                    echo -e "  ${BOLD}Excludes:${NC}  ${excludes:-(none)}" ;;
+        health)     echo -e "  ${BOLD}Trigger:${NC}   failing health checks / not running (2 consecutive checks)" ;;
+    esac
+    echo -e "  ${BOLD}Schedule:${NC}  ${CRON_SCHEDULE}"
+    [[ -n "$notify_cmd" ]] && echo -e "  ${BOLD}Shell:${NC}     ${notify_cmd}"
+    [[ "$notify_sos" == "1" ]] && echo -e "  ${BOLD}StartOS:${NC}   ${notify_lvl} notification"
+    echo ""
+    echo -e "  ${DIM}Re-alert policy: first detection, when the offender list changes, and at${NC}"
+    echo -e "  ${DIM}most one reminder per 24h while the condition persists. No recovery message.${NC}"
+    echo ""
+
+    if ! confirm "Install this alert?"; then
+        [[ $_BACK -eq 1 ]] && return 1
+        print_info "Cancelled."
+        pause; return
+    fi
+
+    install_monitor "$type" "$threshold" "$excludes" "$notify_cmd" "$notify_sos" "$notify_lvl" "$CRON_SCHEDULE" || return 1
+}
+
+# Show installed monitors with their config.
+_monitor_list_display() {
+    local found=0 type
+    for type in "${_MONITOR_TYPES[@]}"; do
+        local script="${_MONITOR_BIN_PREFIX}${type}"
+        [[ -f "$script" ]] || continue
+        found=1
+        local thr cmd sos lvl exc sched
+        _monitor_read_config "$script" thr cmd sos lvl exc
+        sched=$(_monitor_read_schedule "$type")
+        local state_file="${_MONITOR_DATA_PREFIX}${type}.state"
+        local state_val="(no active alert)"
+        [[ -f "$state_file" ]] && state_val="ALERTING since $(date -d "@$(sed -n '2p' "$state_file" 2>/dev/null)" '+%Y.%m.%d %H:%M' 2>/dev/null || echo '?')"
+        echo -e "  ${CYAN}${BOLD}$(_monitor_label "$type")${NC}"
+        case "$type" in
+            disk)       echo -e "     ${DIM}Threshold:${NC} ${thr}%" ;;
+            backup-age) echo -e "     ${DIM}Threshold:${NC} ${thr} day(s)   ${DIM}Excludes:${NC} ${exc:-(none)}" ;;
+            health)     echo -e "     ${DIM}Trigger:${NC}   unhealthy across 2 consecutive checks" ;;
+        esac
+        echo -e "     ${DIM}Schedule:${NC}  ${sched:-(not found in crontab)}"
+        echo -e "     ${DIM}Notify:${NC}    ${cmd:+shell}${cmd:+${sos:+ + }}$([[ "$sos" == "1" ]] && echo "StartOS ${lvl}")"
+        echo -e "     ${DIM}State:${NC}     ${state_val}"
+        echo -e "     ${DIM}Log:${NC}       ${_MONITOR_DATA_PREFIX}${type}.log"
+        echo ""
+    done
+    if [[ $found -eq 0 ]]; then
+        print_info "No alerts installed."
+        return 1
+    fi
+    return 0
+}
+
+_monitor_remove_flow() {
+    print_header
+    print_section "Remove Alert(s)"
+    echo ""
+
+    local -a installed=()
+    local type
+    for type in "${_MONITOR_TYPES[@]}"; do
+        [[ -f "${_MONITOR_BIN_PREFIX}${type}" ]] && installed+=("$type")
+    done
+    if [[ ${#installed[@]} -eq 0 ]]; then
+        print_info "No alerts installed."
+        pause; return
+    fi
+
+    local i=1
+    for type in "${installed[@]}"; do
+        echo -e "    ${BOLD}${i})${NC} $(_monitor_label "$type")"
+        (( i++ ))
+    done
+    echo ""
+    echo -e "    ${DIM}0) Back${NC}"
+    echo ""
+
+    local -a to_remove=()
+    local rchoice
+    while true; do
+        _read rchoice "  Choice(s) [1-$((i-1)), comma-separated, 'all', or 0 to go back]: " || return 1
+        if [[ "$rchoice" == "0" ]]; then return; fi
+        if [[ "$rchoice" == "all" ]]; then
+            to_remove=("${installed[@]}")
+            break
+        fi
+        local valid=true sel=()
+        IFS=',' read -ra parts <<< "$rchoice"
+        local part
+        for part in "${parts[@]}"; do
+            part="${part// /}"
+            if [[ "$part" =~ ^[0-9]+$ ]] && (( part >= 1 && part < i )); then
+                sel+=("${installed[$((part-1))]}")
+            else
+                valid=false; break
+            fi
+        done
+        if $valid && [[ ${#sel[@]} -gt 0 ]]; then
+            to_remove=("${sel[@]}")
+            break
+        fi
+        print_warn "Enter valid number(s) between 1 and $((i-1)), comma-separated, or 'all'."
+    done
+
+    echo ""
+    local names_display=""
+    for type in "${to_remove[@]}"; do
+        names_display+="${names_display:+, }$(_monitor_label "$type")"
+    done
+    if ! confirm "Remove: ${names_display}?"; then
+        [[ $_BACK -eq 1 ]] && return 1
+        print_info "Cancelled."
+        pause; return
+    fi
+
+    # State/log files are volatile runtime files — remove now (harmless when staging).
+    local cmds=""
+    for type in "${to_remove[@]}"; do
+        sudo rm -f "${_MONITOR_DATA_PREFIX}${type}.state" "${_MONITOR_DATA_PREFIX}${type}.state.lastbad"
+        cmds+="crontab -l 2>/dev/null | grep -v 'startos-monitor-${type}' | grep -Fv '| Monitor: ${type} |' | crontab -
+rm -f ${_MONITOR_BIN_PREFIX}${type}
+"
+    done
+
+    _apply_or_stage "Remove alert(s): ${names_display}" "$cmds" || return 1
+}
+
+_monitor_view_log() {
+    print_header
+    print_section "View Alert Log"
+    echo ""
+
+    local -a installed=()
+    local type
+    for type in "${_MONITOR_TYPES[@]}"; do
+        [[ -f "${_MONITOR_BIN_PREFIX}${type}" ]] && installed+=("$type")
+    done
+    if [[ ${#installed[@]} -eq 0 ]]; then
+        print_info "No alerts installed."
+        pause; return
+    fi
+
+    local i=1
+    for type in "${installed[@]}"; do
+        echo -e "    ${BOLD}${i})${NC} $(_monitor_label "$type")"
+        (( i++ ))
+    done
+    echo ""
+    local log_choice
+    while true; do
+        _read log_choice "  Choice [1-$((i-1))]: " || return 1
+        [[ "$log_choice" =~ ^[0-9]+$ ]] && (( log_choice >= 1 && log_choice < i )) && break
+        print_warn "Enter a number between 1 and $((i-1))."
+    done
+    local log_type="${installed[$((log_choice-1))]}"
+    local log_file="${_MONITOR_DATA_PREFIX}${log_type}.log"
+
+    print_header
+    print_section "Alert Log: $(_monitor_label "$log_type")"
+    echo ""
+    if [[ ! -f "$log_file" ]]; then
+        print_info "Log file not found: $log_file"
+        print_info "The monitor may not have run yet (or the server rebooted — logs are volatile)."
+    else
+        echo -e "  ${DIM}(last 50 lines of $log_file)${NC}"
+        echo ""
+        tail -50 "$log_file"
+    fi
+    echo ""
+    pause
+}
+
+# Alerts manager submenu.
+menu_alerts() {
+    while true; do
+        print_header
+        print_section "Alerts"
+        echo ""
+        local type
+        for type in "${_MONITOR_TYPES[@]}"; do
+            local n status
+            case "$type" in
+                disk) n=1 ;; backup-age) n=2 ;; health) n=3 ;;
+            esac
+            if [[ -f "${_MONITOR_BIN_PREFIX}${type}" ]]; then
+                local thr="" cmd="" sos="" lvl="" exc="" sched=""
+                _monitor_read_config "${_MONITOR_BIN_PREFIX}${type}" thr cmd sos lvl exc
+                sched=$(_monitor_read_schedule "$type")
+                case "$type" in
+                    disk)       status="${GREEN}installed${NC} ${DIM}(${thr}%, ${sched:-?})${NC}" ;;
+                    backup-age) status="${GREEN}installed${NC} ${DIM}(${thr}d, ${sched:-?})${NC}" ;;
+                    health)     status="${GREEN}installed${NC} ${DIM}(${sched:-?})${NC}" ;;
+                esac
+            else
+                status="${DIM}not installed${NC}"
+            fi
+            echo -e "    ${CYAN}${BOLD}${n})${NC} $(_monitor_label "$type")  ${status}"
+        done
+        echo ""
+        echo -e "    ${CYAN}${BOLD}4)${NC} List installed alerts"
+        echo -e "    ${CYAN}${BOLD}5)${NC} Remove alert(s)"
+        echo -e "    ${CYAN}${BOLD}6)${NC} View alert log"
+        echo ""
+        echo -e "    ${DIM}0) Back${NC}"
+        echo ""
+        local al_choice
+        _read al_choice "  $(echo -e "${BOLD}Choice:${NC} ")" || return 1
+        case "$al_choice" in
+            1) _monitor_install_flow disk        || return 1 ;;
+            2) _monitor_install_flow backup-age  || return 1 ;;
+            3) _monitor_install_flow health      || return 1 ;;
+            4)
+                print_header
+                print_section "Installed Alerts"
+                echo ""
+                _monitor_list_display || true
+                pause
+                ;;
+            5) _monitor_remove_flow || return 1 ;;
+            6) _monitor_view_log    || return 1 ;;
+            0) return ;;
+            *) print_warn "Enter 0-6." ; sleep 1 ;;
+        esac
+    done
+}
+
+# ─────────────────────────────────────────────
 # System Database Viewer
 # ─────────────────────────────────────────────
 
@@ -2988,9 +3750,10 @@ menu_documentation() {
         echo -e "    ${CYAN}${BOLD}7)${NC} Cron jobs"
         echo -e "    ${CYAN}${BOLD}8)${NC} Notification forwarders"
         echo -e "    ${CYAN}${BOLD}9)${NC} Staged changes"
-        echo -e "    ${CYAN}${BOLD}10)${NC} Save / Load configuration"
-        echo -e "    ${CYAN}${BOLD}11)${NC} Command line"
-        echo -e "    ${CYAN}${BOLD}12)${NC} Troubleshooting"
+        echo -e "    ${CYAN}${BOLD}10)${NC} Alerts"
+        echo -e "    ${CYAN}${BOLD}11)${NC} Save / Load configuration"
+        echo -e "    ${CYAN}${BOLD}12)${NC} Command line"
+        echo -e "    ${CYAN}${BOLD}13)${NC} Troubleshooting"
         echo ""
         echo -e "    ${DIM}0) Back${NC}"
         echo ""
@@ -3159,7 +3922,7 @@ menu_documentation() {
                 echo -e "    ${CYAN}•${NC} ${BOLD}Service Detail${NC} — full detail for a single service"
                 echo ""
                 pause ;;
-            12)
+            13)
                 print_header
                 print_section "Troubleshooting"
                 echo ""
@@ -3220,7 +3983,7 @@ menu_documentation() {
                 echo -e "  ${DIM}Queue file: ${_STAGED_FILE} (root-only)${NC}"
                 echo ""
                 pause ;;
-            11)
+            12)
                 print_header
                 print_section "Command Line"
                 echo ""
@@ -3248,6 +4011,37 @@ menu_documentation() {
                 pause ;;
             10)
                 print_header
+                print_section "Alerts"
+                echo ""
+                echo -e "  Three monitors that watch your server on a cron schedule and alert you"
+                echo -e "  via a shell command (e.g. webhook), a StartOS notification, or both:"
+                echo ""
+                echo -e "    ${CYAN}•${NC} ${BOLD}Disk usage alert${NC} — fires when usage reaches your % threshold"
+                echo -e "    ${CYAN}•${NC} ${BOLD}Backup staleness alert${NC} — fires when any service has not been backed"
+                echo -e "      up within your day threshold (never-backed-up counts as stale; you can"
+                echo -e "      exclude services). One message lists ALL stale services."
+                echo -e "    ${CYAN}•${NC} ${BOLD}Service health watchdog${NC} — fires when a service that should be"
+                echo -e "      running has failing health checks or is not running, persisting across"
+                echo -e "      two consecutive checks (avoids noise from restarts/updates)."
+                echo ""
+                echo -e "  ${BOLD}Shell command contract:${NC} the alert text is provided in the ${CYAN}\$MSG${NC}"
+                echo -e "  environment variable. Example:  ${DIM}curl -d \"\$MSG\" https://ntfy.sh/Your-Topic${NC}"
+                echo -e "  Commands run as root via cron — same trust level as your cron jobs."
+                echo ""
+                echo -e "  ${BOLD}Re-alert policy:${NC} alert on first detection, immediately when the list of"
+                echo -e "  affected services changes, and at most one reminder per 24h while the"
+                echo -e "  condition persists. ${YELLOW}No recovery (all-clear) message is sent.${NC}"
+                echo ""
+                echo -e "  Alert state is volatile — after a reboot, an ongoing condition re-alerts"
+                echo -e "  once. Each alert is a single instance; re-running its wizard updates it."
+                echo ""
+                echo -e "    ${DIM}Scripts: ${_MONITOR_BIN_PREFIX}<type>${NC}"
+                echo -e "    ${DIM}State:   ${_MONITOR_DATA_PREFIX}<type>.state${NC}"
+                echo -e "    ${DIM}Logs:    ${_MONITOR_DATA_PREFIX}<type>.log${NC}"
+                echo ""
+                pause ;;
+            11)
+                print_header
                 print_section "Save / Load Configuration"
                 echo ""
                 echo -e "  Saves your installed cron jobs and notification forwarders as a"
@@ -3274,7 +4068,7 @@ menu_documentation() {
                 echo ""
                 pause ;;
             0) return ;;
-            *) print_warn "Enter 0-12." ; sleep 1 ;;
+            *) print_warn "Enter 0-13." ; sleep 1 ;;
         esac
     done
 }
@@ -3353,6 +4147,18 @@ _config_export_flow() {
     fi
     bundle+="POLLER_COUNT=${pcount}"$'\n'
 
+    # Alert monitor scripts
+    local mcount=0
+    local mt
+    for mt in "${_MONITOR_TYPES[@]}"; do
+        local ms="${_MONITOR_BIN_PREFIX}${mt}"
+        [[ -f "$ms" ]] || continue
+        bundle+="MONITOR_${mcount}_NAME=${mt}"$'\n'
+        bundle+="MONITOR_${mcount}_SCRIPT_B64=$(base64 -w 0 < "$ms")"$'\n'
+        (( mcount++ ))
+    done
+    bundle+="MONITOR_COUNT=${mcount}"$'\n'
+
     # Backup-password secret files (root-only) — carried inside the encrypted
     # bundle so scheduled backups work again after a restore.
     local scount=0
@@ -3410,6 +4216,7 @@ _config_export_flow() {
     echo ""
     echo -e "  ${BOLD}Cron entries:${NC} ${cron_count} startos-admin managed entries"
     echo -e "  ${BOLD}Forwarders:${NC}   ${pcount}"
+    echo -e "  ${BOLD}Alerts:${NC}       ${mcount}"
     echo -e "  ${BOLD}Backup passwords:${NC} ${scount} (root-only secret files)"
     echo ""
     print_section "Encrypted configuration file contents"
@@ -3535,6 +4342,18 @@ _config_restore_flow() {
         pscripts+=("$(printf '%s' "$bundle" | grep "^POLLER_${pi}_SCRIPT_B64=" | head -1 | cut -d= -f2-)")
     done
 
+    local mcount
+    mcount=$(printf '%s' "$bundle" | grep '^MONITOR_COUNT=' | head -1 | cut -d= -f2-)
+    mcount="${mcount//[^0-9]/}"
+    [[ -z "$mcount" ]] && mcount=0
+
+    local -a mnames=() mscripts=()
+    local mi
+    for (( mi=0; mi<mcount; mi++ )); do
+        mnames+=("$(printf '%s'   "$bundle" | grep "^MONITOR_${mi}_NAME="       | head -1 | cut -d= -f2-)")
+        mscripts+=("$(printf '%s' "$bundle" | grep "^MONITOR_${mi}_SCRIPT_B64=" | head -1 | cut -d= -f2-)")
+    done
+
     local scount
     scount=$(printf '%s' "$bundle" | grep '^SECRET_COUNT=' | head -1 | cut -d= -f2-)
     scount="${scount//[^0-9]/}"
@@ -3575,6 +4394,16 @@ _config_restore_flow() {
             pause; return
         fi
     done
+    for mi in "${!mnames[@]}"; do
+        if ! [[ "${mnames[$mi]}" =~ ^(disk|backup-age|health)$ ]]; then
+            print_error "Saved file contains an invalid alert monitor name: '${mnames[$mi]}'. Load aborted."
+            pause; return
+        fi
+        if ! printf '%s' "${mscripts[$mi]}" | base64 -d >/dev/null 2>&1; then
+            print_error "Alert monitor '${mnames[$mi]}' is not valid base64. Load aborted."
+            pause; return
+        fi
+    done
 
     # ── Show restore summary ──────────────────────────────────────────────────
     print_header
@@ -3592,6 +4421,10 @@ _config_restore_flow() {
     echo -e "  ${BOLD}Forwarders:${NC}   ${pcount}"
     for pi in "${!pnames[@]}"; do
         echo -e "    ${DIM}• ${pnames[$pi]}${NC}"
+    done
+    echo -e "  ${BOLD}Alerts:${NC}       ${mcount}"
+    for mi in "${!mnames[@]}"; do
+        echo -e "    ${DIM}• $(_monitor_label "${mnames[$mi]}")${NC}"
     done
     echo -e "  ${BOLD}Backup passwords:${NC} ${scount} (loaded root-only to ${_SECRET_DIR})"
     echo ""
@@ -3659,6 +4492,14 @@ chmod +x /usr/local/bin/startos-admin
         local ps="${pscripts[$pi]}"
         chroot_body+="printf '%s' '${ps}' | base64 -d > ${_POLLER_BIN_PREFIX}${pn}
 chmod +x ${_POLLER_BIN_PREFIX}${pn}
+"
+    done
+
+    for mi in "${!mnames[@]}"; do
+        local mn="${mnames[$mi]}"
+        local msb="${mscripts[$mi]}"
+        chroot_body+="printf '%s' '${msb}' | base64 -d > ${_MONITOR_BIN_PREFIX}${mn}
+chmod +x ${_MONITOR_BIN_PREFIX}${mn}
 "
     done
 
@@ -3897,10 +4738,12 @@ main_menu() {
         print_header
         _nav_tip
         # Counts and labels for display
-        local _cron_n _fwd_arr _fwd_n _stg_n _dbg_label
+        local _cron_n _fwd_arr _fwd_n _stg_n _alrt_arr _alrt_n _dbg_label
         _cron_n=$(sudo crontab -u root -l 2>/dev/null | grep -c '^# startos-admin v' || true)
         _fwd_arr=("${_POLLER_BIN_PREFIX}"*)
         [[ -e "${_fwd_arr[0]}" ]] && _fwd_n=${#_fwd_arr[@]} || _fwd_n=0
+        _alrt_arr=("${_MONITOR_BIN_PREFIX}"*)
+        [[ -e "${_alrt_arr[0]}" ]] && _alrt_n=${#_alrt_arr[@]} || _alrt_n=0
         _stg_n=$(_staged_count)
         local _stg_label="${DIM}(${_stg_n})${NC}"
         [[ $_stg_n -gt 0 ]] && _stg_label="${YELLOW}(${_stg_n} pending)${NC}"
@@ -3920,10 +4763,11 @@ main_menu() {
         echo -e "    ${CYAN}${BOLD}7)${NC} Cron jobs  ${DIM}(${_cron_n})${NC}"
         echo -e "    ${CYAN}${BOLD}8)${NC} Notification forwarders  ${DIM}(${_fwd_n})${NC}"
         echo -e "    ${CYAN}${BOLD}9)${NC} Staged changes  ${_stg_label}"
+        echo -e "    ${CYAN}${BOLD}10)${NC} Alerts  ${DIM}(${_alrt_n})${NC}"
         echo -e "  ${DIM}Other${NC}"
-        echo -e "    ${CYAN}${BOLD}10)${NC} Save / Load configuration"
-        echo -e "    ${CYAN}${BOLD}11)${NC} Documentation"
-        echo -e "    ${CYAN}${BOLD}12)${NC} Debug mode  ${DIM}(${NC}${_dbg_label}${DIM})${NC}"
+        echo -e "    ${CYAN}${BOLD}11)${NC} Save / Load configuration"
+        echo -e "    ${CYAN}${BOLD}12)${NC} Documentation"
+        echo -e "    ${CYAN}${BOLD}13)${NC} Debug mode  ${DIM}(${NC}${_dbg_label}${DIM})${NC}"
         echo ""
         echo -e "    ${DIM}0) Exit${NC}"
         echo ""
@@ -3940,9 +4784,10 @@ main_menu() {
             7) menu_manage_crontab         || { _BACK=0; continue; } ;;
             8) menu_manage_notif_pollers   || { _BACK=0; continue; } ;;
             9) menu_staged_changes         || { _BACK=0; continue; } ;;
-            10) menu_config_backup_restore || { _BACK=0; continue; } ;;
-            11) menu_documentation         || { _BACK=0; continue; } ;;
-            12) menu_toggle_debug          || { _BACK=0; continue; } ;;
+            10) menu_alerts                || { _BACK=0; continue; } ;;
+            11) menu_config_backup_restore || { _BACK=0; continue; } ;;
+            12) menu_documentation         || { _BACK=0; continue; } ;;
+            13) menu_toggle_debug          || { _BACK=0; continue; } ;;
             0)
                 echo ""
                 if [[ $(_staged_count) -gt 0 ]]; then
@@ -3954,7 +4799,7 @@ main_menu() {
                 exit 0
                 ;;
             *)
-                print_warn "Invalid choice. Enter 0-12."
+                print_warn "Invalid choice. Enter 0-13."
                 sleep 1
                 ;;
         esac
