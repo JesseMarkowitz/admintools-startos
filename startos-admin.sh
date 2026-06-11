@@ -10,7 +10,7 @@
 #   Other:    11. Save / Load configuration   12. Documentation   13. Debug mode
 # CLI:        --version --help --update [--yes] --no-update-check | disk memory interfaces [svc]
 
-VERSION="60"   # integer — increment on each release
+VERSION="61"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -2614,7 +2614,7 @@ _monitor_title() {
 }
 
 # Read config vars from an installed monitor script.
-# Usage: _monitor_read_config path threshold_ref shellcmd_ref startos_ref level_ref excludes_ref
+# Usage: _monitor_read_config path threshold_ref shellcmd_ref startos_ref level_ref excludes_ref [target_ref]
 _monitor_read_config() {
     local _mrc_path="$1"
     local -n _mrc_thr="$2" _mrc_cmd="$3" _mrc_sos="$4" _mrc_lvl="$5" _mrc_exc="$6"
@@ -2626,6 +2626,10 @@ _monitor_read_config() {
     _mrc_sos=$(grep '^NOTIFY_STARTOS='   "$_mrc_path" 2>/dev/null | cut -d'"' -f2)
     _mrc_lvl=$(grep '^NOTIF_LEVEL='      "$_mrc_path" 2>/dev/null | cut -d'"' -f2)
     _mrc_exc=$(grep '^EXCLUDES='         "$_mrc_path" 2>/dev/null | cut -d'"' -f2)
+    if [[ $# -ge 7 ]]; then
+        local -n _mrc_tgt="$7"
+        _mrc_tgt=$(grep '^TARGET_ID='    "$_mrc_path" 2>/dev/null | cut -d'"' -f2)
+    fi
 }
 
 # Current cron schedule for an installed monitor (empty if not found).
@@ -2757,9 +2761,10 @@ _pick_monitor_notify() {
 }
 
 # Build the full generated-script content for a monitor type.
-# $1=type $2=threshold $3=excludes-csv $4=shell_cmd(raw) $5=startos(0/1) $6=level
+# $1=type $2=threshold $3=excludes-csv $4=shell_cmd(raw) $5=startos(0/1)
+# $6=level $7=backup-target-id (backup-age only)
 _monitor_script_content() {
-    local type="$1" threshold="$2" excludes="$3" shell_cmd="$4" startos="$5" level="$6"
+    local type="$1" threshold="$2" excludes="$3" shell_cmd="$4" startos="$5" level="$6" target_id="${7:-}"
     local shell_b64=""
     [[ -n "$shell_cmd" ]] && shell_b64=$(printf '%s' "$shell_cmd" | base64 -w 0)
     local title
@@ -2775,6 +2780,8 @@ _monitor_script_content() {
 MONITOR_TYPE=\"${type}\"
 THRESHOLD=\"${threshold}\"
 EXCLUDES=\"${excludes}\"
+TARGET_ID=\"${target_id}\"
+PASS_FILE=\"${_SECRET_DIR}/backup-pass-${target_id}\"
 NOTIFY_SHELL_B64=\"${shell_b64}\"
 NOTIFY_STARTOS=\"${startos}\"
 NOTIF_LEVEL=\"${level}\"
@@ -2827,23 +2834,42 @@ MON_DISK_END
         backup-age)
             cat << 'MON_BAGE_END'
 # ── Check: backup staleness ──────────────────────────────────────────────────
+# StartOS 0.4.0 does not track per-service backup times in its database, so
+# this reads truth from the backup target itself (backup target info), using
+# the root-only stored backup password.
+if [ ! -f "$PASS_FILE" ]; then
+    echo "$(_ts): ERROR — backup password file not found: $PASS_FILE"
+    exit 0
+fi
 DB=$("$START_CLI" db dump 2>&1)
 if [ $? -ne 0 ] || [ -z "$DB" ]; then
     echo "$(_ts): ERROR — start-cli db dump failed"
     exit 0
 fi
+SERVER_ID=$(echo "$DB" | jq -r '.value.serverInfo.id // empty')
+if [ -z "$SERVER_ID" ]; then
+    echo "$(_ts): ERROR — could not resolve server id from db dump"
+    exit 0
+fi
+INFO=$("$START_CLI" backup target info "$TARGET_ID" "$SERVER_ID" "$(cat "$PASS_FILE")" --format json 2>&1)
+if [ $? -ne 0 ] || ! printf '%s' "$INFO" | jq -e '.packageBackups' >/dev/null 2>&1; then
+    echo "$(_ts): ERROR — backup target info failed for target '$TARGET_ID': $INFO"
+    exit 0
+fi
 NOW=$(date +%s)
-OFFENDERS=$(echo "$DB" | jq -r --argjson now "$NOW" --argjson days "$THRESHOLD" --arg excl ",${EXCLUDES}," '
-  .value.packageData | to_entries[]
-  | .key as $k
+# Offenders = installed services (minus excludes) whose newest backup on the
+# target is older than THRESHOLD days, or which have no backup there at all.
+OFFENDERS=$(echo "$DB" | jq -r --argjson now "$NOW" --argjson days "$THRESHOLD" --arg excl ",${EXCLUDES}," --argjson info "$INFO" '
+  .value.packageData | keys[]
+  | . as $k
   | select(($excl | contains("," + $k + ",")) | not)
-  | {id: $k, lb: .value.lastBackup}
-  | if .lb == null then "\(.id)\tnever"
+  | ($info.packageBackups[$k].timestamp // null) as $ts
+  | if $ts == null then "\($k)\tnever"
     else (
-      (try (.lb | sub("\\..*Z$"; "Z") | fromdateiso8601) catch null) as $t
-      | if $t == null then "\(.id)\tbackup date unreadable"
+      (try ($ts | sub("\\..*Z$"; "Z") | fromdateiso8601) catch null) as $t
+      | if $t == null then "\($k)\tbackup date unreadable"
         else ((($now - $t) / 86400 | floor) as $age
-          | if $age > $days then "\(.id)\t\($age) days" else empty end)
+          | if $age > $days then "\($k)\t\($age) days" else empty end)
         end)
     end')
 CONDITION=0; MSG=""; FPRINT=""
@@ -2954,19 +2980,21 @@ MON_TAIL_END
 
 # Install or update a monitor: write script + tagged cron entry via
 # _apply_or_stage. $1=type $2=threshold $3=excludes $4=shell_cmd $5=startos
-# $6=level $7=schedule
+# $6=level $7=schedule $8=backup-target-id $9=backup-password (non-empty =
+# write the root-only password secret file in the same chroot session)
 install_monitor() {
     local type="$1" threshold="$2" excludes="$3" shell_cmd="$4" startos="$5" level="$6" schedule="$7"
+    local target_id="${8:-}" secret_value="${9:-}"
 
     local script_content encoded_script
-    script_content=$(_monitor_script_content "$type" "$threshold" "$excludes" "$shell_cmd" "$startos" "$level")
+    script_content=$(_monitor_script_content "$type" "$threshold" "$excludes" "$shell_cmd" "$startos" "$level" "$target_id")
     encoded_script=$(printf '%s' "$script_content" | base64 -w 0)
 
     local install_ts notify_desc=""
     install_ts=$(date '+%Y.%m.%d %H:%M:%S %Z')
     [[ -n "$shell_cmd" ]] && notify_desc="shell"
     [[ "$startos" == "1" ]] && notify_desc="${notify_desc}${notify_desc:+ + }startos/${level}"
-    local cron_comment="# startos-admin v${VERSION} | Added: ${install_ts} | Action: Alerts | Monitor: ${type} | Threshold: ${threshold} | Notify: ${notify_desc}"
+    local cron_comment="# startos-admin v${VERSION} | Added: ${install_ts} | Action: Alerts | Monitor: ${type} | Threshold: ${threshold}${target_id:+ | Target: ${target_id}} | Notify: ${notify_desc}"
     local cron_line="${schedule} ${_MONITOR_BIN_PREFIX}${type} >> ${_MONITOR_DATA_PREFIX}${type}.log 2>&1"
     local encoded_comment encoded_cron
     encoded_comment=$(printf '%s' "$cron_comment" | base64 -w 0)
@@ -2974,9 +3002,22 @@ install_monitor() {
 
     debug_log "Installing monitor '$type' → ${_MONITOR_BIN_PREFIX}${type}"
 
+    # Optional backup-password secret (backup-age) — written root-only in the
+    # same chroot session, same mechanics as install_cron_job.
+    local secret_cmds=""
+    if [[ -n "$secret_value" && -n "$target_id" ]]; then
+        local encoded_secret
+        encoded_secret=$(printf '%s' "$secret_value" | base64 -w 0)
+        secret_cmds="mkdir -p ${_SECRET_DIR}
+chmod 700 ${_SECRET_DIR}
+printf '%s' \"${encoded_secret}\" | base64 -d > ${_SECRET_DIR}/backup-pass-${target_id}
+chmod 600 ${_SECRET_DIR}/backup-pass-${target_id}
+"
+    fi
+
     # Remove any existing cron entry for this monitor, write the script,
     # then add the tagged comment + cron line.
-    local cmds="mkdir -p ${_STARTOS_DATA_DIR}
+    local cmds="${secret_cmds}mkdir -p ${_STARTOS_DATA_DIR}
 { crontab -l 2>/dev/null || true; } | awk -v t1=\"| Monitor: ${type} |\" -v t2=\"# startos-monitor-${type}\" 'index(\$0,t1)||index(\$0,t2)==1{skip=1;next} skip{skip=0;next} {print}' | crontab -
 printf '%s' \"${encoded_script}\" | base64 -d > ${_MONITOR_BIN_PREFIX}${type}
 chmod +x ${_MONITOR_BIN_PREFIX}${type}
@@ -2997,11 +3038,74 @@ _monitor_install_flow() {
     _nav_tip
 
     # Prefill from an existing install
-    local cur_thr="" cur_cmd="" cur_sos="" cur_lvl="" cur_exc="" cur_sched=""
+    local cur_thr="" cur_cmd="" cur_sos="" cur_lvl="" cur_exc="" cur_sched="" cur_tgt=""
     if [[ -f "${_MONITOR_BIN_PREFIX}${type}" ]]; then
-        _monitor_read_config "${_MONITOR_BIN_PREFIX}${type}" cur_thr cur_cmd cur_sos cur_lvl cur_exc
+        _monitor_read_config "${_MONITOR_BIN_PREFIX}${type}" cur_thr cur_cmd cur_sos cur_lvl cur_exc cur_tgt
         cur_sched=$(_monitor_read_schedule "$type")
         print_info "Already installed — current values shown as defaults; this will update it."
+        echo ""
+    fi
+
+    # ── backup-age: select the backup target to read backup dates from ──────
+    local mon_target="" mon_password=""
+    if [[ "$type" == "backup-age" ]]; then
+        echo -e "  ${DIM}StartOS does not track per-service backup times locally — this alert reads${NC}"
+        echo -e "  ${DIM}them from a backup target using your stored backup password.${NC}"
+        echo ""
+        print_info "Fetching backup targets..."
+        local raw_targets
+        if ! raw_targets=$(start-cli backup target list 2>&1); then
+            print_error "Failed to list backup targets."
+            echo -e "${RED}${raw_targets}${NC}"
+            pause; return 1
+        fi
+        local -a targets=()
+        mapfile -t targets <<< "$(parse_backup_targets "$raw_targets")"
+        if [[ ${#targets[@]} -eq 0 || -z "${targets[0]}" ]]; then
+            print_warn "No backup targets found. Add a target in the StartOS UI first."
+            pause; return 1
+        fi
+        echo ""
+        echo -e "  ${BOLD}Read backup dates from which target?${NC}"
+        local i=1 tgt
+        for tgt in "${targets[@]}"; do
+            echo -e "    ${BOLD}${i})${NC} ${tgt}"
+            (( i++ ))
+        done
+        [[ -n "$cur_tgt" ]] && echo -e "  ${DIM}Current: ${cur_tgt} — press Enter to keep${NC}"
+        echo ""
+        local tgt_choice
+        while true; do
+            _read tgt_choice "  Choice [1-$((i-1))${cur_tgt:+, Enter to keep}]: " || return 1
+            if [[ -z "$tgt_choice" && -n "$cur_tgt" ]]; then
+                mon_target="$cur_tgt"; break
+            fi
+            if [[ "$tgt_choice" =~ ^[0-9]+$ ]] && (( tgt_choice >= 1 && tgt_choice < i )); then
+                mon_target=$(echo "${targets[$((tgt_choice-1))]}" | awk '{print $1}')
+                break
+            fi
+            print_warn "Enter a number between 1 and $((i-1))${cur_tgt:+, or Enter to keep current}."
+        done
+        if ! [[ "$mon_target" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            print_error "Unexpected characters in target id '${mon_target}'. Aborting."
+            pause; return 1
+        fi
+
+        # Backup password: reuse the stored secret if present, else collect it
+        if sudo test -f "${_SECRET_DIR}/backup-pass-${mon_target}"; then
+            echo ""
+            print_info "Using the stored backup password for '${mon_target}' (root-only file)."
+        else
+            echo ""
+            print_warn "No stored backup password for '${mon_target}' yet."
+            print_info "Enter your StartOS primary password (used for backup encryption)."
+            print_info "It will be stored root-only at ${_SECRET_DIR}/backup-pass-${mon_target} (mode 600)."
+            while true; do
+                _read_silent mon_password "  Password: " || return 1
+                [[ -n "$mon_password" ]] && break
+                print_warn "Password cannot be empty."
+            done
+        fi
         echo ""
     fi
 
@@ -3120,6 +3224,7 @@ _monitor_install_flow() {
     case "$type" in
         disk)       echo -e "  ${BOLD}Threshold:${NC} ${threshold}% disk usage" ;;
         backup-age) echo -e "  ${BOLD}Threshold:${NC} ${threshold} day(s) since last backup"
+                    echo -e "  ${BOLD}Target:${NC}    ${mon_target}"
                     echo -e "  ${BOLD}Excludes:${NC}  ${excludes:-(none)}" ;;
         health)     echo -e "  ${BOLD}Trigger:${NC}   failing health checks / not running (2 consecutive checks)" ;;
     esac
@@ -3137,7 +3242,7 @@ _monitor_install_flow() {
         pause; return
     fi
 
-    install_monitor "$type" "$threshold" "$excludes" "$notify_cmd" "$notify_sos" "$notify_lvl" "$CRON_SCHEDULE" || return 1
+    install_monitor "$type" "$threshold" "$excludes" "$notify_cmd" "$notify_sos" "$notify_lvl" "$CRON_SCHEDULE" "$mon_target" "$mon_password" || return 1
 }
 
 # Show installed monitors with their config.
@@ -3147,8 +3252,8 @@ _monitor_list_display() {
         local script="${_MONITOR_BIN_PREFIX}${type}"
         [[ -f "$script" ]] || continue
         found=1
-        local thr cmd sos lvl exc sched
-        _monitor_read_config "$script" thr cmd sos lvl exc
+        local thr cmd sos lvl exc sched tgt
+        _monitor_read_config "$script" thr cmd sos lvl exc tgt
         sched=$(_monitor_read_schedule "$type")
         local state_file="${_MONITOR_DATA_PREFIX}${type}.state"
         local state_val="(no active alert)"
@@ -3156,7 +3261,7 @@ _monitor_list_display() {
         echo -e "  ${CYAN}${BOLD}$(_monitor_label "$type")${NC}"
         case "$type" in
             disk)       echo -e "     ${DIM}Threshold:${NC} ${thr}%" ;;
-            backup-age) echo -e "     ${DIM}Threshold:${NC} ${thr} day(s)   ${DIM}Excludes:${NC} ${exc:-(none)}" ;;
+            backup-age) echo -e "     ${DIM}Threshold:${NC} ${thr} day(s)   ${DIM}Target:${NC} ${tgt:-?}   ${DIM}Excludes:${NC} ${exc:-(none)}" ;;
             health)     echo -e "     ${DIM}Trigger:${NC}   unhealthy across 2 consecutive checks" ;;
         esac
         echo -e "     ${DIM}Schedule:${NC}  ${sched:-(not found in crontab)}"
@@ -3304,12 +3409,12 @@ menu_alerts() {
                 disk) n=1 ;; backup-age) n=2 ;; health) n=3 ;;
             esac
             if [[ -f "${_MONITOR_BIN_PREFIX}${type}" ]]; then
-                local thr="" cmd="" sos="" lvl="" exc="" sched=""
-                _monitor_read_config "${_MONITOR_BIN_PREFIX}${type}" thr cmd sos lvl exc
+                local thr="" cmd="" sos="" lvl="" exc="" sched="" tgt=""
+                _monitor_read_config "${_MONITOR_BIN_PREFIX}${type}" thr cmd sos lvl exc tgt
                 sched=$(_monitor_read_schedule "$type")
                 case "$type" in
                     disk)       status="${GREEN}installed${NC} ${DIM}(${thr}%, ${sched:-?})${NC}" ;;
-                    backup-age) status="${GREEN}installed${NC} ${DIM}(${thr}d, ${sched:-?})${NC}" ;;
+                    backup-age) status="${GREEN}installed${NC} ${DIM}(${thr}d, ${tgt:-?}, ${sched:-?})${NC}" ;;
                     health)     status="${GREEN}installed${NC} ${DIM}(${sched:-?})${NC}" ;;
                 esac
             else
@@ -3531,7 +3636,10 @@ _db_svc_detail() {
     local desired started last_bk registry
     desired=$(echo "$db"  | jq -r ".value.packageData[\"$pkg\"].statusInfo.desired | to_entries[0].value // \"unknown\"")
     started=$(echo "$db"  | jq -r ".value.packageData[\"$pkg\"].statusInfo.started // \"unknown\"")
-    last_bk=$(echo "$db"  | jq -r ".value.packageData[\"$pkg\"].lastBackup          // \"never\"")
+    # StartOS 0.4.0 does not populate per-service lastBackup — say so rather
+    # than a misleading "never". (The backup staleness alert reads real dates
+    # from the backup target instead.)
+    last_bk=$(echo "$db"  | jq -r ".value.packageData[\"$pkg\"].lastBackup          // \"not tracked by StartOS 0.4.0\"")
     registry=$(echo "$db" | jq -r ".value.packageData[\"$pkg\"].registry             // \"unknown\"")
 
     [[ "$started" != "unknown" ]] && started=$(date -d "$started" '+%Y.%m.%d %H:%M:%S %Z' 2>/dev/null || echo "$started")
@@ -4020,6 +4128,9 @@ menu_documentation() {
                 echo -e "    ${CYAN}•${NC} ${BOLD}Backup staleness alert${NC} — fires when any service has not been backed"
                 echo -e "      up within your day threshold (never-backed-up counts as stale; you can"
                 echo -e "      exclude services). One message lists ALL stale services."
+                echo -e "      ${DIM}Reads real backup dates from a backup target you choose, using your${NC}"
+                echo -e "      ${DIM}stored backup password (StartOS does not track them locally). The${NC}"
+                echo -e "      ${DIM}password is briefly visible in the process list during each check.${NC}"
                 echo -e "    ${CYAN}•${NC} ${BOLD}Service health watchdog${NC} — fires when a service that should be"
                 echo -e "      running has failing health checks or is not running, persisting across"
                 echo -e "      two consecutive checks (avoids noise from restarts/updates)."
