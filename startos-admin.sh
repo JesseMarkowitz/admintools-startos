@@ -10,7 +10,7 @@
 #   Other:    11. Save / Load configuration   12. Documentation   13. Debug mode
 # CLI:        --version --help --update [--yes] --no-update-check | disk memory interfaces [svc]
 
-VERSION="63"   # integer — increment on each release
+VERSION="64"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -33,7 +33,7 @@ _POLLER_BIN_PREFIX="/usr/local/bin/startos-notif-poller-"
 _STARTOS_DATA_DIR="/usr/local/share/startos-admin"
 _POLLER_STATE_PREFIX="${_STARTOS_DATA_DIR}/startos-admin-poller-state-"
 _POLLER_LOG_PREFIX="${_STARTOS_DATA_DIR}/startos-notif-poller-"
-# Alert monitors (disk / backup-age / health) — one singleton script per type.
+# Alert monitors (disk / backup-age / health / drive) — named instances.
 _MONITOR_BIN_PREFIX="/usr/local/bin/startos-monitor-"
 _MONITOR_DATA_PREFIX="${_STARTOS_DATA_DIR}/startos-monitor-"
 _MONITOR_VOLUMES_PATH="/media/startos/data/package-data/volumes/"
@@ -2597,7 +2597,7 @@ menu_manage_notif_pollers() {
 }
 
 # ─────────────────────────────────────────────
-# Alerts (disk usage / backup staleness / service health)
+# Alerts (disk usage / backup staleness / service health / drive health)
 # ─────────────────────────────────────────────
 # Each alert is a NAMED instance — a generated script
 # /usr/local/bin/startos-monitor-<type>-<name> run by a tagged cron entry.
@@ -2616,7 +2616,7 @@ _monitor_installed() {
         [[ -f "$f" ]] || continue
         suffix="${f##"${_MONITOR_BIN_PREFIX}"}"
         # Match longest type prefix first (backup-age contains a hyphen).
-        for type in backup-age disk health; do
+        for type in backup-age disk drive health; do
             if [[ "$suffix" == "$type" ]]; then
                 printf '%s\t%s\t%s\n' "$type" "" "$f"
                 continue 2
@@ -2639,6 +2639,7 @@ _monitor_label() {
         disk)       echo "Disk usage alert" ;;
         backup-age) echo "Backup staleness alert" ;;
         health)     echo "Service health watchdog" ;;
+        drive)      echo "Drive health alert" ;;
     esac
 }
 
@@ -2647,6 +2648,7 @@ _monitor_title() {
         disk)       echo "Disk Usage Alert" ;;
         backup-age) echo "Backup Staleness Alert" ;;
         health)     echo "Service Health Alert" ;;
+        drive)      echo "Drive Health Alert" ;;
     esac
 }
 
@@ -2799,6 +2801,55 @@ _pick_monitor_notify() {
     return 0
 }
 
+# Stdlib-only python that reads the NVMe SMART / Health log page (log ID 2)
+# via the admin ioctl on /dev/nvmeN and prints key=value lines. Embedded
+# base64 into generated drive monitors and run directly (via sudo) for the
+# wizard's live preview. No smartctl/nvme-cli needed — StartOS doesn't ship
+# them and host packages don't survive OS updates. Single-quoted literal:
+# must contain no single quotes.
+_NVME_SMART_PY='import sys, fcntl, ctypes
+
+class AdminCmd(ctypes.Structure):
+    _fields_ = [
+        ("opcode", ctypes.c_uint8), ("flags", ctypes.c_uint8),
+        ("rsvd1", ctypes.c_uint16), ("nsid", ctypes.c_uint32),
+        ("cdw2", ctypes.c_uint32), ("cdw3", ctypes.c_uint32),
+        ("metadata", ctypes.c_uint64), ("addr", ctypes.c_uint64),
+        ("metadata_len", ctypes.c_uint32), ("data_len", ctypes.c_uint32),
+        ("cdw10", ctypes.c_uint32), ("cdw11", ctypes.c_uint32),
+        ("cdw12", ctypes.c_uint32), ("cdw13", ctypes.c_uint32),
+        ("cdw14", ctypes.c_uint32), ("cdw15", ctypes.c_uint32),
+        ("timeout_ms", ctypes.c_uint32), ("result", ctypes.c_uint32),
+    ]
+
+NVME_IOCTL_ADMIN_CMD = 0xC0484E41  # _IOWR(N, 0x41, 72-byte AdminCmd)
+buf = ctypes.create_string_buffer(512)
+cmd = AdminCmd()
+cmd.opcode = 0x02            # Get Log Page
+cmd.nsid = 0xFFFFFFFF        # controller-wide
+cmd.addr = ctypes.addressof(buf)
+cmd.data_len = 512
+cmd.cdw10 = 0x02 | ((512 // 4 - 1) << 16)  # LID 2 = SMART / Health, NUMDL
+with open(sys.argv[1], "rb") as f:
+    rc = fcntl.ioctl(f.fileno(), NVME_IOCTL_ADMIN_CMD, cmd)
+if rc != 0:
+    sys.stderr.write("NVMe error status 0x%x\n" % rc)
+    sys.exit(1)
+d = bytes(buf)
+
+def le(lo, hi):
+    return int.from_bytes(d[lo:hi], "little")
+
+print("critical_warning=%d" % d[0])
+print("temperature_c=%d" % (le(1, 3) - 273))
+print("available_spare=%d" % d[3])
+print("spare_threshold=%d" % d[4])
+print("percentage_used=%d" % d[5])
+print("power_on_hours=%d" % le(112, 128))
+print("unsafe_shutdowns=%d" % le(144, 160))
+print("media_errors=%d" % le(160, 176))
+print("num_err_log_entries=%d" % le(176, 192))'
+
 # Build the full generated-script content for a monitor instance.
 # $1=type $2=threshold $3=excludes-csv $4=shell_cmd(raw) $5=startos(0/1)
 # $6=level $7=backup-target-id (backup-age only) $8=instance name
@@ -2835,6 +2886,11 @@ REMIND_SECS=86400
 LOG_MAX_LINES=2000
 DEBUG=0
 [ -f ${_STARTOS_DATA_DIR}/debug ] && DEBUG=1"
+
+    # Drive monitors carry the python SMART helper (base64 is safe to embed
+    # double-quoted, same as NOTIFY_SHELL_B64).
+    [[ "$type" == "drive" ]] && \
+        printf 'SMART_PY_B64="%s"\n' "$(printf '%s' "$_NVME_SMART_PY" | base64 -w 0)"
 
     # Common preamble — PATH, timestamp, log self-truncation
     cat << 'MON_PRE_END'
@@ -2973,6 +3029,75 @@ if [ -n "$CONFIRMED" ]; then
 fi
 echo "$(_ts): bad now: $(printf '%s' "$BAD_NOW" | tr '\n' ' ')| confirmed: ${CONFIRMED:-none}"
 MON_HEALTH_END
+            ;;
+        drive)
+            cat << 'MON_DRIVE_END'
+# ── Check: NVMe drive health (SMART) ─────────────────────────────────────────
+# Reads each controller's SMART / Health log via the embedded python helper.
+# Alerts on: any critical-warning bit, spare capacity below the drive's own
+# threshold, wear (percentage used) >= THRESHOLD, and media errors appearing
+# or increasing (tracked per drive in a .media-<ctrl> state file).
+CONDITION=0; MSG=""; FPRINT=""
+FOUND=0
+for CTRL in /sys/class/nvme/nvme*; do
+    [ -d "$CTRL" ] || continue
+    CNAME="${CTRL##*/}"
+    DEV="/dev/${CNAME}"
+    [ -e "$DEV" ] || continue
+    FOUND=1
+    MODEL=$(sed 's/[[:space:]]*$//' "$CTRL/model" 2>/dev/null)
+    [ -n "$MODEL" ] || MODEL="$DEV"
+    OUT=$(printf '%s' "$SMART_PY_B64" | base64 -d | python3 - "$DEV" 2>&1)
+    if [ $? -ne 0 ] || [ -z "$OUT" ]; then
+        echo "$(_ts): ERROR — SMART read failed for $DEV: $OUT"
+        continue
+    fi
+    CW=$(printf '%s\n' "$OUT" | awk -F= '$1=="critical_warning"{print $2}')
+    TEMP=$(printf '%s\n' "$OUT" | awk -F= '$1=="temperature_c"{print $2}')
+    SPARE=$(printf '%s\n' "$OUT" | awk -F= '$1=="available_spare"{print $2}')
+    SPARE_TH=$(printf '%s\n' "$OUT" | awk -F= '$1=="spare_threshold"{print $2}')
+    USED=$(printf '%s\n' "$OUT" | awk -F= '$1=="percentage_used"{print $2}')
+    MEDIA=$(printf '%s\n' "$OUT" | awk -F= '$1=="media_errors"{print $2}')
+    PROBS=""
+    if [ "${CW:-0}" -ne 0 ] 2>/dev/null; then
+        BITS=""
+        [ $((CW & 1)) -ne 0 ]  && BITS="${BITS}${BITS:+, }spare capacity below threshold"
+        [ $((CW & 2)) -ne 0 ]  && BITS="${BITS}${BITS:+, }temperature out of safe range (${TEMP}C)"
+        [ $((CW & 4)) -ne 0 ]  && BITS="${BITS}${BITS:+, }media reliability degraded"
+        [ $((CW & 8)) -ne 0 ]  && BITS="${BITS}${BITS:+, }drive is in READ-ONLY mode"
+        [ $((CW & 16)) -ne 0 ] && BITS="${BITS}${BITS:+, }volatile memory backup failed"
+        PROBS="CRITICAL WARNING: ${BITS:-code ${CW}}"
+    fi
+    if [ "${SPARE:-100}" -lt "${SPARE_TH:-0}" ] 2>/dev/null; then
+        PROBS="${PROBS}${PROBS:+; }spare capacity ${SPARE}% below drive threshold ${SPARE_TH}%"
+    fi
+    if [ "${USED:-0}" -ge "$THRESHOLD" ] 2>/dev/null; then
+        PROBS="${PROBS}${PROBS:+; }${USED}% of rated endurance used (alert threshold ${THRESHOLD}%)"
+    fi
+    MEDIA_FILE="${STATE_FILE}.media-${CNAME}"
+    LAST_MEDIA=""
+    [ -f "$MEDIA_FILE" ] && LAST_MEDIA=$(cat "$MEDIA_FILE")
+    case "$LAST_MEDIA" in *[!0-9]*) LAST_MEDIA="" ;; esac
+    if [ -n "$LAST_MEDIA" ] && [ "${MEDIA:-0}" -gt "$LAST_MEDIA" ] 2>/dev/null; then
+        PROBS="${PROBS}${PROBS:+; }media errors increased from ${LAST_MEDIA} to ${MEDIA}"
+    elif [ -z "$LAST_MEDIA" ] && [ "${MEDIA:-0}" -gt 0 ] 2>/dev/null; then
+        PROBS="${PROBS}${PROBS:+; }drive reports ${MEDIA} media error(s)"
+    fi
+    mkdir -p "$(dirname "$MEDIA_FILE")"
+    printf '%s\n' "${MEDIA:-0}" > "$MEDIA_FILE"
+    if [ -n "$PROBS" ]; then
+        CONDITION=1
+        FPRINT="${FPRINT}${FPRINT:+,}${CNAME}:cw${CW}:sp${SPARE}:wear${USED}:me${MEDIA}"
+        MSG="${MSG}${MSG:+ | }${MODEL} (${DEV}): ${PROBS}"
+    fi
+    echo "$(_ts): ${DEV} ${MODEL}: temp ${TEMP}C, spare ${SPARE}%, wear ${USED}%, media errors ${MEDIA}, critical warning ${CW}"
+done
+if [ "$FOUND" -eq 0 ]; then
+    echo "$(_ts): ERROR — no NVMe drives found (this alert supports NVMe drives only)"
+    exit 0
+fi
+[ -n "$MSG" ] && MSG="Drive health: ${MSG}"
+MON_DRIVE_END
             ;;
     esac
 
@@ -3175,6 +3300,49 @@ _monitor_install_flow() {
         echo ""
     fi
 
+    # ── drive: verify NVMe + python3, and show current SMART readings ───────
+    if [[ "$type" == "drive" ]]; then
+        if ! command -v python3 >/dev/null 2>&1; then
+            print_error "python3 not found on this system — the drive health alert requires it."
+            pause; return 1
+        fi
+        local -a drv_ctrls=()
+        local drv_c
+        for drv_c in /sys/class/nvme/nvme*; do
+            [[ -d "$drv_c" ]] && drv_ctrls+=("$drv_c")
+        done
+        if [[ ${#drv_ctrls[@]} -eq 0 ]]; then
+            print_warn "No NVMe drives found — this alert supports NVMe drives only."
+            pause; return 1
+        fi
+        echo -e "  ${DIM}Reads each NVMe drive's SMART health log directly from the kernel —${NC}"
+        echo -e "  ${DIM}no extra packages needed. Current readings:${NC}"
+        echo ""
+        local drv_ok=0
+        for drv_c in "${drv_ctrls[@]}"; do
+            local drv_dev="/dev/${drv_c##*/}" drv_model drv_out
+            drv_model=$(sed 's/[[:space:]]*$//' "${drv_c}/model" 2>/dev/null)
+            [[ -n "$drv_model" ]] || drv_model="$drv_dev"
+            if drv_out=$(printf '%s' "$_NVME_SMART_PY" | sudo python3 - "$drv_dev" 2>&1); then
+                local drv_temp drv_spare drv_used drv_media drv_cw
+                drv_temp=$(awk -F= '$1=="temperature_c"{print $2}' <<< "$drv_out")
+                drv_spare=$(awk -F= '$1=="available_spare"{print $2}' <<< "$drv_out")
+                drv_used=$(awk -F= '$1=="percentage_used"{print $2}' <<< "$drv_out")
+                drv_media=$(awk -F= '$1=="media_errors"{print $2}' <<< "$drv_out")
+                drv_cw=$(awk -F= '$1=="critical_warning"{print $2}' <<< "$drv_out")
+                echo -e "    ${BOLD}${drv_model}${NC} ${DIM}(${drv_dev})${NC}: temp ${drv_temp}°C, spare ${drv_spare}%, wear ${drv_used}%, media errors ${drv_media}, critical warning ${drv_cw}"
+                (( drv_ok++ ))
+            else
+                print_warn "SMART read failed for ${drv_dev}: ${drv_out}"
+            fi
+        done
+        echo ""
+        if [[ $drv_ok -eq 0 ]]; then
+            print_error "No drive answered the SMART query — cannot install this alert."
+            pause; return 1
+        fi
+    fi
+
     # ── Step 1: Threshold ────────────────────────────────────────────────────
     local threshold=""
     case "$type" in
@@ -3205,6 +3373,18 @@ _monitor_install_flow() {
             echo -e "  or is not running — only after the problem persists across ${BOLD}two${NC}"
             echo -e "  consecutive checks (avoids noise from restarts and updates)."
             echo ""
+            ;;
+        drive)
+            echo -e "  ${BOLD}Alert when SSD wear reaches what percent of rated endurance?${NC}"
+            echo -e "  ${DIM}90 is a sensible default. Critical warnings, low spare capacity, and${NC}"
+            echo -e "  ${DIM}new media errors always alert, regardless of this threshold.${NC}"
+            [[ -n "$cur_thr" ]] && echo -e "  ${DIM}Current: ${cur_thr}% — press Enter to keep${NC}"
+            while true; do
+                _read threshold "  Wear threshold % [1-100${cur_thr:+, Enter to keep}]: " || return 1
+                [[ -z "$threshold" && -n "$cur_thr" ]] && { threshold="$cur_thr"; break; }
+                [[ "$threshold" =~ ^[0-9]+$ ]] && (( threshold >= 1 && threshold <= 100 )) && break
+                print_warn "Enter a whole number between 1 and 100."
+            done
             ;;
     esac
 
@@ -3277,6 +3457,11 @@ _monitor_install_flow() {
                 "Every 5 minutes" "*/5 * * * *" \
                 "Every 15 minutes" "*/15 * * * *" \
                 "Every 30 minutes" "*/30 * * * *" || return 1 ;;
+        drive)
+            _pick_monitor_schedule CRON_SCHEDULE \
+                "Daily at 9 AM" "0 9 * * *" \
+                "Every 6 hours" "0 */6 * * *" \
+                "Weekly (Mon 9 AM)" "0 9 * * 1" || return 1 ;;
     esac
 
     # ── Step 4: Notification method ──────────────────────────────────────────
@@ -3294,6 +3479,7 @@ _monitor_install_flow() {
                     echo -e "  ${BOLD}Target:${NC}    ${mon_target}"
                     echo -e "  ${BOLD}Excludes:${NC}  ${excludes:-(none)}" ;;
         health)     echo -e "  ${BOLD}Trigger:${NC}   failing health checks / not running (2 consecutive checks)" ;;
+        drive)      echo -e "  ${BOLD}Threshold:${NC} ${threshold}% wear ${DIM}(critical warnings, spare, media errors always alert)${NC}" ;;
     esac
     echo -e "  ${BOLD}Schedule:${NC}  ${CRON_SCHEDULE}"
     [[ -n "$notify_cmd" ]] && echo -e "  ${BOLD}Shell:${NC}     ${notify_cmd}"
@@ -3334,6 +3520,7 @@ _monitor_list_display() {
             disk)       echo -e "     ${DIM}Threshold:${NC} ${thr}%" ;;
             backup-age) echo -e "     ${DIM}Threshold:${NC} ${thr} day(s)   ${DIM}Target:${NC} ${tgt:-?}   ${DIM}Excludes:${NC} ${exc:-(none)}" ;;
             health)     echo -e "     ${DIM}Trigger:${NC}   unhealthy across 2 consecutive checks" ;;
+            drive)      echo -e "     ${DIM}Threshold:${NC} ${thr}% wear   ${DIM}(critical warnings, spare, media errors always alert)${NC}" ;;
         esac
         echo -e "     ${DIM}Schedule:${NC}  ${sched:-(not found in crontab)}"
         echo -e "     ${DIM}Notify:${NC}    ${cmd:+shell}${cmd:+${sos:+ + }}$([[ "$sos" == "1" ]] && echo "StartOS ${lvl}")"
@@ -3354,15 +3541,17 @@ _monitor_add_flow() {
     echo -e "    ${BOLD}1)${NC} Disk usage alert"
     echo -e "    ${BOLD}2)${NC} Backup staleness alert"
     echo -e "    ${BOLD}3)${NC} Service health watchdog"
+    echo -e "    ${BOLD}4)${NC} Drive health alert ${DIM}(NVMe SMART)${NC}"
     echo ""
     local t_choice type
     while true; do
-        _read t_choice "  Choice [1-3]: " || return 1
+        _read t_choice "  Choice [1-4]: " || return 1
         case "$t_choice" in
             1) type="disk";       break ;;
             2) type="backup-age"; break ;;
             3) type="health";     break ;;
-            *) print_warn "Enter 1, 2, or 3." ;;
+            4) type="drive";      break ;;
+            *) print_warn "Enter 1-4." ;;
         esac
     done
     echo ""
@@ -3510,7 +3699,9 @@ _monitor_remove_flow() {
     local cmds="" suffix
     for idx in "${rm_idx[@]}"; do
         suffix="${r_suffixes[$idx]}"
-        sudo rm -f "${_MONITOR_DATA_PREFIX}${suffix}.state" "${_MONITOR_DATA_PREFIX}${suffix}.state.lastbad"
+        # .state plus its derivatives (.state.lastbad, .state.media-*); the
+        # glob must expand as root, hence sh -c.
+        sudo sh -c "rm -f '${_MONITOR_DATA_PREFIX}${suffix}.state' '${_MONITOR_DATA_PREFIX}${suffix}.state.'*"
         cmds+="crontab -l 2>/dev/null | grep -v 'startos-monitor-${suffix} ' | grep -Fv '| Monitor: ${suffix} |' | crontab -
 rm -f ${_MONITOR_BIN_PREFIX}${suffix}
 "
@@ -3583,6 +3774,7 @@ menu_alerts() {
                     disk)       desc="${thr}%" ;;
                     backup-age) desc="${thr}d, ${tgt:-?}" ;;
                     health)     desc="2-check debounce" ;;
+                    drive)      desc="${thr}% wear" ;;
                 esac
                 echo -e "    ${CYAN}•${NC} $(_monitor_display "$t" "$n")  ${DIM}(${desc})${NC}"
             done <<< "$inst_lines"
@@ -4289,7 +4481,7 @@ menu_documentation() {
                 print_header
                 print_section "Alerts"
                 echo ""
-                echo -e "  Three monitors that watch your server on a cron schedule and alert you"
+                echo -e "  Four monitors that watch your server on a cron schedule and alert you"
                 echo -e "  via a shell command (e.g. webhook), a StartOS notification, or both:"
                 echo ""
                 echo -e "    ${CYAN}•${NC} ${BOLD}Disk usage alert${NC} — fires when usage reaches your % threshold"
@@ -4302,6 +4494,11 @@ menu_documentation() {
                 echo -e "    ${CYAN}•${NC} ${BOLD}Service health watchdog${NC} — fires when a service that should be"
                 echo -e "      running has failing health checks or is not running, persisting across"
                 echo -e "      two consecutive checks (avoids noise from restarts/updates)."
+                echo -e "    ${CYAN}•${NC} ${BOLD}Drive health alert${NC} — fires when an NVMe drive's SMART log shows"
+                echo -e "      a critical warning, low spare capacity, wear past your % threshold, or"
+                echo -e "      new media errors — the dying-drive warning the StartOS UI lacks."
+                echo -e "      ${DIM}Reads SMART directly from the kernel (no packages installed).${NC}"
+                echo -e "      ${DIM}NVMe drives only; SATA/USB drives are not monitored.${NC}"
                 echo ""
                 echo -e "  ${BOLD}Shell command contract:${NC} the alert text is provided in the ${CYAN}\$MSG${NC}"
                 echo -e "  environment variable. Example:  ${DIM}curl -d \"\$MSG\" https://ntfy.sh/Your-Topic${NC}"

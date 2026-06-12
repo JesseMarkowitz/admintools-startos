@@ -396,11 +396,12 @@ The queue is stored root-only at `/root/.startos-admin/staged-changes` (it can c
 <details>
 <summary><strong>10. Alerts</strong></summary>
 
-Three monitors that run on a cron schedule and alert you via a shell command (e.g. webhook), a StartOS notification, or both:
+Four monitors that run on a cron schedule and alert you via a shell command (e.g. webhook), a StartOS notification, or both:
 
 - **Disk usage alert** — fires when disk usage reaches your percent threshold.
 - **Backup staleness alert** — fires when any service has not been backed up within your day threshold. Services that have never been backed up count as stale; you can exclude services that are intentionally not backed up. One message lists **all** stale services, e.g. `Backup staleness: 2 service(s) exceed 7 day(s): nextcloud (9 days), vaultwarden (never)`. Because StartOS 0.4.0 does not track per-service backup times locally, this alert reads real backup dates from a backup target you choose, using your stored backup password (`/root/.startos-admin/backup-pass-<target>`; the wizard collects it if not already stored). The password is briefly visible in the process list during each check — the default daily schedule keeps this rare.
 - **Service health watchdog** — fires when a service that should be running has failing health checks or is not running, only after the problem persists across two consecutive checks (avoids noise from restarts and updates).
+- **Drive health alert** — fires when an NVMe drive reports trouble in its SMART health log: any critical warning from the drive itself (reliability degraded, read-only mode, temperature out of safe range, spare below threshold), spare capacity below the drive's own threshold, wear (percentage of rated endurance used) at or past your percent threshold, or media errors appearing or increasing. This is the early warning the StartOS UI does not provide — it shows disk usage and temperature, but nothing warns you a drive is wearing out or failing. Reads the SMART log directly from the kernel via a built-in helper (no extra packages installed on your server); the setup wizard shows your drives' current readings. NVMe drives only — SATA/USB drives are not monitored. All drives are checked by one alert; the message names the affected drive, e.g. `Drive health: Samsung SSD 970 EVO Plus 2TB (/dev/nvme0): 91% of rated endurance used (alert threshold 90%)`.
 
 **Shell command contract:** the alert text is provided in the `$MSG` environment variable — e.g. `curl -d "$MSG" https://ntfy.sh/Your-Topic`. Commands run as root via cron (same trust level as your cron jobs).
 
@@ -423,7 +424,7 @@ Saves your installed cron jobs and notification forwarders as a single AES-256 e
 - All root cron entries
 - All notification forwarder scripts (including embedded webhook URLs and schedules)
 - All scheduled-backup password files (root-only secrets, carried inside the encrypted file)
-- All alert monitor scripts (disk usage, backup staleness, service health)
+- All alert monitor scripts (disk usage, backup staleness, service health, drive health)
 
 **Load reinstalls** everything in a single reboot: cron jobs, notification forwarder scripts, backup password files, and the `startos-admin` script itself (downloaded fresh from GitHub and **signature-verified** before install — if verification fails, the rest of the load proceeds but the script is not reinstalled).
 
