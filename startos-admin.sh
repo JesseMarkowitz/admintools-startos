@@ -10,7 +10,7 @@
 #   Other:    11. Save / Load configuration   12. Documentation   13. Debug mode
 # CLI:        --version --help --update [--yes] --no-update-check | disk memory interfaces [svc]
 
-VERSION="64"   # integer — increment on each release
+VERSION="65"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -3153,6 +3153,19 @@ MON_TAIL_END
 install_monitor() {
     local type="$1" threshold="$2" excludes="$3" shell_cmd="$4" startos="$5" level="$6" schedule="$7"
     local target_id="${8:-}" secret_value="${9:-}" name="${10:-}" cleanup_legacy="${11:-0}"
+
+    # Defense-in-depth: type and name become root-owned file paths and cron
+    # lines. Every caller already validates, but guard here too so a bad value
+    # can never be written as a path (this is how v62 produced orphaned
+    # "<type>-/usr/local/bin/startos-monitor-<type>" cron entries).
+    case "$type" in
+        disk|backup-age|health|drive) ;;
+        *) print_error "install_monitor: invalid monitor type '${type}'."; return 1 ;;
+    esac
+    if [[ -n "$name" ]] && ! [[ "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]*$ ]]; then
+        print_error "install_monitor: invalid monitor name '${name}' (letters, digits, hyphens only)."
+        return 1
+    fi
     local inst="${type}${name:+-${name}}"
 
     local script_content encoded_script
@@ -4877,7 +4890,7 @@ _config_restore_flow() {
         fi
     done
     for mi in "${!mnames[@]}"; do
-        if ! [[ "${mnames[$mi]}" =~ ^(disk|backup-age|health)(-[a-zA-Z0-9][a-zA-Z0-9-]*)?$ ]]; then
+        if ! [[ "${mnames[$mi]}" =~ ^(disk|backup-age|health|drive)(-[a-zA-Z0-9][a-zA-Z0-9-]*)?$ ]]; then
             print_error "Saved file contains an invalid alert monitor name: '${mnames[$mi]}'. Load aborted."
             pause; return
         fi
