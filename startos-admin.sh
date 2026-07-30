@@ -10,7 +10,7 @@
 #   Other:    11. Save / Load configuration   12. Documentation   13. Debug mode
 # CLI:        --version --help --update [--yes] --no-update-check | disk memory interfaces [svc]
 
-VERSION="65"   # integer — increment on each release
+VERSION="66"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -691,10 +691,14 @@ menu_disk_usage() {
     print_section "Usage by Service"
     echo ""
 
+    # du exits non-zero if a file vanishes mid-scan (e.g. btcpayserver's Postgres
+    # temp relation files churn constantly), yet still prints correct totals for
+    # every volume. Discard the transient stderr and judge success by output
+    # presence, not exit code — matching _cli_disk below.
     local raw_output
-    if ! raw_output=$(sudo du -hd 1 /media/startos/data/package-data/volumes/ 2>&1); then
+    raw_output=$(sudo du -hd 1 /media/startos/data/package-data/volumes/ 2>/dev/null)
+    if [[ -z "$raw_output" ]]; then
         print_error "Failed to read disk usage."
-        echo -e "${RED}${raw_output}${NC}"
         pause; return
     fi
 
