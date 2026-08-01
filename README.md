@@ -185,11 +185,13 @@ Use cases:
 
 Reads the full system database via `start-cli db dump` and presents it through several focused views.
 
+Checks `start-cli state` first: while StartOS is initializing it serves a reduced API with no `db.*` methods, so a dump there fails with `Method not found`. The menu reports that the server is still starting up rather than surfacing the raw RPC error.
+
 Sub-options:
 
-**1) Server Info** — hostname, StartOS version, architecture, platform, last backup time.
+**1) Server Info** — hostname, StartOS version, architecture, platform, last backup time. Architecture and platform come from `start-cli server device-info`; as of StartOS 0.4.0.1 they are no longer carried in the database dump.
 
-**2) Network** — addresses, Tor onion addresses, WiFi status, gateways (with LAN/WAN IPs), and DNS servers.
+**2) Network** — addresses, WiFi status, gateways (with LAN/WAN IPs), and DNS servers. Addresses are read per binding from `serverInfo.network.host.bindings`. Tor onion addresses are not listed: as of StartOS 0.4.0 Tor is a service the user installs and enables per interface, so there is no server-wide onion list in the database.
 
 **3) Service Status** — desired state and health-check results for every installed service.
 
@@ -406,6 +408,8 @@ Four monitors that run on a cron schedule and alert you via a shell command (e.g
 **Shell command contract:** the alert text is provided in the `$MSG` environment variable — e.g. `curl -d "$MSG" https://ntfy.sh/Your-Topic`. Commands run as root via cron (same trust level as your cron jobs).
 
 **Re-alert policy:** alert on first detection, immediately when the list of affected services changes, and at most one reminder per 24 hours while the condition persists. No recovery (all-clear) message is sent. Alert state is volatile — after a reboot, an ongoing condition re-alerts once.
+
+**Startup skip:** the two monitors that read the system database (backup staleness, service health) check `start-cli state` first and skip the run while StartOS is initializing, logging `skipped — StartOS not running`. Without this a reboot produces a `db dump` error in the log on every scheduled run until the server finishes coming up, since the initializing server serves no `db.*` methods.
 
 **Named instances:** you can install several alerts of the same type, each with its own name, threshold, notification route, and schedule — e.g. `disk [warn50]` sending an ntfy info at 50% **plus** `disk [crit85]` raising a StartOS error at 85%, or two backup staleness alerts watching different targets. Instances are fully independent: with disk at 87%, both of those example alerts are in alert state, each with its own daily reminder. Re-running an alert's wizard updates it; alerts installed before naming existed are migrated to a named instance the first time you edit them. Alerts are included in Save / Load configuration.
 

@@ -10,21 +10,25 @@
 #   Other:    11. Save / Load configuration   12. Documentation   13. Debug mode
 # CLI:        --version --help --update [--yes] --no-update-check | disk memory interfaces [svc]
 
-VERSION="66"   # integer — increment on each release
+VERSION="67"   # integer — increment on each release
 
 set -euo pipefail
 
 # ─────────────────────────────────────────────
 # Colors & Styles
 # ─────────────────────────────────────────────
-GREEN="\e[32m"
-RED="\e[31m"
-YELLOW="\e[33m"
-BLUE="\e[34m"
-CYAN="\e[36m"
-BOLD="\e[1m"
-DIM="\e[2m"
-NC="\e[0m"
+# Real ESC bytes ($'...'), not the literal "\e[..m" two-character form. Only
+# `echo -e` expands a literal \e; awk and printf emit it verbatim — which is how
+# the package-stats table ended up printing "\e[1m" on screen, since it passes
+# these to awk via -v (mawk, Debian's awk, has no \e escape at all).
+GREEN=$'\e[32m'
+RED=$'\e[31m'
+YELLOW=$'\e[33m'
+BLUE=$'\e[34m'
+CYAN=$'\e[36m'
+BOLD=$'\e[1m'
+DIM=$'\e[2m'
+NC=$'\e[0m'
 
 # ─────────────────────────────────────────────
 # Path Constants
@@ -136,6 +140,39 @@ print_warn() {
 
 print_section() {
     echo -e "\n${BOLD}${BLUE}── ${1} ${NC}${DIM}$(printf '─%.0s' {1..40})${NC}"
+}
+
+# The server's API state: Running | Initializing | Error (or Unknown if
+# unreachable). `state` is the one method served by every context and it needs
+# no auth, so it still answers when db/package calls cannot. Bounded by
+# timeout: the call that has to answer when the server is sick must not be the
+# one that hangs.
+_startos_state() {
+    timeout 10 start-cli state 2>/dev/null || echo "Unknown"
+}
+
+# Guard for calls that need a fully-running server. While StartOS is
+# initializing it serves a reduced API with no db.* methods, so 'db dump'
+# comes back "Method not found" rather than anything about startup — check
+# first and say what is actually happening. Returns 1 unless state is Running.
+_require_running() {
+    local st
+    st=$(_startos_state)
+    debug_log "start-cli state: ${st}"
+    case "$st" in
+        Running) return 0 ;;
+        Initializing)
+            print_error "StartOS is still starting up."
+            echo -e "  ${DIM}System data is unavailable until initialization completes.${NC}"
+            echo -e "  ${DIM}Watch progress with${NC} ${CYAN}start-cli init subscribe${NC}" ;;
+        Error)
+            print_error "StartOS is in diagnostic mode — the server failed to start."
+            echo -e "  ${DIM}Open the web interface for the diagnostic report.${NC}" ;;
+        *)
+            print_error "Could not reach StartOS ('start-cli state' failed)."
+            echo -e "  ${DIM}Confirm the server is powered on and startd is running.${NC}" ;;
+    esac
+    return 1
 }
 
 pause() {
@@ -2942,6 +2979,14 @@ if [ ! -f "$PASS_FILE" ]; then
     echo "$(_ts): ERROR — backup password file not found: $PASS_FILE"
     exit 0
 fi
+# While StartOS initializes it serves a reduced API with no db.* methods, so
+# 'db dump' fails with "Method not found". That is a normal post-reboot state,
+# not a fault — check first so it is not logged as an error every run.
+STATE=$(timeout 10 "$START_CLI" state 2>/dev/null) || STATE="Unknown"
+if [ "$STATE" != "Running" ]; then
+    echo "$(_ts): skipped — StartOS not running (state: ${STATE})"
+    exit 0
+fi
 DB=$("$START_CLI" db dump 2>&1)
 if [ $? -ne 0 ] || [ -z "$DB" ]; then
     echo "$(_ts): ERROR — start-cli db dump failed"
@@ -2987,6 +3032,14 @@ MON_BAGE_END
         health)
             cat << 'MON_HEALTH_END'
 # ── Check: service health ────────────────────────────────────────────────────
+# While StartOS initializes it serves a reduced API with no db.* methods, so
+# 'db dump' fails with "Method not found". That is a normal post-reboot state,
+# not a fault — check first so it is not logged as an error every run.
+STATE=$(timeout 10 "$START_CLI" state 2>/dev/null) || STATE="Unknown"
+if [ "$STATE" != "Running" ]; then
+    echo "$(_ts): skipped — StartOS not running (state: ${STATE})"
+    exit 0
+fi
 DB=$("$START_CLI" db dump 2>&1)
 if [ $? -ne 0 ] || [ -z "$DB" ]; then
     echo "$(_ts): ERROR — start-cli db dump failed"
@@ -3838,12 +3891,18 @@ _db_server_info() {
     print_section "Server Info"
     echo ""
 
-    local hostname version arch platform last_backup
+    local hostname version arch platform last_backup dev_info
     hostname=$(echo "$db"    | jq -r '.value.serverInfo.hostname    // "unknown"')
     version=$(echo "$db"     | jq -r '.value.serverInfo.version     // "unknown"')
-    arch=$(echo "$db"        | jq -r '.value.serverInfo.arch        // "unknown"')
-    platform=$(echo "$db"    | jq -r '.value.serverInfo.platform    // "unknown"')
     last_backup=$(echo "$db" | jq -r '.value.serverInfo.lastBackup  // "never"')
+
+    # StartOS 0.4.0.1 dropped arch/platform from serverInfo; they now come from
+    # 'server device-info' (.hardware.arch / .os.platform).
+    dev_info=$(start-cli server device-info --format json 2>/dev/null) || dev_info=""
+    arch=$(echo "$dev_info"     | jq -r '.hardware.arch // "unknown"' 2>/dev/null || echo "unknown")
+    platform=$(echo "$dev_info" | jq -r '.os.platform  // "unknown"' 2>/dev/null || echo "unknown")
+    [[ -z "$arch"     ]] && arch="unknown"
+    [[ -z "$platform" ]] && platform="unknown"
 
     if [[ "$last_backup" != "never" ]]; then
         last_backup=$(date -d "$last_backup" '+%Y.%m.%d %H:%M:%S %Z' 2>/dev/null || echo "$last_backup")
@@ -3868,13 +3927,27 @@ _db_network() {
     # ── Addresses (mirrors the GUI Addresses table) ──────────────────────────
     print_section "Addresses"
     echo ""
+    # 0.4.0.1 replaced serverInfo.network.hostnameInfo with a per-binding address
+    # list under network.host.bindings[<internal port>].addresses.available[].
+    # IP entries carry metadata.gateway (string), mDNS entries metadata.gateways
+    # (array). The default port for the scheme is left off the URL.
     echo "$db" | jq -r '
-        [.value.serverInfo.network.hostnameInfo // {} | to_entries[] | .value[] |
+        [.value.serverInfo.network.host.bindings // {} | to_entries[] |
+            .value.addresses.available[]? |
+            (if .ssl then "https" else "http" end) as $scheme |
+            (.metadata.kind // "unknown") as $kind |
+            (if $kind == "ipv6"
+                then "[" + .hostname +
+                     (if (.metadata.scopeId and (.hostname | startswith("fe80")))
+                        then "%" + (.metadata.scopeId|tostring) else "" end) + "]"
+                else .hostname end) as $host |
+            (if (.ssl and .port == 443) or ((.ssl|not) and .port == 80)
+                then "" else ":" + (.port|tostring) end) as $portsuffix |
             {
-                type:    (.hostname.kind // "unknown"),
+                type:    $kind,
                 access:  (if .public then "public" else "private" end),
-                gateway: (.gateway.name // "unknown"),
-                url:     ("https://" + .hostname.value)
+                gateway: (.metadata.gateway // ((.metadata.gateways // []) | join(",")) | if . == "" then "unknown" else . end),
+                url:     ($scheme + "://" + $host + $portsuffix)
             }
         ] | unique_by(.url) | .[] |
         "\(.type)\t\(.access)\t\(.gateway)\t\(.url)"
@@ -3883,23 +3956,17 @@ _db_network() {
     done
     echo ""
 
-    # ── Tor Addresses ────────────────────────────────────────────────────────
-    local onions
-    onions=$(echo "$db" | jq -r '.value.serverInfo.network.onions[]? // empty' 2>/dev/null)
-    if [[ -n "$onions" ]]; then
-        print_section "Tor Addresses"
-        echo ""
-        while IFS= read -r onion; do
-            echo -e "  ${CYAN}•${NC} $onion"
-        done <<< "$onions"
-        echo ""
-    fi
+    # Tor addresses are no longer reported here: as of 0.4.0 Tor is a service the
+    # user installs and enables per interface, so serverInfo.network.onions is
+    # gone and there is no server-wide onion list to show.
 
     # ── WiFi ─────────────────────────────────────────────────────────────────
     print_section "WiFi"
     echo ""
     local wifi_enabled wifi_ssid
-    wifi_enabled=$(echo "$db" | jq -r '.value.serverInfo.network.wifi.enabled  // "unknown"')
+    # `// "unknown"` would swallow a legitimate `false` here, since jq's
+    # alternative operator treats false as empty — test for null explicitly.
+    wifi_enabled=$(echo "$db" | jq -r '.value.serverInfo.network.wifi.enabled | if . == null then "unknown" else tostring end')
     wifi_ssid=$(echo "$db"    | jq -r '.value.serverInfo.network.wifi.selected // "none"')
     echo -e "  ${BOLD}Enabled:${NC}  $wifi_enabled"
     echo -e "  ${BOLD}Network:${NC}  $wifi_ssid"
@@ -3925,14 +3992,15 @@ _db_network() {
     print_section "DNS Servers"
     echo ""
     local dns_strategy
+    # 0.4.0.1 moved dns under serverInfo.network.
     dns_strategy=$(echo "$db" | jq -r '
-        if (.value.serverInfo.dns.staticServers | (. != null and length > 0)) then "Static"
+        if (.value.serverInfo.network.dns.staticServers | (. != null and length > 0)) then "Static"
         else "DHCP" end
     ' 2>/dev/null)
     echo -e "  ${BOLD}Strategy:${NC}  $dns_strategy"
     echo ""
     echo "$db" | jq -r '
-        [(.value.serverInfo.dns.staticServers // [])[], (.value.serverInfo.dns.dhcpServers // [])[]] |
+        [(.value.serverInfo.network.dns.staticServers // [])[], (.value.serverInfo.network.dns.dhcpServers // [])[]] |
         unique[]
     ' 2>/dev/null | while read -r dns; do
         echo -e "  ${CYAN}•${NC} $dns"
@@ -4179,6 +4247,8 @@ menu_db_dump() {
     print_header
     print_section "System Data"
     echo ""
+    _require_running || { pause; return; }
+
     print_info "Fetching database dump..."
     debug_log "Running: start-cli db dump"
     local db_json db_err
@@ -4402,7 +4472,7 @@ menu_documentation() {
                 echo -e "  ${BOLD}Available views:${NC}"
                 echo ""
                 echo -e "    ${CYAN}•${NC} ${BOLD}Server Info${NC}    — hostname, OS version, architecture, last backup"
-                echo -e "    ${CYAN}•${NC} ${BOLD}Network${NC}        — Tor addresses, WiFi, gateway IPs, DNS servers"
+                echo -e "    ${CYAN}•${NC} ${BOLD}Network${NC}        — LAN/WAN addresses, WiFi, gateway IPs, DNS servers"
                 echo -e "    ${CYAN}•${NC} ${BOLD}Service Status${NC} — all services with running/stopped state and health checks"
                 echo -e "    ${CYAN}•${NC} ${BOLD}Service Detail${NC} — full detail for a single service"
                 echo ""
@@ -4432,7 +4502,9 @@ menu_documentation() {
                 echo -e "  ${BOLD}start-cli authentication errors${NC}"
                 echo -e "  Some features require ${CYAN}start-cli${NC} to be authenticated."
                 echo -e "  If you see 'Failed to list packages', reconnect your SSH session"
-                echo -e "  and confirm ${CYAN}start-cli auth status${NC} reports authenticated."
+                echo -e "  and confirm ${CYAN}start-cli auth session list${NC} succeeds."
+                echo -e "  To check the server is up at all, run ${CYAN}start-cli state${NC}"
+                echo -e "  — it reports Running, Initializing, or Error and needs no auth."
                 echo ""
                 echo -e "  ${BOLD}Changes lost after reboot${NC}"
                 echo -e "  StartOS does not persist changes by default. All changes made by"
@@ -5400,7 +5472,13 @@ _cli_interfaces() {
     local svc="${1:-}"
     local db
     if ! db=$(start-cli db dump 2>&1); then
-        echo "ERROR: 'start-cli db dump' failed." >&2
+        local st
+        st=$(_startos_state)
+        if [[ "$st" != "Running" ]]; then
+            echo "ERROR: StartOS is not running (state: ${st}); interfaces are unavailable." >&2
+        else
+            echo "ERROR: 'start-cli db dump' failed: ${db}" >&2
+        fi
         exit 1
     fi
     local jq_filter
