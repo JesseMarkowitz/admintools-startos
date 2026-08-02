@@ -10,7 +10,7 @@
 #   Other:    11. Save / Load configuration   12. Documentation   13. Debug mode
 # CLI:        --version --help --update [--yes] --no-update-check | disk memory interfaces [svc]
 
-VERSION="67"   # integer — increment on each release
+VERSION="68"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -4125,24 +4125,36 @@ _db_svc_detail() {
 }
 
 # Extract service interface URLs from a DB dump as TSV:
-# service<TAB>iface-name<TAB>type<TAB>network<TAB>url
+# service<TAB>iface-name<TAB>type<TAB>network<TAB>url<TAB>active|inactive
 # $1 = db dump JSON, $2 = JSON array of service ids to include.
+#
+# As of StartOS 0.4.0 there is no packageData.<pkg>.serviceInterfaces map;
+# interfaces live inside the binding they belong to, at
+#   packageData.<pkg>.hosts.<hostId>.bindings.<internalPort>.interfaces.<ifaceId>
+# so the addresses for an interface are the enclosing binding's
+# addresses.available — no hostId lookup needed.
 _interfaces_tsv() {
     echo "$1" | jq -r --argjson svcs "$2" '
+      # Gateway display names ("Wired connection 1", "StartTunnel", …)
+      (.value.serverInfo.network.gateways // {}) as $gws |
       .value.packageData | to_entries[] |
       select(.key as $k | $svcs | index($k)) |
       .key as $svc |
-      .value as $pkg |
-      $pkg.serviceInterfaces | to_entries[] |
+      (.value.hosts // {}) | to_entries[] |
+      (.value.bindings // {}) | to_entries[] |
+      .value as $binding |
+      select($binding.enabled != false) |
+      ($binding.addresses // {}) as $addrs |
+      ($binding.interfaces // {}) | to_entries[] |
       .value as $iface |
-      $iface.addressInfo.hostId as $hostId |
-      $iface.addressInfo.suffix as $suffix |
+      ($iface.addressInfo.suffix // "") as $suffix |
       $iface.addressInfo.scheme as $scheme |
       $iface.addressInfo.sslScheme as $sslScheme |
-      # Walk bindings → addresses.available for the matched host
-      ($pkg.hosts[$hostId].bindings // {} | to_entries[].value.addresses.available[]?) as $a |
+      ($addrs.available // [])[] as $a |
+      # mdns / private-domain carry metadata.gateways[], everything else gateway
+      ($a.metadata.gateway // ($a.metadata.gateways // [])[0]) as $gwId |
       # Filter: skip loopback, internal bridge, link-local IPv6
-      select($a.metadata.gateway | . != "lo" and . != "lxcbr0") |
+      select($gwId | . != "lo" and . != "lxcbr0") |
       select(($a.metadata.kind == "ipv6" and ($a.hostname | startswith("fe80::"))) | not) |
       # Wrap IPv6 in brackets
       (if $a.metadata.kind == "ipv6" then "[" + $a.hostname + "]"
@@ -4150,23 +4162,31 @@ _interfaces_tsv() {
       # Strip query params from suffix (hides embedded certs/macaroons)
       ($suffix | split("?")[0]) as $safeSuffix |
       # Build URL using ssl flag and interface scheme
-      (
-        if ($a.ssl and $sslScheme != null) then
-          $sslScheme + "://" + $host + ":" + ($a.port|tostring) + $safeSuffix
-        elif ($a.ssl | not) and ($scheme != null) then
-          $scheme + "://" + $host + ":" + ($a.port|tostring) + $safeSuffix
-        elif $a.ssl then
-          "ssl://" + $host + ":" + ($a.port|tostring) + $safeSuffix
-        else
-          "tcp://" + $host + ":" + ($a.port|tostring) + $safeSuffix
-        end
-      ) as $url |
+      (if ($a.ssl and $sslScheme != null) then $sslScheme
+       elif ($a.ssl | not) and ($scheme != null) then $scheme
+       elif $a.ssl then "ssl"
+       else "tcp"
+       end) as $proto |
+      # Omit the port when it is the scheme default
+      (if ($proto == "https" and $a.port == 443) or ($proto == "http" and $a.port == 80)
+       then "" else ":" + ($a.port|tostring) end) as $portPart |
+      ($proto + "://" + $host + $portPart + $safeSuffix) as $url |
       # Network label
-      (if $a.metadata.gateway == "wg1" then "tunnel"
-       elif $a.metadata.gateway == null then "local"
-       else $a.metadata.gateway
+      (if $gwId == null then "local"
+       else ($gws[$gwId].name // $gws[$gwId].ipInfo.name // $gwId)
        end) as $net |
-      "\($svc)\t\($iface.name)\t\($iface.type)\t\($net)\t\($url)"
+      # Active = what the UI shows as switched on. A public IP:port is off
+      # unless listed in addresses.enabled; everything else (private IPs and
+      # domains) is on unless listed in addresses.disabled.
+      (($a.public == true) and ($a.metadata.kind == "ipv4" or $a.metadata.kind == "ipv6")) as $isPublicIp |
+      (if $isPublicIp then
+         ($a.port == null) or
+         ((($addrs.enabled // []) | index($host + ":" + ($a.port|tostring))) != null)
+       else
+         (($addrs.disabled // [])
+           | any(.[0] == $a.hostname and .[1] == ($a.port // 0))) | not
+       end) as $active |
+      "\($svc)\t\($iface.name)\t\($iface.type)\t\($net)\t\($url)\t\(if $active then "active" else "inactive" end)"
     ' 2>/dev/null
 }
 
@@ -4226,7 +4246,7 @@ _db_interfaces() {
         print_info "No interfaces found for selected services."
     else
         local prev_svc=""
-        while IFS=$'\t' read -r svc iname itype net url; do
+        while IFS=$'\t' read -r svc iname itype net url active; do
             if [[ "$svc" != "$prev_svc" ]]; then
                 [[ -n "$prev_svc" ]] && echo ""
                 echo -e "  ${BOLD}${svc}${NC}"
@@ -4235,7 +4255,12 @@ _db_interfaces() {
             local type_color="$GREEN"
             [[ "$itype" == "api" ]] && type_color="$YELLOW"
             [[ "$itype" == "p2p" ]] && type_color="$BLUE"
-            printf "    ${type_color}%-4s${NC}  %-20s  %-24s  %s\n" "$itype" "$iname" "$net" "$url"
+            # Inactive addresses are switched off in the UI: shown, but dimmed.
+            if [[ "$active" == "active" ]]; then
+                printf "    ${type_color}%-4s${NC}  %-20s  %-20s  %s\n" "$itype" "$iname" "$net" "$url"
+            else
+                printf "    ${DIM}%-4s  %-20s  %-20s  %s  (off)${NC}\n" "$itype" "$iname" "$net" "$url"
+            fi
         done <<< "$output"
     fi
     echo ""

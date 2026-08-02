@@ -101,7 +101,7 @@ startos-admin interfaces [svc]    Service interface URLs (tab-separated)
 
 `--update` exit codes: `0` up to date · `10` update available (not installed) · `1` network failure · `3` signature verification failure. Updates installed with `--update --yes` are signature-verified first and include any staged changes in the same restart.
 
-The data commands print plain/tab-separated output suitable for monitoring scripts, e.g. `startos-admin interfaces nextcloud | grep tor`.
+The data commands print plain/tab-separated output suitable for monitoring scripts, e.g. `startos-admin interfaces vaultwarden | grep StartTunnel`. The `interfaces` columns are `service`, `interface name`, `type`, `network`, `url`, `active|inactive`.
 
 </details>
 
@@ -202,14 +202,20 @@ Sub-options:
 For each interface, shows:
 - Interface type (`ui`, `api`, `p2p`)
 - Interface name
-- Network (e.g. Wired connection, tor, tunnel)
+- Network — the gateway's display name, matching the web UI (e.g. `Wired connection 1`, `StartTunnel`)
 - Full URL with correct scheme and port
+
+Interfaces are read from `packageData.<pkg>.hosts.<host>.bindings.<port>.interfaces`, where StartOS 0.4.0 moved them; the addresses shown are the enclosing binding's `addresses.available`.
 
 Filtering:
 - Excludes loopback (`lo`) and internal bridge (`lxcbr0`) gateways
 - Excludes link-local IPv6 (`fe80::`) addresses
+- Excludes bindings the service has disabled
 - Wraps IPv6 addresses in brackets
 - Prefers SSL when available; falls back to plain scheme or `tcp://`/`ssl://` for interfaces without an explicit scheme (e.g. peer, ZeroMQ)
+- Omits the port when it is the scheme default (`:443` for https, `:80` for http)
+
+Addresses switched off in the web UI are still listed, dimmed and marked `(off)`. This mirrors the UI's rule: a public IP:port is off unless it appears in the binding's `addresses.enabled`; a private IP or a domain is on unless it appears in `addresses.disabled`.
 
 Use cases:
 - Quickly find the URL for any service interface
