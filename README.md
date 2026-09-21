@@ -2,6 +2,9 @@
 
 Interactive administrative menu for StartOS servers.
 
+For a tested, password-conscious workflow for scheduled StartOS backups, see
+[Automating StartOS Backups](BACKUP-GUIDE.md).
+
 ---
 
 <details>
