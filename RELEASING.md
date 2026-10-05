@@ -27,7 +27,12 @@ the new key. Users must reinstall once via the curl command in the README.
 
 1. Make and test your changes.
 2. Bump `VERSION=` in `startos-admin.sh` (integer, +1).
-3. Update `README.md` if anything user-visible changed.
+3. Update `README.md` (and `BACKUP-GUIDE.md`, if backups are affected) if
+   anything user-visible changed. On every release, also re-check the
+   README's dated statements against the current StartOS release and update
+   them: the "as of <month year>" note under *Intended use* (is each feature
+   still missing from the StartOS web interface?), the supported/tested
+   StartOS version under *Requirements*, and the docs.start9.com links.
 4. Sign the final script (re-run this after **any** further edit, or the
    release will fail verification):
 

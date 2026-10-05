@@ -1,6 +1,7 @@
 # Automating StartOS Backups
 
-This guide uses **StartOS Admin Tools** to run StartOS backups on a schedule.
+This guide uses **StartOS Admin Tools** ([README](README.md)) to run StartOS
+backups on a schedule.
 It does not replace a tested backup target or a recovery plan. Complete the
 manual backup test before adding automation.
 
@@ -11,7 +12,7 @@ manual backup test before adding automation.
 
 ## Before you begin
 
-- Run StartOS 0.4.x and have SSH access as the `start9` user.
+- Run StartOS 0.4.0.x and have SSH access as the `start9` user.
 - Have a backup target configured in StartOS: a supported physical drive or a
   network folder on your LAN.
 - Know the StartOS primary password that will encrypt the backup.
@@ -95,8 +96,10 @@ tool.
 
 The scheduler stores the password in
 `/root/.startos-admin/backup-pass-<target>` with mode `600`; the crontab reads
-it when the backup runs. The password is not written into the crontab, its
-listing, or the tool's configuration export.
+it when the backup runs. The password is not written into the crontab or its
+listing. It **is** carried inside the tool's encrypted configuration file
+(**11) Save / Load configuration**), so a restored server keeps its schedules
+working; keep that file and its passphrase as safe as the password itself.
 
 The password is still briefly present in the process list while `start-cli`
 is running the backup. This is a limitation of the current StartOS CLI syntax,
@@ -118,7 +121,8 @@ After the scheduled time:
 1. In Admin Tools, use **5) Backup schedule → 2) Edit an existing backup
    schedule** to review or change its target, services, schedule, password, or
    post-backup action.
-1. Optionally configure **10) Alerts → Backup staleness alert**. It checks the
+1. Optionally configure **10) Alerts → 1) Add an alert → Backup staleness
+   alert**. It checks the
    dates stored on a selected target and can alert when a service has not been
    backed up within your threshold.
 
@@ -149,6 +153,4 @@ backup, select the service, and restore it.
 For a lost or corrupted StartOS data drive, use the StartOS initial-setup
 recovery flow to restore the server. Test recovery procedures on non-critical
 data when possible; a successful scheduled job alone is not a restore test.
-
-## What changed from the manual-crontab method
 
