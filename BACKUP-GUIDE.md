@@ -64,7 +64,11 @@ and only run a version you trust.
 From the main menu, choose **5) Backup schedule**, then **1) Add a new backup
 schedule**. The wizard asks for:
 
-1. **Backup target** — select the target you tested in StartOS.
+1. **Backup target** — select the target you tested in StartOS. A physical
+   drive is saved by its filesystem UUID (`uuid-<UUID>`), not its device name
+   (`disk-/dev/sdb1`), because device names change when drives are re-plugged
+   or the server reboots. The schedule finds the drive by UUID at backup time,
+   and fails rather than writing to a different disk if it is not connected.
 1. **StartOS primary password** — enter it at the hidden prompt. This is the
    password that encrypts the backup.
 1. **Services** — choose individual services or `all`.
@@ -118,15 +122,22 @@ After the scheduled time:
    dates stored on a selected target and can alert when a service has not been
    backed up within your threshold.
 
-Use **7) Cron jobs** only to view or remove a schedule when necessary. If you
-remove a backup schedule, also remove its no-longer-needed password file with
-an administrator command:
+Use **7) Cron jobs** only to view or remove a schedule when necessary.
+Removing a schedule does not remove its password file. To remove a
+no-longer-needed password file, delete it inside StartOS persistence mode:
 
 ```bash
-sudo rm /root/.startos-admin/backup-pass-<target>
+sudo /usr/lib/startos/scripts/chroot-and-upgrade
+rm /root/.startos-admin/backup-pass-<target>
+exit
 ```
 
-Replace `<target>` with the target ID shown by the schedule. Do this only after
+The server restarts when you `exit`. A plain `sudo rm` outside persistence
+mode does not last: StartOS keeps the live system's changes in memory, so the
+file reappears at the next restart.
+
+Replace `<target>` with the target shown by the schedule — `cifs-0` for a
+network folder, or `uuid-<UUID>` for a physical drive. Do this only after
 confirming no other schedule or backup-staleness alert uses that target.
 
 ## Recovering from a backup

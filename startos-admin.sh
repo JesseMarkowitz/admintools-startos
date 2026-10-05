@@ -10,7 +10,7 @@
 #   Other:    11. Save / Load configuration   12. Documentation   13. Debug mode
 # CLI:        --version --help --update [--yes] --no-update-check | disk memory interfaces [svc]
 
-VERSION="68"   # integer — increment on each release
+VERSION="69"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -223,8 +223,84 @@ parse_package_ids() {
 parse_backup_targets() {
     echo "$1" | jq -r '
         to_entries[] |
-        "\(.key)  (\(.value.hostname // .value.type // "unknown")\(.value.path // ""))"
+        if .value.type == "disk" then
+            "\(.key)  (\([.value.vendor, .value.model] | map(select(. != null)) | join(" ") | if . == "" then "disk" else . end), \((.value.capacity // 0) / 1e9 * 10 | floor / 10) GB\(if .value.label then ", label \(.value.label)" else "" end))"
+        else
+            "\(.key)  (\(.value.hostname // .value.type // "unknown")\(.value.path // ""))"
+        end
     '
+}
+
+# Disk backup targets are listed by their current kernel device name
+# (disk-/dev/sdb1). That name is not stable: after a reboot or replug the same
+# id can name a DIFFERENT drive, and a backup would silently go there. So
+# schedules and alerts store a stable target key instead:
+#   disk → "uuid-<filesystem UUID>"   (resolved to disk-/dev/sdXN at run time)
+#   cifs → the target id unchanged    ("cifs-0")
+# The key is the charset-safe name used in password file names, cron comments
+# and generated scripts.
+_BACKUP_UUID_DIR="/dev/disk/by-uuid"
+
+# Print the stable key for a target id from `backup target list`.
+# Returns 1 if a disk target has no filesystem UUID.
+_backup_target_key() {
+    local id="$1" dev link
+    case "$id" in
+        disk-/*)
+            dev="${id#disk-}"
+            for link in "$_BACKUP_UUID_DIR"/*; do
+                [[ -e "$link" ]] || continue
+                if [[ "$(readlink -f "$link")" == "$dev" ]]; then
+                    printf 'uuid-%s\n' "${link##*/}"
+                    return 0
+                fi
+            done
+            return 1
+            ;;
+        *) printf '%s\n' "$id" ;;
+    esac
+}
+
+# Print the target argument for a `backup create` cron line. A disk key
+# resolves the drive by UUID when cron runs; if the drive is not connected the
+# target becomes a path that does not exist, so start-cli fails instead of
+# backing up to whichever drive now holds the old device name.
+_backup_target_cron_arg() {
+    case "$1" in
+        uuid-*)
+            local u="${1#uuid-}"
+            # shellcheck disable=SC2016  # $( ) is meant for cron's shell, not this one
+            printf '"disk-$(readlink -e %s/%s || echo %s/%s-not-connected)"' \
+                "$_BACKUP_UUID_DIR" "$u" "$_BACKUP_UUID_DIR" "$u"
+            ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+# Print the target key of an installed `backup create` cron line.
+_backup_key_from_cron_line() {
+    local re='backup create "disk-\$\(readlink -e /dev/disk/by-uuid/([A-Za-z0-9._-]+) '
+    if [[ "$1" =~ $re ]]; then
+        printf 'uuid-%s\n' "${BASH_REMATCH[1]}"
+    else
+        printf '%s\n' "$1" | grep -oE "backup create [^ ]+" | awk '{print $3}'
+    fi
+}
+
+# Resolve a listed target id to its stable key, printing why if it can't.
+# $1 = id from the menu, $2 = nameref for the key. Returns 1 on failure.
+_backup_pick_key() {
+    local id="$1"
+    local -n _bpk_key="$2"
+    if ! _bpk_key=$(_backup_target_key "$id"); then
+        print_error "Drive '${id}' has no filesystem UUID, so it cannot be told apart from"
+        print_error "other drives after a reboot or replug. Aborting."
+        return 1
+    fi
+    if [[ "$_bpk_key" == uuid-* ]]; then
+        print_info "Disk target saved as '${_bpk_key}' (its filesystem UUID), so it follows"
+        print_info "this drive even if its device name (now ${id#disk-}) changes."
+    fi
 }
 
 # Quote a string for safe single-quoted embedding in a shell command line.
@@ -1266,17 +1342,18 @@ _backup_wizard() {
         fi
         if [[ "$tgt_choice" =~ ^[0-9]+$ ]] && \
            [[ "$tgt_choice" -ge 1 ]] && [[ "$tgt_choice" -lt "$i" ]]; then
-            backup_target="${targets[$((tgt_choice - 1))]}"
-            backup_target=$(echo "$backup_target" | awk '{print $1}')
+            local picked_id
+            picked_id=$(echo "${targets[$((tgt_choice - 1))]}" | awk '{print $1}')
+            _backup_pick_key "$picked_id" backup_target || { pause; return 1; }
             break
         fi
         print_warn "Enter a number between 1 and $((i-1))${_bw_def_target:+, or Enter to keep current}."
     done
 
-    # Target ID becomes part of a root-owned file path and a cron line —
+    # Target key becomes part of a root-owned file path and a cron line —
     # restrict to a safe charset before going any further.
     if ! [[ "$backup_target" =~ ^[A-Za-z0-9._-]+$ ]]; then
-        print_error "Backup target id '${backup_target}' contains unexpected characters. Aborting."
+        print_error "Backup target '${backup_target}' contains unexpected characters. Aborting."
         pause; return 1
     fi
 
@@ -1370,7 +1447,8 @@ _backup_wizard() {
     # root-only file (mode 600) at install time and read at backup time, so it
     # never appears in the crontab, crontab listings, or config exports.
     local pass_path="${_SECRET_DIR}/backup-pass-${backup_target}"
-    local backup_cmd="${_START_CLI} backup create ${backup_target} \"\$(cat ${pass_path})\""
+    local backup_cmd
+    backup_cmd="${_START_CLI} backup create $(_backup_target_cron_arg "$backup_target") \"\$(cat ${pass_path})\""
     [[ -n "$pkg_ids_arg" ]] && backup_cmd+=" --package-ids ${pkg_ids_arg}"
     _bwfl="$CRON_SCHEDULE $backup_cmd"
     [[ -n "$notif_cmd" ]] && _bwfl+=" && $notif_cmd"
@@ -1438,7 +1516,7 @@ _backup_edit_flow() {
     for (( ei=0; ei<${#old_comments[@]}; ei++ )); do
         local e_sched e_target
         e_sched=$(echo "${old_cron_lines[$ei]}" | awk '{print $1,$2,$3,$4,$5}')
-        e_target=$(echo "${old_cron_lines[$ei]}" | grep -oE "backup create [^ ]+" | awk '{print $3}')
+        e_target=$(_backup_key_from_cron_line "${old_cron_lines[$ei]}")
         echo -e "  ${BOLD}$((ei+1)))${NC} ${e_sched}  →  ${e_target:-unknown}"
         echo -e "     ${DIM}${old_comments[$ei]}${NC}"
         echo ""
@@ -1466,7 +1544,7 @@ _backup_edit_flow() {
 
     # ── Parse defaults from existing entry ───────────────────────────────────
     local def_target def_sched def_pkg def_notif=""
-    def_target=$(echo "$old_cron_line" | grep -oE "backup create [^ ]+" | awk '{print $3}')
+    def_target=$(_backup_key_from_cron_line "$old_cron_line")
     def_sched=$(echo "$old_cron_line" | awk '{print $1,$2,$3,$4,$5}')
     # If --package-ids present, extract value; otherwise empty string = all packages
     def_pkg=$(echo "$old_cron_line" | grep -oE "\-\-package-ids [^ ]+" | awk '{print $2}')
@@ -2997,9 +3075,21 @@ if [ -z "$SERVER_ID" ]; then
     echo "$(_ts): ERROR — could not resolve server id from db dump"
     exit 0
 fi
-INFO=$("$START_CLI" backup target info "$TARGET_ID" "$SERVER_ID" "$(cat "$PASS_FILE")" --format json 2>&1)
+# A disk target is stored by filesystem UUID ("uuid-<UUID>") because its
+# device name changes on replug; resolve the drive's current name now.
+case "$TARGET_ID" in
+    uuid-*)
+        _DEV=$(readlink -e "/dev/disk/by-uuid/${TARGET_ID#uuid-}") || {
+            echo "$(_ts): ERROR — backup drive ${TARGET_ID} is not connected"
+            exit 0
+        }
+        TARGET_ARG="disk-${_DEV}"
+        ;;
+    *) TARGET_ARG="$TARGET_ID" ;;
+esac
+INFO=$("$START_CLI" backup target info "$TARGET_ARG" "$SERVER_ID" "$(cat "$PASS_FILE")" --format json 2>&1)
 if [ $? -ne 0 ] || ! printf '%s' "$INFO" | jq -e '.packageBackups' >/dev/null 2>&1; then
-    echo "$(_ts): ERROR — backup target info failed for target '$TARGET_ID': $INFO"
+    echo "$(_ts): ERROR — backup target info failed for target '$TARGET_ARG' (${TARGET_ID}): $INFO"
     exit 0
 fi
 NOW=$(date +%s)
@@ -3342,7 +3432,9 @@ _monitor_install_flow() {
                 mon_target="$cur_tgt"; break
             fi
             if [[ "$tgt_choice" =~ ^[0-9]+$ ]] && (( tgt_choice >= 1 && tgt_choice < i )); then
-                mon_target=$(echo "${targets[$((tgt_choice-1))]}" | awk '{print $1}')
+                local picked_id
+                picked_id=$(echo "${targets[$((tgt_choice-1))]}" | awk '{print $1}')
+                _backup_pick_key "$picked_id" mon_target || { pause; return 1; }
                 break
             fi
             print_warn "Enter a number between 1 and $((i-1))${cur_tgt:+, or Enter to keep current}."
@@ -4422,6 +4514,10 @@ menu_documentation() {
                 echo -e "  ${BOLD}Password storage:${NC} your StartOS primary password is saved to a root-only"
                 echo -e "  file (${DIM}${_SECRET_DIR}/backup-pass-<target>${NC}, mode 600) — it does NOT appear"
                 echo -e "  in the crontab. It is briefly visible in the process list while a backup runs."
+                echo ""
+                echo -e "  ${BOLD}Physical drives:${NC} saved by filesystem UUID (${DIM}uuid-<UUID>${NC}), not by device"
+                echo -e "  name (${DIM}disk-/dev/sdb1${NC}), which can change on replug or reboot. The backup finds"
+                echo -e "  the drive by UUID each time, and fails if it is not connected."
                 echo ""
                 pause ;;
             6)
