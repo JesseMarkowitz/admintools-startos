@@ -298,6 +298,8 @@ Configuration options:
 
 Your StartOS primary password is saved to a root-only file (`/root/.startos-admin/backup-pass-<target>`, mode 600) that the cron job reads at backup time — it does not appear in the crontab. If you change your StartOS password, edit the schedule and enter the new one. Deleting a schedule does not delete its password file; see [BACKUP-GUIDE.md](BACKUP-GUIDE.md) for how to remove it.
 
+A schedule that backs up only some services passes each one to `start-cli` as its own `--package-ids` flag. Versions before v70 joined them with commas instead (`--package-ids a,b`), which `start-cli` rejects, so a schedule with two or more selected services never ran — silently, since cron discards the error. **Edit an existing backup schedule** marks those entries; pick one and save it again to fix it.
+
 **Physical drives (USB etc.)** are saved by their filesystem UUID, shown as `uuid-<UUID>`, not by the device name StartOS lists them under (`disk-/dev/sdb1`). Device names change when drives are re-plugged or the server reboots — the same name can then point at a *different* drive — so the cron job looks the drive up by UUID each time it runs. If the drive is not connected, the backup fails rather than writing to another disk. Its password file is `/root/.startos-admin/backup-pass-uuid-<UUID>`. A drive with no filesystem UUID cannot be scheduled.
 
 > **Note:** StartOS already generates a notification when a backup completes. Combining a kickoff notification with the completion notification can help estimate time it takes for backups to complete

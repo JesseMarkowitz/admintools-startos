@@ -10,7 +10,7 @@
 #   Other:    11. Save / Load configuration   12. Documentation   13. Debug mode
 # CLI:        --version --help --update [--yes] --no-update-check | disk memory interfaces [svc]
 
-VERSION="69"   # integer — increment on each release
+VERSION="70"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -275,6 +275,20 @@ _backup_target_cron_arg() {
             ;;
         *) printf '%s' "$1" ;;
     esac
+}
+
+# Print the package IDs of an installed `backup create` cron line as one
+# comma-separated list (empty = all packages). Reads both forms: one
+# --package-ids flag per package, and the comma-joined value pre-v70 wrote.
+_backup_pkg_ids_from_cron_line() {
+    printf '%s\n' "$1" | grep -oE -- "--package-ids [^ ]+" | awk '{print $2}' | paste -sd, - || true
+}
+
+# True if a `backup create` cron line carries a comma-joined --package-ids
+# value. Versions before v70 wrote that form; start-cli rejects it, so the job
+# exits without backing anything up (issue #1).
+_backup_cron_line_has_joined_ids() {
+    printf '%s\n' "$1" | grep -qE -- "--package-ids [^ ]*,"
 }
 
 # Print the target key of an installed `backup create` cron line.
@@ -1449,7 +1463,15 @@ _backup_wizard() {
     local pass_path="${_SECRET_DIR}/backup-pass-${backup_target}"
     local backup_cmd
     backup_cmd="${_START_CLI} backup create $(_backup_target_cron_arg "$backup_target") \"\$(cat ${pass_path})\""
-    [[ -n "$pkg_ids_arg" ]] && backup_cmd+=" --package-ids ${pkg_ids_arg}"
+    # start-cli takes one --package-ids flag per package; a comma-joined value
+    # is rejected as an invalid ID and the backup never runs (issue #1).
+    if [[ -n "$pkg_ids_arg" ]]; then
+        local _bw_ids _bw_id
+        IFS=',' read -ra _bw_ids <<< "$pkg_ids_arg"
+        for _bw_id in "${_bw_ids[@]}"; do
+            backup_cmd+=" --package-ids ${_bw_id}"
+        done
+    fi
     _bwfl="$CRON_SCHEDULE $backup_cmd"
     [[ -n "$notif_cmd" ]] && _bwfl+=" && $notif_cmd"
     _bwpw="$backup_password"
@@ -1519,6 +1541,10 @@ _backup_edit_flow() {
         e_target=$(_backup_key_from_cron_line "${old_cron_lines[$ei]}")
         echo -e "  ${BOLD}$((ei+1)))${NC} ${e_sched}  →  ${e_target:-unknown}"
         echo -e "     ${DIM}${old_comments[$ei]}${NC}"
+        if _backup_cron_line_has_joined_ids "${old_cron_lines[$ei]}"; then
+            echo -e "     ${YELLOW}⚠ This schedule never runs: its package list is comma-joined, which start-cli rejects.${NC}"
+            echo -e "     ${YELLOW}  Pick it and save it again to fix it.${NC}"
+        fi
         echo ""
     done
 
@@ -1546,8 +1572,10 @@ _backup_edit_flow() {
     local def_target def_sched def_pkg def_notif=""
     def_target=$(_backup_key_from_cron_line "$old_cron_line")
     def_sched=$(echo "$old_cron_line" | awk '{print $1,$2,$3,$4,$5}')
-    # If --package-ids present, extract value; otherwise empty string = all packages
-    def_pkg=$(echo "$old_cron_line" | grep -oE "\-\-package-ids [^ ]+" | awk '{print $2}')
+    # Collect every --package-ids value into one comma-separated list; none =
+    # empty string = all packages. A pre-v70 line holds one comma-joined value,
+    # which reads back the same way, so re-saving it repairs it.
+    def_pkg=$(_backup_pkg_ids_from_cron_line "$old_cron_line")
     # Extract post-action command (everything after first ' && ')
     if echo "$old_cron_line" | grep -qF ' && '; then
         def_notif=$(echo "$old_cron_line" | awk -F' && ' '{for(i=2;i<=NF;i++) printf "%s%s",$i,(i<NF?" && ":""); print ""}')
