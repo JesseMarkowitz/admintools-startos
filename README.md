@@ -30,7 +30,7 @@ This tool is intended for StartOS Administrators who:
 <summary><strong>Requirements</strong></summary>
 
 - SSH access to your StartOS server as the Start9 user
-- StartOS 0.4.0.x (most recently tested on 0.4.0.1). It does not support StartOS 0.3.5.x.
+- StartOS 0.4.0.x (most recently tested on 0.4.0.2). It does not support StartOS 0.3.5.x.
 - sudo privileges (the Start9 user has these by default)
 - `start-cli` available and authenticated (preinstalled on StartOS; most features use it)
 - `jq`, `curl`, and `openssl` (all preinstalled on StartOS; the script checks at startup)
@@ -516,3 +516,9 @@ When enabled, shows extra output during operations and enables verbose logging f
 Debug state persists within a boot session via a flag file. It is reset on reboot.
 
 </details>
+
+---
+
+## License
+
+MIT. See [LICENSE](LICENSE).
