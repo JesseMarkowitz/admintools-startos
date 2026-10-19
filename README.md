@@ -291,7 +291,7 @@ Configuration options:
 - Backup target
 - StartOS primary password (entered at a hidden prompt)
 - Services (individual selection or all)
-- Schedule — daily at midnight, daily at 3 AM, weekly on Sunday at midnight, or a custom cron expression
+- Schedule — daily at 00:00, daily at 03:00, weekly on Sunday at 00:00, or a custom cron expression. Times are the server's clock, which on StartOS is UTC, not your local time; the wizard shows the server's current time. This applies to every schedule the tool installs (cron jobs, forwarders, alerts).
 - Post-backup actions:
   - Optional shell command — enter the full command, e.g.: `curl -d "Backup to CIFs-0 for Nextcloud and Vaultwarden started" https://ntfy.sh/StartOS-adjective-noun-Alerts`
   - Optional StartOS standard UI notification

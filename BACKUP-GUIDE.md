@@ -73,9 +73,13 @@ schedule**. The wizard asks for:
 1. **StartOS primary password** — enter it at the hidden prompt. This is the
    password that encrypts the backup.
 1. **Services** — choose individual services or `all`.
-1. **Schedule** — choose daily at midnight, daily at 3 AM, weekly on Sunday at
-   midnight, or enter a five-field cron expression. Use a time when service
-   downtime will be acceptable.
+1. **Schedule** — choose daily at 00:00, daily at 03:00, weekly on Sunday at
+   00:00, or enter a five-field cron expression. Use a time when service
+   downtime will be acceptable. **All times are the server's clock, which on
+   StartOS is UTC** — not your local time. For midnight in New York, enter
+   `0 4 * * *` in summer (EDT) or `0 5 * * *` in winter (EST); cron does not
+   follow daylight saving for you. The wizard shows the server's current time
+   to convert from.
 1. **Post-backup action** — optional. StartOS already posts a completion
    notification; a separate kickoff notification or trusted webhook can make
    it easier to notice a backup that takes unusually long.

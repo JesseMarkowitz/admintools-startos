@@ -10,7 +10,7 @@
 #   Other:    11. Save / Load configuration   12. Documentation   13. Debug mode
 # CLI:        --version --help --update [--yes] --no-update-check | disk memory interfaces [svc]
 
-VERSION="70"   # integer — increment on each release
+VERSION="71"   # integer — increment on each release
 
 set -euo pipefail
 
@@ -1124,6 +1124,14 @@ _cron_manage_flow() {
     done
 }
 
+# Cron runs on the server's clock, which on StartOS is UTC, not the user's
+# local time: "45 21 * * *" fires at 21:45 UTC (5:45 PM in New York in
+# summer). Say so wherever a schedule is picked, with the current server time
+# to convert from.
+_cron_clock_note() {
+    echo -e "  ${YELLOW}Times are server time (${NC}${BOLD}$(date '+%Z')${NC}${YELLOW}), not your local time. The server's clock reads ${NC}${BOLD}$(date '+%H:%M %Z')${NC}${YELLOW} now.${NC}"
+}
+
 # Validate a 5-field cron expression. Returns 0 if valid, 1 with message if not.
 _validate_cron_expr() {
     local expr="$1"
@@ -1167,7 +1175,8 @@ _cron_add_flow() {
     echo -e "  ${BOLD}Step 1 of 3 — Schedule${NC}"
     echo -e "  ${DIM}Fields: minute(0-59)  hour(0-23)  day-of-month(1-31)  month(1-12)  day-of-week(0-7)${NC}"
     echo -e "  ${DIM}Use * for 'every', / for step (e.g. */5), - for range, , for list.${NC}"
-    echo -e "  ${DIM}Example: 0 3 * * *   (daily at 3 AM)${NC}"
+    echo -e "  ${DIM}Example: 0 3 * * *   (daily at 03:00 server time)${NC}"
+    _cron_clock_note
     echo -e "  ${DIM}Use ${CYAN}https://crontab.guru/${NC}${DIM} to build or verify your expression.${NC}"
     echo ""
     local cron_schedule=""
@@ -1276,9 +1285,11 @@ _pick_backup_schedule() {
     local _pbs_def="${1:-}"
     echo ""
     echo -e "  ${BOLD}Select backup schedule:${NC}"
-    echo -e "    ${BOLD}1)${NC} Daily at midnight     ${DIM}(0 0 * * *)${NC}"
-    echo -e "    ${BOLD}2)${NC} Daily at 3 AM         ${DIM}(0 3 * * *)${NC}"
-    echo -e "    ${BOLD}3)${NC} Weekly (Sun midnight) ${DIM}(0 0 * * 0)${NC}"
+    _cron_clock_note
+    local _pbs_tz; _pbs_tz=$(date '+%Z')
+    echo -e "    ${BOLD}1)${NC} Daily at 00:00 ${_pbs_tz}       ${DIM}(0 0 * * *)${NC}"
+    echo -e "    ${BOLD}2)${NC} Daily at 03:00 ${_pbs_tz}       ${DIM}(0 3 * * *)${NC}"
+    echo -e "    ${BOLD}3)${NC} Weekly (Sun 00:00 ${_pbs_tz})   ${DIM}(0 0 * * 0)${NC}"
     echo -e "    ${BOLD}4)${NC} Custom cron expression"
     [[ -n "$_pbs_def" ]] && echo -e "    ${BOLD}5)${NC} Keep current          ${DIM}(${_pbs_def})${NC}"
     echo ""
@@ -1326,8 +1337,12 @@ _backup_wizard() {
     print_info "Fetching backup targets..."
     local raw_targets
     if ! raw_targets=$(start-cli backup target list 2>&1); then
-        print_error "Failed to list backup targets."
-        echo -e "${RED}${raw_targets}${NC}"
+        # Right after a restart StartOS answers "Method not found" until it
+        # finishes initializing; _require_running says so instead.
+        if _require_running; then
+            print_error "Failed to list backup targets."
+            echo -e "${RED}${raw_targets}${NC}"
+        fi
         pause; return 1
     fi
 
@@ -1483,7 +1498,7 @@ _backup_wizard() {
     echo ""
     echo -e "  ${BOLD}Target:${NC}    $backup_target"
     echo -e "  ${BOLD}Packages:${NC}  $packages_display"
-    echo -e "  ${BOLD}Schedule:${NC}  $CRON_SCHEDULE"
+    echo -e "  ${BOLD}Schedule:${NC}  $CRON_SCHEDULE  ${DIM}(server time, $(date '+%Z'))${NC}"
     [[ -n "$notif_cmd" ]] && echo -e "  ${BOLD}Notify:${NC}    $notif_cmd"
     echo -e "  ${BOLD}Password:${NC}  stored root-only at ${pass_path} (not in the crontab)"
     echo ""
@@ -1869,6 +1884,7 @@ menu_schedule_stay_alive() {
 _pick_poll_frequency() {
     echo ""
     echo -e "  ${BOLD}Select check frequency:${NC}"
+    _cron_clock_note
     echo -e "    ${BOLD}1)${NC} Every 5 minutes    ${DIM}(*/5 * * * *)${NC}"
     echo -e "    ${BOLD}2)${NC} Every 15 minutes   ${DIM}(*/15 * * * *)${NC}"
     echo -e "    ${BOLD}3)${NC} Every 30 minutes   ${DIM}(*/30 * * * *)${NC}"
@@ -2838,6 +2854,7 @@ _pick_monitor_schedule() {
     local n=${#labels[@]}
     echo ""
     echo -e "  ${BOLD}Select check schedule:${NC}"
+    _cron_clock_note
     local i
     for i in "${!labels[@]}"; do
         echo -e "    ${BOLD}$((i+1)))${NC} ${labels[$i]}  ${DIM}(${exprs[$i]})${NC}"
@@ -3434,8 +3451,12 @@ _monitor_install_flow() {
         print_info "Fetching backup targets..."
         local raw_targets
         if ! raw_targets=$(start-cli backup target list 2>&1); then
-            print_error "Failed to list backup targets."
-            echo -e "${RED}${raw_targets}${NC}"
+            # Right after a restart StartOS answers "Method not found" until it
+            # finishes initializing; _require_running says so instead.
+            if _require_running; then
+                print_error "Failed to list backup targets."
+                echo -e "${RED}${raw_targets}${NC}"
+            fi
             pause; return 1
         fi
         local -a targets=()
