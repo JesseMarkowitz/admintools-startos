@@ -1,5 +1,22 @@
 # startos-admin
 
+> [!WARNING]
+> **StartOS 0.4.1 is not yet supported.** startos-admin v71 is tested through
+> StartOS 0.4.0.4. StartOS 0.4.1 changed how backup passwords are passed to
+> `start-cli`, which breaks the **Backup staleness alert**: on 0.4.1 it stops
+> alerting and reports nothing. Other features have not been tested on 0.4.1.
+>
+> - **On StartOS 0.4.0.x:** use v71.
+> - **Before updating to 0.4.1:** save your configuration (option 11) so you can
+>   load it afterwards. Any StartOS update removes the cron jobs, forwarders and
+>   alerts this tool installed.
+> - **Already on 0.4.1:** don't rely on the Backup staleness alert until a release
+>   that supports 0.4.1 is out. Check your backups another way in the meantime,
+>   e.g. the last-backup time in the StartOS UI.
+>
+> This section will list which startos-admin version to use with each StartOS
+> version once 0.4.1 support ships.
+
 Interactive administrative menu for StartOS servers. Run it over SSH to see disk,
 memory and system details, schedule backups and other recurring jobs, forward
 StartOS notifications to outside services, and set up alerts — all from a menu
@@ -30,7 +47,7 @@ This tool is intended for StartOS Administrators who:
 <summary><strong>Requirements</strong></summary>
 
 - SSH access to your StartOS server as the Start9 user
-- StartOS 0.4.0.x (most recently tested on 0.4.0.2). It does not support StartOS 0.3.5.x.
+- StartOS 0.4.0.x (most recently tested on 0.4.0.4). StartOS 0.4.1 is not yet supported (see the warning at the top). It does not support StartOS 0.3.5.x.
 - sudo privileges (the Start9 user has these by default)
 - `start-cli` available and authenticated (preinstalled on StartOS; most features use it)
 - `jq`, `curl`, and `openssl` (all preinstalled on StartOS; the script checks at startup)
