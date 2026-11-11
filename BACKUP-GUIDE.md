@@ -12,13 +12,24 @@ manual backup test before adding automation.
 
 ## Before you begin
 
-- Run StartOS 0.4.0.x and have SSH access as the `start9` user.
+- Run StartOS 0.4.0 or newer and have SSH access as the `start9` user.
 - Have a backup target configured in StartOS: a supported physical drive or a
   network folder on your LAN.
 - Know the StartOS primary password that will encrypt the backup.
 - Plan for the interruption: StartOS stops each service it backs up, performs
   the backup, then restarts it only if it was running beforehand. A service
   that was stopped remains stopped.
+
+> [!NOTE]
+> **StartOS 0.4.1 and newer: backup format conversion.** When you create a
+> backup in the web interface, StartOS 0.4.1+ offers to convert an existing
+> backup on that target to a newer format. Conversion runs in the background
+> and can take a long time; a scheduled backup to that target fails while it
+> runs, so let it finish before the next scheduled run (or skip conversion).
+> After conversion, StartOS versions older than 0.4.1 can no longer read that
+> target, so don't convert a target you may need to restore onto an older
+> StartOS. Conversion is started only from the web interface, never by a
+> scheduled backup.
 
 For valuable data, especially Lightning data, maintain current backups on more
 than one target. A new backup replaces the prior backup on the *same* target;

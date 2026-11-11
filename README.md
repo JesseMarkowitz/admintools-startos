@@ -1,21 +1,21 @@
 # startos-admin
 
-> [!WARNING]
-> **StartOS 0.4.1 is not yet supported.** startos-admin v71 is tested through
-> StartOS 0.4.0.4. StartOS 0.4.1 changed how backup passwords are passed to
-> `start-cli`, which breaks the **Backup staleness alert**: on 0.4.1 it stops
-> alerting and reports nothing. Other features have not been tested on 0.4.1.
+> [!IMPORTANT]
+> **Which StartOS versions are supported**
 >
-> - **On StartOS 0.4.0.x:** use v71.
-> - **Before updating to 0.4.1:** save your configuration (option 11) so you can
->   load it afterwards. Any StartOS update removes the cron jobs, forwarders and
->   alerts this tool installed.
-> - **Already on 0.4.1:** don't rely on the Backup staleness alert until a release
->   that supports 0.4.1 is out. Check your backups another way in the meantime,
->   e.g. the last-backup time in the StartOS UI.
+> | StartOS | startos-admin |
+> | --- | --- |
+> | 0.4.0.3 – 0.4.2 | v72 and newer (tested on 0.4.2) |
+> | 0.4.0 – 0.4.0.2 | v72 works except the **Backup staleness alert**, which needs 0.4.0.3 or newer — update StartOS |
+> | 0.3.5.x | not supported |
 >
-> This section will list which startos-admin version to use with each StartOS
-> version once 0.4.1 support ships.
+> v71 and older: the Backup staleness alert stops working on StartOS 0.4.1 and newer
+> (0.4.1 changed how backup passwords are passed to `start-cli`). v72 fixes it and
+> offers to rebuild your installed alerts the first time you start it.
+>
+> **Any StartOS update removes the cron jobs, forwarders and alerts this tool
+> installed.** Save your configuration (option 11) before updating StartOS, and Load
+> it afterwards.
 
 Interactive administrative menu for StartOS servers. Run it over SSH to see disk,
 memory and system details, schedule backups and other recurring jobs, forward
@@ -34,10 +34,10 @@ remove it safely.
 
 This tool is intended for StartOS Administrators who:
 
-- Want additional functionality not currently (as of October 2026) available in the graphical user interface
+- Want additional functionality not currently (as of November 2026) available in the graphical user interface
 - Prefer menu-driven administration over manual CLI use
 - Have SSH access to their server
-- For StartOS SSH information see: https://docs.start9.com/start-os/0.4.0.x/ssh.html
+- For StartOS SSH information see: https://docs.start9.com/start-os/ssh.html
 
 </details>
 
@@ -47,7 +47,7 @@ This tool is intended for StartOS Administrators who:
 <summary><strong>Requirements</strong></summary>
 
 - SSH access to your StartOS server as the Start9 user
-- StartOS 0.4.0.x (most recently tested on 0.4.0.4). StartOS 0.4.1 is not yet supported (see the warning at the top). It does not support StartOS 0.3.5.x.
+- StartOS 0.4.0.3 or newer (most recently tested on 0.4.2). On 0.4.0–0.4.0.2 everything except the Backup staleness alert works. StartOS 0.3.5.x is not supported.
 - sudo privileges (the Start9 user has these by default)
 - `start-cli` available and authenticated (preinstalled on StartOS; most features use it)
 - `jq`, `curl`, and `openssl` (all preinstalled on StartOS; the script checks at startup)
@@ -67,7 +67,7 @@ Key risks and cautions:
 
 - **Root-level impact:** If you run this script as `root` (or via `sudo`), it can modify system state (e.g., write to `/usr/local/bin`, create/edit cron entries, create state files, make outbound HTTP requests). Mistakes or malicious changes could cause system damage or data loss.
 - **Not formally vetted or approved:** This project has **not** been heavily security-audited, formally reviewed, or approved by Start9/StartOS. It may contain bugs or unsafe assumptions.
-- **Backup password storage:** When you schedule a backup, your StartOS primary password is stored in a root-only file (`/root/.startos-admin/backup-pass-<target>`, mode 600) that the cron job reads at backup time. It does **not** appear in the crontab. It **is** included, encrypted, in a saved configuration file (see *Save / Load Configuration*), so protect that file and its passphrase accordingly. Residual exposure: the password is briefly visible in the process list (`ps`) while a backup is running, and the file remains if you later delete the backup cron entry. To remove it permanently, delete it inside persistence mode (`chroot-and-upgrade`) as described in [BACKUP-GUIDE.md](BACKUP-GUIDE.md) — a plain `sudo rm` is undone at the next restart. Backups scheduled with versions ≤ 56 still have the password inline in the crontab — edit the schedule once to migrate it to the new format.
+- **Backup password storage:** When you schedule a backup, your StartOS primary password is stored in a root-only file (`/root/.startos-admin/backup-pass-<target>`, mode 600) that the cron job reads at backup time. It does **not** appear in the crontab. It **is** included, encrypted, in a saved configuration file (see *Save / Load Configuration*), so protect that file and its passphrase accordingly. Residual exposure: the password is briefly visible in the process list (`ps`) while a backup is running, and the file remains if you later delete the backup cron entry. To remove it permanently, delete it inside persistence mode (`chroot-and-upgrade`) as described in [BACKUP-GUIDE.md](BACKUP-GUIDE.md) — a plain `sudo rm` is undone at the next restart. Backups scheduled with versions ≤ 56 still have the password inline in the crontab — edit the schedule once to migrate it to the new format. Backup staleness alerts no longer use a password (v72); a password file stored for an older alert stays until you remove it, and a backup schedule to the same target still uses it.
 - **Update integrity verification:** Updates and configuration-load downloads are verified against a signature (`startos-admin.sh.sig`) using a public key embedded in the script before anything is installed. A script that fails verification is never installed. Trust is anchored at first install (review the script you initially download); a compromised repository cannot push executable code without the private signing key, which is not stored in the repository.
 - **Input validation:** Webhook/stay-alive URLs and keyword filters are restricted to conservative character sets, and notification titles/messages are shell-escaped, so user input cannot inject commands into the root crontab or generated forwarder scripts. `%` is rejected in values that end up in cron lines (cron treats it as a newline).
 - **Alert/post-action shell commands run as root:** commands you configure for alerts and post-backup/cron actions execute as root via cron, by design. Only enter commands you trust — they have the same power as anything else you run with sudo.
@@ -137,7 +137,7 @@ The data commands print plain/tab-separated output suitable for monitoring scrip
 
 By default, StartOS does not persist changes across reboots.  This lets users easily recover from almost all issues by rebooting the server and the base StartOS code will execute cleanly.   
 
-There are times when it is helpful to have your changes persist across reboots.  This can be done by entering chroot edit mode with `sudo /usr/lib/startos/scripts/chroot-and-upgrade`.  Changes made in this mode are preserved.  When you exit this mode your StartOS server will automatically reboot.  (The StartOS 0.4.0.x docs do not currently cover this mode; an older 0.3.5.x guide shows it in use: https://docs.start9.com/0.3.5.x/misc-guides/ssh-tor.html.)
+There are times when it is helpful to have your changes persist across reboots.  This can be done by entering chroot edit mode with `sudo /usr/lib/startos/scripts/chroot-and-upgrade`.  Changes made in this mode are preserved.  When you exit this mode your StartOS server will automatically reboot.  (The StartOS 0.4 docs do not currently cover this mode; an older 0.3.5.x guide shows it in use: https://docs.start9.com/0.3.5.x/misc-guides/ssh-tor.html.)
 
 startos-admin has the capability built in to make changes persistent using the above approach. 
 
@@ -177,6 +177,8 @@ Instead of applying immediately, any change can be *staged*. Staged changes queu
 ---
 
 ### Actions
+
+The top of the main menu shows a short server status, the same facts the SSH login banner prints: hostname, StartOS version, uptime, NTP sync, services running out of installed, data drive used/total, memory used/total, and the last backup time (server time, with how long ago). It is refreshed each time you return to the main menu (at most every 30 seconds). While StartOS is starting up it says so instead.
 
 The script presents an interactive menu with the following options, grouped into **Display**, **Create**, **Manage**, and **Other**. Changes made by Create/Manage actions can be applied immediately (one restart each) or staged and applied together (see *Staged Changes*).
 
@@ -220,7 +222,7 @@ Sub-options:
 
 **3) Service Status** — desired state and health-check results for every installed service.
 
-**4) Service Detail** — deep view of a single service: status, started time, last backup, registry, health checks, and dependencies.
+**4) Service Detail** — deep view of a single service: status, started time, last backup, registry, health checks, and dependencies. Last backup is the service's last *successful* backup to any target; StartOS records it from 0.4.0.3 on.
 
 **5) Service Interfaces** — displays all externally reachable URLs for one or more services. Select individual services (comma-separated) or all at once.
 
@@ -456,7 +458,7 @@ Options:
 Alert types:
 
 - **Disk usage alert** — fires when disk usage reaches your percent threshold.
-- **Backup staleness alert** — fires when any service has not been backed up within your day threshold. Services that have never been backed up count as stale; you can exclude services that are intentionally not backed up. One message lists **all** stale services, e.g. `Backup staleness: 2 service(s) exceed 7 day(s): nextcloud (9 days), vaultwarden (never)`. Because StartOS 0.4.0 does not track per-service backup times locally, this alert reads real backup dates from a backup target you choose, using your stored backup password (`/root/.startos-admin/backup-pass-<target>`; the wizard collects it if not already stored). A physical drive is stored by filesystem UUID (`uuid-<UUID>`), as for backup schedules: the alert finds the drive under whatever device name it has that day, and logs an error rather than checking another disk if it is not connected. The password is briefly visible in the process list during each check — the default daily schedule keeps this rare.
+- **Backup staleness alert** — fires when any service has not been backed up within your day threshold. Services that have never been backed up count as stale; you can exclude services that are intentionally not backed up. One message lists **all** stale services, e.g. `Backup staleness: 2 service(s) exceed 7 day(s): nextcloud (9 days), vaultwarden (never)`. It reads each service's last *successful* backup time, to any target, from the StartOS database (`packageData.<id>.lastBackup`, recorded from StartOS 0.4.0.3 on), so it needs no backup password. Optionally it can also watch one backup target and alert when that target has not received a backup within the threshold (read from `start-cli backup target list`, also without a password) — useful when you back up to more than one place and want to know if one of them stops, e.g. `...; backup target cifs-0 last received a backup 9 days ago`. A physical drive is stored by filesystem UUID (`uuid-<UUID>`), as for backup schedules, and is found under whatever device name it has that day. A watched target that is not connected or can't be reached counts as a failed check (see below); the per-service part still runs. Alerts made by v71 and older passed your backup password to `backup target info`, which StartOS 0.4.1 no longer accepts; v72 offers to rebuild them at launch.
 - **Service health watchdog** — fires when a service that should be running has failing health checks or is not running, only after the problem persists across two consecutive checks (avoids noise from restarts and updates).
 - **Drive health alert** — fires when an NVMe drive reports trouble in its SMART health log: any critical warning from the drive itself (reliability degraded, read-only mode, temperature out of safe range, spare below threshold), spare capacity below the drive's own threshold, wear (percentage of rated endurance used) at or past your percent threshold, or media errors appearing or increasing. This is the early warning the StartOS UI does not provide — it shows disk usage and temperature, but nothing warns you a drive is wearing out or failing. Reads the SMART log directly from the kernel via a built-in helper (no extra packages installed on your server); the setup wizard shows your drives' current readings. NVMe drives only — SATA/USB drives are not monitored. All drives are checked by one alert; the message names the affected drive, e.g. `Drive health: Samsung SSD 970 EVO Plus 2TB (/dev/nvme0): 91% of rated endurance used (alert threshold 90%)`.
 
@@ -464,7 +466,11 @@ Alert types:
 
 **Re-alert policy:** alert on first detection, immediately when the list of affected services changes, and at most one reminder per 24 hours while the condition persists. No recovery (all-clear) message is sent. Alert state is volatile — after a reboot, an ongoing condition re-alerts once.
 
-**Startup skip:** the two monitors that read the system database (backup staleness, service health) check `start-cli state` first and skip the run while StartOS is initializing, logging `skipped — StartOS not running`. Without this a reboot produces a `db dump` error in the log on every scheduled run until the server finishes coming up, since the initializing server serves no `db.*` methods.
+**Startup skip:** the two monitors that read the system database (backup staleness, service health) check `start-cli state` first and skip the run while StartOS is initializing, logging `skipped — StartOS is still starting up`. Without this a reboot produces a `db dump` error in the log on every scheduled run until the server finishes coming up, since the initializing server serves no `db.*` methods.
+
+**When a check can't run:** an alert that can't do its check (StartOS unreachable or in diagnostic mode, `db dump` failing, an NVMe drive that won't answer, a watched backup target that is not connected) logs the error and counts it. After **3 failed runs in a row** it sends one notification through its usual route, e.g. `Backup Staleness Alert [daily]: the check has failed 3 times in a row, so this alert may miss problems until it is fixed. Last error: …`, then stays quiet until a run succeeds, which resets the count. A server that is still starting up doesn't count. The **List** view shows an alert whose check is currently failing. The count is volatile, like alert state.
+
+**Rebuilding after an update:** generated alert scripts carry a format number. When a new startos-admin version changes how alerts work, it lists the older alerts at launch and offers to rebuild them with their current settings in one restart (or stage it). Loading a configuration saved by an older version rebuilds its alerts the same way.
 
 **Named instances:** you can install several alerts of the same type, each with its own name, threshold, notification route, and schedule — e.g. `disk [warn50]` sending an ntfy info at 50% **plus** `disk [crit85]` raising a StartOS error at 85%, or two backup staleness alerts watching different targets. Instances are fully independent: with disk at 87%, both of those example alerts are in alert state, each with its own daily reminder. Re-running an alert's wizard updates it; alerts installed before naming existed are migrated to a named instance the first time you edit them. Alerts are included in Save / Load configuration.
 
