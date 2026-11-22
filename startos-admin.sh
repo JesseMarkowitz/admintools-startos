@@ -10,13 +10,22 @@
 #   Other:    11. Save / Load configuration   12. Documentation   13. Debug mode
 # CLI:        --version --help --update [--yes] --no-update-check | disk memory interfaces [svc]
 
-VERSION="72"   # integer — increment on each release
+VERSION="73"   # integer — increment on each release
 
-# Generated alert scripts carry MONITOR_FORMAT. Bump this whenever the
-# generator changes in a way installed alerts must pick up; at launch the menu
-# offers to rebuild every alert below it (settings kept). 2 = v72: password-free
-# backup staleness check, "check failing" notifications.
+# Generated alert scripts carry MONITOR_FORMAT. Bump a type's format whenever
+# its generated script changes in a way installed alerts must pick up; at
+# launch the menu offers to rebuild every alert below its type's format
+# (settings kept).
+#   2 = v72: password-free backup staleness check, "check failing" notices.
+#   3 = v73 (backup-age only): StartOS 0.4.3 backup targets (registered ids,
+#       availability).
 _MONITOR_FORMAT=2
+_monitor_format() {
+    case "$1" in
+        backup-age) echo 3 ;;
+        *)          echo "$_MONITOR_FORMAT" ;;
+    esac
+}
 
 set -euo pipefail
 
@@ -43,7 +52,8 @@ _POLLER_BIN_PREFIX="/usr/local/bin/startos-notif-poller-"
 _STARTOS_DATA_DIR="/usr/local/share/startos-admin"
 _POLLER_STATE_PREFIX="${_STARTOS_DATA_DIR}/startos-admin-poller-state-"
 _POLLER_LOG_PREFIX="${_STARTOS_DATA_DIR}/startos-notif-poller-"
-# Alert monitors (disk / backup-age / health / drive) — named instances.
+# Alert monitors (disk / backup-age / backup-ok / backup-failed / health /
+# drive) — named instances.
 _MONITOR_BIN_PREFIX="/usr/local/bin/startos-monitor-"
 _MONITOR_DATA_PREFIX="${_STARTOS_DATA_DIR}/startos-monitor-"
 _MONITOR_VOLUMES_PATH="/media/startos/data/package-data/volumes/"
@@ -58,6 +68,10 @@ _SECRET_DIR="/root/.startos-admin"
 # restart. Root-only (blocks can contain backup-password base64). Survives
 # script exit; lost on reboot (applying always reboots anyway).
 _STAGED_FILE="${_SECRET_DIR}/staged-changes"
+# Ends every chroot session: delete backup-password files that no cron line
+# (active or commented out) refers to any more, so removing or retargeting a
+# backup schedule doesn't leave the password behind on disk.
+_SECRET_SWEEP_CMDS="for __f in ${_SECRET_DIR}/backup-pass-*; do if [ -f \"\$__f\" ] && ! crontab -l 2>/dev/null | grep -qF \"\$__f\"; then rm -f \"\$__f\"; fi; done; true"
 # Single source of truth for the published script location.
 _REPO_RAW_URL="https://raw.githubusercontent.com/JesseMarkowitz/admintools-startos/refs/heads/main/startos-admin.sh"
 # Public key used to verify release signatures (startos-admin.sh.sig) before
@@ -120,7 +134,9 @@ debug_log() {
 # ─────────────────────────────────────────────
 
 print_header() {
-    clear
+    # clear fails without a usable TERM (e.g. TERM=dumb, or none); under set -e
+    # that would end the script silently, so it is cosmetic only.
+    clear 2>/dev/null || true
     echo -e "${CYAN}${BOLD}"
     echo "  ╔══════════════════════════════════════════╗"
     printf "  ║      StartOS Admin Menu  v%-15s║\n" "${VERSION}"
@@ -180,6 +196,31 @@ _require_running() {
     esac
     return 1
 }
+
+# StartOS version ("0.4.3"), from the file every 0.4.x image ships; empty if
+# unreadable.
+_os_version() {
+    local v
+    v=$(head -c 64 /usr/lib/startos/VERSION.txt 2>/dev/null | tr -d '[:space:]') || v=""
+    printf '%s' "$v"
+}
+
+# True if StartOS is at least version $1 (pre-release suffixes ignored).
+# Unknown version → false.
+_os_at_least() {
+    local v
+    v=$(_os_version)
+    v="${v%%[-:+~]*}"
+    [[ -n "$v" ]] || return 1
+    [[ "$(printf '%s\n%s\n' "$1" "$v" | sort -V | head -1)" == "$1" ]]
+}
+
+# StartOS 0.4.3 replaced backup targets: they are registered in System →
+# Backups, disk targets get a permanent id (32-character GUID, the drive kept
+# as /dev/disk/by-uuid/<UUID>), unregistered drives are not listed, and the
+# old "disk-/dev/sdX" ids are rejected. Backup results go to History instead
+# of notifications.
+_backup_targets_registered() { _os_at_least 0.4.3; }
 
 # Bytes → "1.2T" / "6.1G" / "512M" (one decimal above M).
 _human_bytes() {
@@ -325,12 +366,31 @@ parse_package_ids() {
 }
 
 # Extract backup targets from start-cli backup target list JSON output.
-# Outputs one line per target: "id  (hostname/path)"
+# Outputs one line per target: "id  (description)"
 # The ID is always the first whitespace-delimited field on each line.
+# Two shapes: StartOS 0.4.3+ lists registered targets as {name, source:{kind,
+# …}, availability, available, error}; older StartOS lists every partition and
+# CIFS share as {type, …}.
 parse_backup_targets() {
     echo "$1" | jq -r '
+        def human: if . == null then null
+            elif . >= 1e12 then "\(. / 1e11 | floor / 10)T"
+            elif . >= 1e9 then "\(. / 1e8 | floor / 10)G"
+            else "\(. / 1e6 | floor)M" end;
         to_entries[] |
-        if .value.type == "disk" then
+        if (.value.source | type) == "object" then
+            .value as $t | $t.source as $s |
+            (if $s.kind == "cifs" then "network share"
+             elif $s.kind == "local" then "folder on this server"
+             elif $s.kind == "disk" then
+                ([$s.drive.vendor, $s.drive.model] | map(select(. != null and . != "")) | join(" ")
+                 | if . == "" then "drive" else "drive: \(.)" end)
+             else ($s.kind // "unknown") end) as $kind |
+            (if $t.availability == "unavailable" then ", UNAVAILABLE\(if $t.error then ": \($t.error)" else "" end)"
+             elif ($t.available | human) then ", \($t.available | human) free"
+             else "" end) as $state |
+            "\(.key)  (\($t.name // "unnamed") — \($kind)\($state))"
+        elif .value.type == "disk" then
             "\(.key)  (\([.value.vendor, .value.model] | map(select(. != null)) | join(" ") | if . == "" then "disk" else . end), \((.value.capacity // 0) / 1e9 * 10 | floor / 10) GB\(if .value.label then ", label \(.value.label)" else "" end))"
         else
             "\(.key)  (\(.value.hostname // .value.type // "unknown")\(.value.path // ""))"
@@ -422,6 +482,42 @@ _backup_pick_key() {
         print_info "Disk target saved as '${_bpk_key}' (its filesystem UUID), so it follows"
         print_info "this drive even if its device name (now ${id#disk-}) changes."
     fi
+}
+
+# StartOS 0.4.3+: print the registered target id for an old "uuid-<UUID>" key,
+# i.e. the drive added in System → Backups whose partition has that filesystem
+# UUID, at its root (where pre-0.4.3 backups were written).
+# $1 = uuid key, $2 = `backup target list` JSON. Returns 1 if none.
+_backup_uuid_to_registered() {
+    local u="${1#uuid-}" id
+    id=$(printf '%s' "$2" | jq -r --arg p "${_BACKUP_UUID_DIR}/${u}" '
+        to_entries[]
+        | select(.value.source.kind? == "disk"
+                 and .value.source.logicalname == $p
+                 and ((.value.source.path // "") == ""))
+        | .key' 2>/dev/null | head -1) || id=""
+    [[ -n "$id" && "$id" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+    printf '%s\n' "$id"
+}
+
+# Rewrite one installed `backup create` cron line that targets a drive by
+# "uuid-<UUID>" (pre-0.4.3 form) to the drive's registered id, password file
+# included. $1 = cron line, $2 = target list JSON, $3/$4 = namerefs for the
+# new line and "old-key new-key". Returns 1 if the line is not in that form,
+# 2 if the drive is not registered.
+_backup_line_to_registered() {
+    local line="$1" tlist="$2"
+    local -n _bltr_line="$3" _bltr_keys="$4"
+    local key gid
+    key=$(_backup_key_from_cron_line "$line")
+    [[ "$key" == uuid-* ]] || return 1
+    gid=$(_backup_uuid_to_registered "$key" "$tlist") || return 2
+    local u="${key#uuid-}"
+    local old_arg="\"disk-\$(readlink -e ${_BACKUP_UUID_DIR}/${u} || echo ${_BACKUP_UUID_DIR}/${u}-not-connected)\""
+    [[ "$line" == *"$old_arg"* ]] || return 1
+    _bltr_line="${line/"$old_arg"/$gid}"
+    _bltr_line="${_bltr_line//"${_SECRET_DIR}/backup-pass-${key}"/${_SECRET_DIR}/backup-pass-${gid}}"
+    _bltr_keys="${key} ${gid}"
 }
 
 # Quote a string for safe single-quoted embedding in a shell command line.
@@ -568,6 +664,7 @@ _staged_run_chroot() {
         [[ -n "$all" ]] && all+=$'\n'
         all+="$extra"
     fi
+    all+=$'\n'"$_SECRET_SWEEP_CMDS"
     local chroot_exit=0
     printf '%s\nexit\n' "$all" | sudo /usr/lib/startos/scripts/chroot-and-upgrade || chroot_exit=$?
     debug_log "chroot-and-upgrade exit: $chroot_exit"
@@ -1455,8 +1552,15 @@ _backup_wizard() {
 
     mapfile -t targets <<< "$(parse_backup_targets "$raw_targets")"
 
+    [[ -z "${targets[0]:-}" ]] && targets=()
+    local _bw_registered=0
+    _backup_targets_registered && _bw_registered=1
     if [[ ${#targets[@]} -eq 0 ]]; then
-        print_warn "No backup targets found. Add a target in the StartOS UI first."
+        if [[ $_bw_registered -eq 1 ]]; then
+            print_warn "No backup targets found. Add one in the StartOS web interface first (System → Backups)."
+        else
+            print_warn "No backup targets found. Add a target in the StartOS UI first."
+        fi
         pause; return 1
     fi
 
@@ -1467,6 +1571,10 @@ _backup_wizard() {
         echo -e "    ${BOLD}${i})${NC} ${tgt}"
         (( i++ ))
     done
+    if [[ $_bw_registered -eq 1 ]]; then
+        echo -e "  ${DIM}Only targets added in System → Backups are listed. To back up to a drive,${NC}"
+        echo -e "  ${DIM}add it there first — a drive that already holds backups keeps them.${NC}"
+    fi
     [[ -n "$_bw_def_target" ]] && echo -e "  ${DIM}Current: ${_bw_def_target} — press Enter to keep${NC}"
     echo ""
 
@@ -1485,6 +1593,21 @@ _backup_wizard() {
         fi
         print_warn "Enter a number between 1 and $((i-1))${_bw_def_target:+, or Enter to keep current}."
     done
+
+    # A kept pre-0.4.3 drive key ("uuid-<UUID>") no longer works on 0.4.3:
+    # switch to the drive's registered id.
+    if [[ $_bw_registered -eq 1 && "$backup_target" == uuid-* ]]; then
+        local _bw_gid
+        if _bw_gid=$(_backup_uuid_to_registered "$backup_target" "$raw_targets"); then
+            print_info "This drive is now registered in StartOS as '${_bw_gid}'; the schedule will use that id."
+            backup_target="$_bw_gid"
+        else
+            print_error "StartOS 0.4.3 backs up only to drives added in System → Backups, and this"
+            print_error "drive (filesystem UUID ${backup_target#uuid-}) has not been added. Add it there"
+            print_error "(its existing backups are kept), then edit this schedule again."
+            pause; return 1
+        fi
+    fi
 
     # Target key becomes part of a root-owned file path and a cron line —
     # restrict to a safe charset before going any further.
@@ -2885,8 +3008,8 @@ _monitor_installed() {
     for f in "${_MONITOR_BIN_PREFIX}"*; do
         [[ -f "$f" ]] || continue
         suffix="${f##"${_MONITOR_BIN_PREFIX}"}"
-        # Match longest type prefix first (backup-age contains a hyphen).
-        for type in backup-age disk drive health; do
+        # Match the hyphenated types first (a bare-type prefix would swallow them).
+        for type in backup-age backup-ok backup-failed disk drive health; do
             if [[ "$suffix" == "$type" ]]; then
                 printf '%s\t%s\t%s\n' "$type" "" "$f"
                 continue 2
@@ -2908,6 +3031,8 @@ _monitor_label() {
     case "$1" in
         disk)       echo "Disk usage alert" ;;
         backup-age) echo "Backup staleness alert" ;;
+        backup-ok)  echo "Backup succeeded alert" ;;
+        backup-failed) echo "Backup failed alert" ;;
         health)     echo "Service health watchdog" ;;
         drive)      echo "Drive health alert" ;;
     esac
@@ -2917,6 +3042,8 @@ _monitor_title() {
     case "$1" in
         disk)       echo "Disk Usage Alert" ;;
         backup-age) echo "Backup Staleness Alert" ;;
+        backup-ok)  echo "Backup Succeeded Alert" ;;
+        backup-failed) echo "Backup Failed Alert" ;;
         health)     echo "Service Health Alert" ;;
         drive)      echo "Drive Health Alert" ;;
     esac
@@ -2990,10 +3117,13 @@ _pick_monitor_schedule() {
 # Notification method picker for monitors: shell command / StartOS / both.
 # The alert text is dynamic, so the shell command receives it as $MSG.
 # Sets namerefs: shell_cmd (raw, empty = none), startos (0/1), level.
-# Optional $4/$5/$6 = current values for prefill (edit flow).
+# Optional $4/$5/$6 = current values for prefill (edit flow); $7 = the level
+# offered as the default for a new choice (info/warning/error, default warning).
 _pick_monitor_notify() {
     local -n _pmn_cmd="$1" _pmn_sos="$2" _pmn_lvl="$3"
     local _pmn_def_cmd="${4:-}" _pmn_def_sos="${5:-}" _pmn_def_lvl="${6:-}"
+    local _pmn_new_lvl="${7:-warning}" _pmn_dn=2
+    case "$_pmn_new_lvl" in info) _pmn_dn=1 ;; error) _pmn_dn=3 ;; esac
     _pmn_cmd=""; _pmn_sos=0; _pmn_lvl="warning"
 
     echo ""
@@ -3060,8 +3190,8 @@ _pick_monitor_notify() {
         echo ""
         local _pmn_lc
         while true; do
-            _read _pmn_lc "  Choice [1-3, default 2]: " || return 1
-            case "${_pmn_lc:-2}" in
+            _read _pmn_lc "  Choice [1-3, default ${_pmn_dn}]: " || return 1
+            case "${_pmn_lc:-$_pmn_dn}" in
                 1) _pmn_lvl="info";    break ;;
                 2) _pmn_lvl="warning"; break ;;
                 3) _pmn_lvl="error";   break ;;
@@ -3139,7 +3269,7 @@ _monitor_script_content() {
 # StartOS Alert Monitor — generated by startos-admin.sh
 # Monitor: ${inst}
 # Re-run startos-admin (main menu → 10, Alerts) to update this configuration.
-MONITOR_FORMAT=\"${_MONITOR_FORMAT}\"
+MONITOR_FORMAT=\"$(_monitor_format "$type")\"
 MONITOR_TYPE=\"${type}\"
 MONITOR_NAME=\"${name}\"
 THRESHOLD=\"${threshold}\"
@@ -3300,34 +3430,62 @@ if [ $? -ne 0 ]; then
 fi
 TARGET_STALE=""
 if [ -n "$TARGET_ID" ]; then
-    # A disk target is stored by filesystem UUID ("uuid-<UUID>") because its
-    # device name changes on replug; find the drive's current name now.
+    TLIST=$(timeout 120 "$START_CLI" backup target list 2>&1)
+    _TRC=$?
+    TLIST_OK=1
+    if [ "$_TRC" -ne 0 ] || ! printf '%s' "$TLIST" | jq -e 'type == "object"' >/dev/null 2>&1; then
+        TLIST_OK=0
+    fi
+    # StartOS 0.4.3+ lists only targets registered in System → Backups, each
+    # with a "source"; older StartOS lists every partition and CIFS share.
+    REGISTERED=0
+    _OLDEST=$(printf '%s\n%s\n' "0.4.3" "${OS_VER%%[-:]*}" | sort -V | head -1)
+    [ "$_OLDEST" = "0.4.3" ] && REGISTERED=1
+    # A pre-0.4.3 disk target is stored by filesystem UUID ("uuid-<UUID>")
+    # because its device name changes on replug. Before 0.4.3, find the
+    # drive's current device name; from 0.4.3, find the registered target
+    # that holds that partition.
     TARGET_ARG="$TARGET_ID"
     case "$TARGET_ID" in
         uuid-*)
-            _DEV=$(readlink -e "/dev/disk/by-uuid/${TARGET_ID#uuid-}") || _DEV=""
-            TARGET_ARG="disk-${_DEV}"
+            if [ "$REGISTERED" = 1 ]; then
+                TARGET_ARG=$(printf '%s' "$TLIST" | jq -r --arg p "/dev/disk/by-uuid/${TARGET_ID#uuid-}" '
+                    to_entries[] | select(.value.source.kind? == "disk" and .value.source.logicalname == $p
+                                          and ((.value.source.path // "") == "")) | .key' 2>/dev/null | head -1)
+            else
+                _DEV=$(readlink -e "/dev/disk/by-uuid/${TARGET_ID#uuid-}") || _DEV=""
+                TARGET_ARG="${_DEV:+disk-${_DEV}}"
+            fi
             ;;
     esac
-    TLIST=$(timeout 120 "$START_CLI" backup target list 2>&1)
-    if [ $? -ne 0 ] || ! printf '%s' "$TLIST" | jq -e 'type == "object"' >/dev/null 2>&1; then
+    if [ "$TLIST_OK" != 1 ]; then
         CHECK_ERR="could not list backup targets: ${TLIST:0:200}"
-    elif [ "$TARGET_ARG" = "disk-" ] || ! printf '%s' "$TLIST" | jq -e --arg t "$TARGET_ARG" 'has($t)' >/dev/null 2>&1; then
-        CHECK_ERR="backup target ${TARGET_ID} is not connected"
-    elif [ "$(printf '%s' "$TLIST" | jq -r --arg t "$TARGET_ARG" '.[$t].mountable == false')" = "true" ]; then
-        CHECK_ERR="backup target ${TARGET_ID} could not be reached"
+    elif [ -z "$TARGET_ARG" ] && [ "$REGISTERED" = 1 ]; then
+        CHECK_ERR="backup target ${TARGET_ID} has not been added in System → Backups"
+    elif [ -z "$TARGET_ARG" ] || ! printf '%s' "$TLIST" | jq -e --arg t "$TARGET_ARG" 'has($t)' >/dev/null 2>&1; then
+        if [ "$REGISTERED" = 1 ]; then
+            CHECK_ERR="backup target ${TARGET_ID} is no longer listed in System → Backups"
+        else
+            CHECK_ERR="backup target ${TARGET_ID} is not connected"
+        fi
+    elif [ "$(printf '%s' "$TLIST" | jq -r --arg t "$TARGET_ARG" '(.[$t].mountable == false) or (.[$t].availability == "unavailable")')" = "true" ]; then
+        _TERR=$(printf '%s' "$TLIST" | jq -r --arg t "$TARGET_ARG" '.[$t].error // empty' | cut -c1-200)
+        CHECK_ERR="backup target ${TARGET_ID} could not be reached${_TERR:+: ${_TERR}}"
     else
+        # Name the target in messages: a registered id is 32 opaque letters.
+        _TNAME=$(printf '%s' "$TLIST" | jq -r --arg t "$TARGET_ARG" '.[$t].name // empty' | cut -c1-80)
+        TLABEL="${TARGET_ID}${_TNAME:+ (${_TNAME})}"
         TTS=$(printf '%s' "$TLIST" | jq -r --arg t "$TARGET_ARG" --arg s "$SERVER_ID" '.[$t].startOs[$s].timestamp // empty')
         if [ -z "$TTS" ]; then
-            TARGET_STALE="backup target ${TARGET_ID} has no backup from this server"
+            TARGET_STALE="backup target ${TLABEL} has no backup from this server"
         else
             TT=$(date -d "$TTS" +%s 2>/dev/null) || TT=""
             if [ -z "$TT" ]; then
                 CHECK_ERR="unreadable backup date on target ${TARGET_ID}: ${TTS}"
             else
                 TAGE=$(( (NOW - TT) / 86400 ))
-                [ "$TAGE" -gt "$THRESHOLD" ] && TARGET_STALE="backup target ${TARGET_ID} last received a backup ${TAGE} days ago"
-                echo "$(_ts): target ${TARGET_ID}: last backup ${TTS} (${TAGE} days)"
+                [ "$TAGE" -gt "$THRESHOLD" ] && TARGET_STALE="backup target ${TLABEL} last received a backup ${TAGE} days ago"
+                echo "$(_ts): target ${TLABEL}: last backup ${TTS} (${TAGE} days)"
             fi
         fi
     fi
@@ -3347,6 +3505,101 @@ if [ -n "$TARGET_STALE" ]; then
 fi
 echo "$(_ts): stale: ${FPRINT:-none}"
 MON_BAGE_END
+            ;;
+        backup-ok|backup-failed)
+            cat << 'MON_BRES_END'
+# ── Check: backup results ────────────────────────────────────────────────────
+# StartOS 0.4.3 and newer record each finished backup run in History instead
+# of sending a notification. Report each run this alert has not seen yet that
+# succeeded (backup-ok) or failed (backup-failed). Seen run ids live beside
+# STATE_FILE, which is volatile: with no seen list (after a restart, or right
+# after install, which restarts), runs that finished more than 30 minutes
+# before the restart, or more than 2 hours ago, count as already reported.
+_need_running
+HIST=$(timeout 60 "$START_CLI" backup history list --limit 25 --format json 2>&1)
+_HRC=$?
+if [ "$_HRC" -ne 0 ] || ! printf '%s' "$HIST" | jq -e '.runs | type == "array"' >/dev/null 2>&1; then
+    _fail "could not read backup history (needs StartOS 0.4.3 or newer): ${HIST:0:200}"
+fi
+SEEN_FILE="${STATE_FILE}.seen"
+NOW=$(date +%s)
+CUTOFF=0
+if [ ! -f "$SEEN_FILE" ]; then
+    _UP=$(cut -d. -f1 /proc/uptime 2>/dev/null)
+    case "$_UP" in ''|*[!0-9]*) _UP=0 ;; esac
+    CUTOFF=$(( NOW - _UP - 1800 ))
+    [ "$CUTOFF" -lt $(( NOW - 7200 )) ] && CUTOFF=$(( NOW - 7200 ))
+fi
+# One line per run, oldest first: id, started, completed (epoch), outcome
+# (ok / failed = the backup stopped / partial = some items reported errors),
+# target name, summary. @tsv escapes tabs and newlines inside error text.
+RUNS=$(printf '%s' "$HIST" | jq -r '
+  def epoch: (try (sub("\\.[0-9]+"; "") | fromdateiso8601) catch 0);
+  .runs | reverse[]
+  | .report as $r
+  | ($r.server.error) as $se
+  | [($r.packages // {}) | to_entries[] | select(.value.error != null) | "\(.key): \(.value.error)"] as $pe
+  | [($r.sharedVolumes // {}) | to_entries[] | select(.value.error != null) | "volume \(.value.name // .key): \(.value.error)"] as $ve
+  | (($r.packages // {}) | length) as $np
+  | (($r.sharedVolumes // {}) | length) as $nv
+  | (if $se != null then "failed" elif ($pe | length) > 0 or ($ve | length) > 0 then "partial" else "ok" end) as $out
+  | [ .id, (.startedAt | epoch), (.completedAt | epoch), $out,
+      ((.targetName // .targetId // "") | if . == "" then "?" else . end),
+      (if $out != "ok"
+       then ((if $se != null then ["\($se)"] else [] end) + $pe + $ve) | join("; ")
+       else "\($np) service(s)\(if $nv > 0 then " and \($nv) shared volume(s)" else "" end) backed up" end) ]
+  | @tsv' 2>&1)
+if [ $? -ne 0 ]; then
+    _fail "could not read the backup history entries: ${RUNS:0:200}"
+fi
+WANT="ok"; [ "$MONITOR_TYPE" = "backup-failed" ] && WANT="failed"
+mkdir -p "$(dirname "$SEEN_FILE")"
+touch "$SEEN_FILE"
+_fmt_time() { date -d "@$1" '+%Y-%m-%d %H:%M %Z' 2>/dev/null || echo "?"; }
+_fmt_dur() {
+    _S=$1; [ "$_S" -lt 0 ] 2>/dev/null && _S=0
+    if [ "$_S" -ge 3600 ]; then echo "$((_S / 3600))h $((_S % 3600 / 60))m"
+    elif [ "$_S" -ge 60 ]; then echo "$((_S / 60))m"
+    else echo "${_S}s"; fi
+}
+NEW=0
+while IFS=$'\t' read -r RID RSTART REND ROUT RTGT RSUM; do
+    [ -n "$RID" ] || continue
+    grep -qxF "$RID" "$SEEN_FILE" && continue
+    printf '%s\n' "$RID" >> "$SEEN_FILE"
+    NEW=$((NEW + 1))
+    if [ "$REND" -lt "$CUTOFF" ] 2>/dev/null; then
+        echo "$(_ts): run ${RID} (${ROUT}, ${RTGT}) finished before this alert started — not reported"
+        continue
+    fi
+    _RCLASS="$ROUT"; [ "$ROUT" = "partial" ] && _RCLASS="failed"
+    if [ "$_RCLASS" != "$WANT" ]; then
+        echo "$(_ts): run ${RID} ${ROUT} (${RTGT}) — not this alert's outcome"
+        continue
+    fi
+    if [ "$ROUT" = "ok" ]; then
+        TITLE="Backup succeeded"
+        BODY="Backup to ${RTGT} finished $(_fmt_time "$REND") after $(_fmt_dur $((REND - RSTART))): ${RSUM}."
+    elif [ "$ROUT" = "partial" ]; then
+        TITLE="Backup failed"
+        BODY="Backup to ${RTGT} finished $(_fmt_time "$REND") with errors: $(printf '%s' "$RSUM" | cut -c1-600)"
+    else
+        TITLE="Backup failed"
+        BODY="Backup to ${RTGT} (started $(_fmt_time "$RSTART")) failed: $(printf '%s' "$RSUM" | cut -c1-600)"
+    fi
+    echo "$(_ts): run ${RID} ${ROUT} (${RTGT}) — notifying"
+    _notify "$TITLE" "$BODY"
+done <<< "$RUNS"
+# Keep the seen list short; history returns at most 25 runs per check.
+if [ "$(wc -l < "$SEEN_FILE")" -gt 200 ]; then
+    _TMP=$(mktemp) && tail -n 100 "$SEEN_FILE" > "$_TMP" && cat "$_TMP" > "$SEEN_FILE"
+    rm -f "$_TMP"
+fi
+echo "$(_ts): ${NEW} new backup run(s)"
+# Each run is reported once above; the condition state machine below has
+# nothing more to do.
+CONDITION=0; MSG=""; FPRINT=""
+MON_BRES_END
             ;;
         health)
             cat << 'MON_HEALTH_END'
@@ -3524,7 +3777,7 @@ _monitor_install_cmds() {
     # can never be written as a path (this is how v62 produced orphaned
     # "<type>-/usr/local/bin/startos-monitor-<type>" cron entries).
     case "$type" in
-        disk|backup-age|health|drive) ;;
+        disk|backup-age|backup-ok|backup-failed|health|drive) ;;
         *) print_error "Invalid monitor type '${type}'."; return 1 ;;
     esac
     if [[ -n "$name" ]] && ! [[ "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]*$ ]]; then
@@ -3581,17 +3834,18 @@ install_monitor() {
     _apply_or_stage "$(_monitor_display "$1" "${9:-}"): threshold ${2}, ${7}" "$cmds" || return 1
 }
 
-# Alerts generated before _MONITOR_FORMAT need rebuilding: v71 and older
-# backup staleness alerts fail on StartOS 0.4.1+ (the password-argument
-# change), and none of them report a check that keeps failing. Prints
-# "type<TAB>name<TAB>path" for each.
+# Alerts generated before their type's _monitor_format need rebuilding: v71
+# and older backup staleness alerts fail on StartOS 0.4.1+ (the password-
+# argument change) and don't report a check that keeps failing; v72 ones
+# can't follow StartOS 0.4.3's registered backup targets. Prints
+# "type<TAB>name<TAB>path<TAB>format" for each.
 _monitor_outdated() {
     local type name path fmt
     while IFS=$'\t' read -r type name path; do
         [[ -n "$path" ]] || continue
         fmt=$(grep -m1 '^MONITOR_FORMAT=' "$path" 2>/dev/null | cut -d'"' -f2) || fmt=""
         [[ "$fmt" =~ ^[0-9]+$ ]] || fmt=1
-        (( fmt < _MONITOR_FORMAT )) && printf '%s\t%s\t%s\n' "$type" "$name" "$path"
+        (( fmt < $(_monitor_format "$type") )) && printf '%s\t%s\t%s\t%s\n' "$type" "$name" "$path" "$fmt"
     done < <(_monitor_installed)
     return 0
 }
@@ -3602,7 +3856,7 @@ _monitor_outdated() {
 _monitor_rebuild_saved() {
     local inst="$1" b64="$2"
     local -n _mrs_out="$3"
-    [[ "$inst" =~ ^(disk|backup-age|health|drive)(-([a-zA-Z0-9][a-zA-Z0-9-]*))?$ ]] || return 1
+    [[ "$inst" =~ ^(disk|backup-age|backup-ok|backup-failed|health|drive)(-([a-zA-Z0-9][a-zA-Z0-9-]*))?$ ]] || return 1
     local type="${BASH_REMATCH[1]}" name="${BASH_REMATCH[3]}"
     local tmp
     tmp=$(mktemp) || return 1
@@ -3610,7 +3864,7 @@ _monitor_rebuild_saved() {
     local fmt
     fmt=$(grep -m1 '^MONITOR_FORMAT=' "$tmp" | cut -d'"' -f2) || fmt=""
     [[ "$fmt" =~ ^[0-9]+$ ]] || fmt=1
-    if (( fmt >= _MONITOR_FORMAT )); then rm -f "$tmp"; return 1; fi
+    if (( fmt >= $(_monitor_format "$type") )); then rm -f "$tmp"; return 1; fi
     local thr="" cmd="" sos="" lvl="" exc="" tgt=""
     _monitor_read_config "$tmp" thr cmd sos lvl exc tgt
     rm -f "$tmp"
@@ -3637,14 +3891,20 @@ _offer_monitor_rebuild() {
     echo ""
     echo -e "  These alerts were installed by an older startos-admin:"
     echo ""
-    local type name path all_cmds="" n=0 skipped=0
-    while IFS=$'\t' read -r type name path; do
+    local type name path fmt all_cmds="" n=0 skipped=0 any_v72=0 any_v73=0
+    while IFS=$'\t' read -r type name path fmt; do
         local suffix="${path##"${_MONITOR_BIN_PREFIX}"}"
         local thr="" cmd="" sos="" lvl="" exc="" tgt="" sched
         _monitor_read_config "$path" thr cmd sos lvl exc tgt
         sched=$(_monitor_read_schedule "$suffix")
         local note=""
-        [[ "$type" == "backup-age" ]] && note=" ${YELLOW}— not working on StartOS 0.4.1 and newer${NC}"
+        (( fmt < 2 )) && any_v72=1
+        [[ "$type" == "backup-age" ]] && (( fmt < 3 )) && any_v73=1
+        if [[ "$type" == "backup-age" ]] && (( fmt < 2 )); then
+            note=" ${YELLOW}— not working on StartOS 0.4.1 and newer${NC}"
+        elif [[ "$type" == "backup-age" && -n "$tgt" ]] && _backup_targets_registered; then
+            note=" ${YELLOW}— its target check needs this update on StartOS 0.4.3${NC}"
+        fi
         if [[ -z "$sched" ]]; then
             echo -e "    ${DIM}•${NC} $(_monitor_display "$type" "$name")${note} ${RED}(no cron schedule found — remove and re-add it under Alerts)${NC}"
             (( skipped++ )) || true
@@ -3658,9 +3918,13 @@ _offer_monitor_rebuild() {
     done <<< "$lines"
     echo ""
     [[ $n -gt 0 ]] || { pause; return 0; }
-    echo -e "  Rebuilding keeps each alert's settings and schedule. Backup staleness alerts"
-    echo -e "  no longer use your backup password, and every alert now notifies you if its"
-    echo -e "  check fails ${BOLD}3 times in a row${NC}."
+    echo -e "  Rebuilding keeps each alert's settings and schedule, and brings in:"
+    if [[ $any_v72 -eq 1 ]]; then
+        echo -e "    ${DIM}•${NC} Backup staleness alerts no longer use your backup password."
+        echo -e "    ${DIM}•${NC} Every alert notifies you if its check fails ${BOLD}3 times in a row${NC}."
+    fi
+    [[ $any_v73 -eq 1 ]] && \
+        echo -e "    ${DIM}•${NC} Backup staleness alerts understand StartOS 0.4.3's backup targets."
     if ! confirm "Rebuild ${n} alert(s) now?"; then
         _BACK=0
         print_info "Not rebuilt. You'll be asked again next time you start startos-admin."
@@ -3670,14 +3934,131 @@ _offer_monitor_rebuild() {
     _apply_or_stage "$_REBUILD_LABEL (${n})" "$all_cmds" || { _BACK=0; return 0; }
 }
 
+# At launch on StartOS 0.4.3+: backup schedules saved for a drive by
+# "uuid-<UUID>" stop working, because 0.4.3 rejects "disk-/dev/sdX" ids and
+# backs up only to registered targets. Offer to switch each one to its drive's
+# registered id (password file renamed with it), all in one restart, and name
+# the drives that still have to be added in System → Backups.
+_UUIDFIX_LABEL="Update drive backup schedules for StartOS 0.4.3"
+_offer_backup_target_upgrade() {
+    _backup_targets_registered || return 0
+    local cron_output
+    cron_output=$(sudo crontab -u root -l 2>/dev/null) || return 0
+    printf '%s\n' "$cron_output" | grep -q 'backup create "disk-\$(readlink -e /dev/disk/by-uuid/' || return 0
+    if _staged_labels 2>/dev/null | grep -qF "$_UUIDFIX_LABEL"; then
+        return 0
+    fi
+    [[ "$(_startos_state)" == "Running" ]] || return 0
+    local tlist
+    tlist=$(timeout 120 start-cli backup target list 2>/dev/null) || return 0
+
+    local -a fixed=() missing=()
+    local cmds="" line new keys
+    while IFS= read -r line; do
+        [[ "$line" == *'backup create "disk-$(readlink -e /dev/disk/by-uuid/'* ]] || continue
+        local rc=0
+        _backup_line_to_registered "$line" "$tlist" new keys || rc=$?
+        if [[ $rc -eq 0 ]]; then
+            local old_key="${keys% *}" new_key="${keys#* }"
+            fixed+=("${old_key} → ${new_key}  ${DIM}($(echo "$line" | awk '{print $1,$2,$3,$4,$5}'))${NC}")
+            local b64_old b64_new
+            b64_old=$(printf '%s' "$line" | base64 -w 0)
+            b64_new=$(printf '%s' "$new" | base64 -w 0)
+            cmds+="if [ -f ${_SECRET_DIR}/backup-pass-${old_key} ]; then cp -p ${_SECRET_DIR}/backup-pass-${old_key} ${_SECRET_DIR}/backup-pass-${new_key}; fi
+__o=\$(printf '%s' \"${b64_old}\" | base64 -d); __n=\$(printf '%s' \"${b64_new}\" | base64 -d)
+crontab -l 2>/dev/null | while IFS= read -r __l; do if [ \"\$__l\" = \"\$__o\" ]; then printf '%s\n' \"\$__n\"; else printf '%s\n' \"\$__l\"; fi; done | crontab -
+"
+        elif [[ $rc -eq 2 ]]; then
+            missing+=("$(_backup_key_from_cron_line "$line")  ${DIM}($(echo "$line" | awk '{print $1,$2,$3,$4,$5}'))${NC}")
+        fi
+    done <<< "$cron_output"
+    [[ ${#fixed[@]} -gt 0 || ${#missing[@]} -gt 0 ]] || return 0
+
+    print_header
+    print_section "Drive backup schedules need updating"
+    echo ""
+    echo -e "  StartOS 0.4.3 backs up only to targets added in System → Backups and no longer"
+    echo -e "  accepts the drive names these schedules use, so they would fail."
+    echo ""
+    local f
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        echo -e "  ${YELLOW}Not added in System → Backups yet:${NC}"
+        for f in "${missing[@]}"; do echo -e "    ${DIM}•${NC} ${f}"; done
+        echo -e "  ${DIM}Add each drive there (its existing backups are kept), then restart${NC}"
+        echo -e "  ${DIM}startos-admin to update these schedules.${NC}"
+        echo ""
+    fi
+    if [[ ${#fixed[@]} -eq 0 ]]; then
+        pause; return 0
+    fi
+    echo -e "  ${BOLD}Can be switched to the drive's StartOS id now:${NC}"
+    for f in "${fixed[@]}"; do echo -e "    ${DIM}•${NC} ${f}"; done
+    echo ""
+    if ! confirm "Update ${#fixed[@]} schedule(s) now?"; then
+        _BACK=0
+        print_info "Not updated. You'll be asked again next time you start startos-admin."
+        pause
+        return 0
+    fi
+    _apply_or_stage "$_UUIDFIX_LABEL (${#fixed[@]})" "$cmds" || { _BACK=0; return 0; }
+}
+
 # Wizard: install or update one monitor instance (prefilled if installed).
 # $1=type $2=instance name $3=legacy (1 = prefill from + migrate the unnamed
 # v60/v61 singleton of this type)
+# Ask for a new alert's name, offering one built from its settings. Names
+# only tell alerts of the same type apart, so the suggestion is the setting
+# that differs between them (threshold), or the type itself. An existing
+# name is allowed only after confirming it should be replaced.
+_pick_monitor_name() {
+    local -n _pmn_out="$1"
+    local type="$2" thr="$3" base sugg n=2
+    case "$type" in
+        disk)          base="${thr}pct" ;;
+        backup-age)    base="${thr}d" ;;
+        drive)         base="wear${thr}" ;;
+        health)        base="watchdog" ;;
+        backup-ok)     base="succeeded" ;;
+        backup-failed) base="failed" ;;
+        *)             base="default" ;;
+    esac
+    sugg="$base"
+    while [[ -f "${_MONITOR_BIN_PREFIX}${type}-${sugg}" ]]; do
+        sugg="${base}-${n}"; (( n++ ))
+    done
+    echo ""
+    echo -e "  ${BOLD}Name this alert:${NC}"
+    echo -e "  ${DIM}The name tells it apart from other alerts of this type in menus, logs and${NC}"
+    echo -e "  ${DIM}notifications. Press Enter to use the suggestion.${NC}"
+    local nm
+    while true; do
+        _read nm "  Alert name [${sugg}]: " || return 1
+        [[ -z "$nm" ]] && nm="$sugg"
+        if ! [[ "$nm" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]*$ ]]; then
+            print_warn "Use only letters, numbers, and hyphens."
+            continue
+        fi
+        if [[ -f "${_MONITOR_BIN_PREFIX}${type}-${nm}" ]]; then
+            print_warn "A '${nm}' alert of this type already exists."
+            confirm "Replace it with these settings?" || { [[ $_BACK -eq 1 ]] && return 1; continue; }
+        fi
+        break
+    done
+    _pmn_out="$nm"
+}
+
 _monitor_install_flow() {
     local type="$1" name="$2" legacy="${3:-0}"
+    # An empty name means a new alert: it is named after the other settings.
+    local new_alert=0
+    [[ -z "$name" ]] && new_alert=1
     local inst="${type}-${name}"
     local label
-    label=$(_monitor_display "$type" "$name")
+    if (( new_alert )); then
+        label="New $(_monitor_label "$type")"
+    else
+        label=$(_monitor_display "$type" "$name")
+    fi
 
     print_header
     print_section "$label"
@@ -3689,7 +4070,7 @@ _monitor_install_flow() {
     local prefill_path="${_MONITOR_BIN_PREFIX}${inst}"
     [[ "$legacy" == "1" ]] && prefill_path="${_MONITOR_BIN_PREFIX}${type}"
     local cur_thr="" cur_cmd="" cur_sos="" cur_lvl="" cur_exc="" cur_sched="" cur_tgt=""
-    if [[ -f "$prefill_path" ]]; then
+    if (( ! new_alert )) && [[ -f "$prefill_path" ]]; then
         _monitor_read_config "$prefill_path" cur_thr cur_cmd cur_sos cur_lvl cur_exc cur_tgt
         if [[ "$legacy" == "1" ]]; then
             cur_sched=$(_monitor_read_schedule "$type")
@@ -3733,6 +4114,8 @@ _monitor_install_flow() {
             echo -e "    ${BOLD}${i})${NC} ${tgt}"
             (( i++ ))
         done
+        _backup_targets_registered && \
+            echo -e "  ${DIM}Only targets added in System → Backups are listed.${NC}"
         [[ -n "$cur_tgt" ]] && echo -e "  ${DIM}Current: ${cur_tgt} — press Enter to keep${NC}"
         echo ""
         local tgt_choice
@@ -3752,10 +4135,51 @@ _monitor_install_flow() {
             fi
             print_warn "Enter a number between 0 and $((i-1))${cur_tgt:+, or Enter to keep current}."
         done
+        if [[ "$mon_target" == uuid-* ]] && _backup_targets_registered; then
+            local mon_gid
+            if mon_gid=$(_backup_uuid_to_registered "$mon_target" "$raw_targets"); then
+                print_info "This drive is now registered in StartOS as '${mon_gid}'; the alert will use that id."
+                mon_target="$mon_gid"
+            else
+                print_warn "This drive hasn't been added in System → Backups, so StartOS 0.4.3 won't back"
+                print_warn "up to it and this alert will report it as not added until you add it."
+            fi
+        fi
         if [[ -n "$mon_target" ]] && ! [[ "$mon_target" =~ ^[A-Za-z0-9._-]+$ ]]; then
             print_error "Unexpected characters in target id '${mon_target}'. Aborting."
             pause; return 1
         fi
+        echo ""
+    fi
+
+    # ── backup-ok / backup-failed: needs StartOS 0.4.3's backup history ─────
+    if [[ "$type" == "backup-ok" || "$type" == "backup-failed" ]]; then
+        local bh_out
+        if ! bh_out=$(timeout 60 start-cli backup history list --limit 1 --format json 2>&1) \
+           || ! printf '%s' "$bh_out" | jq -e '.runs | type == "array"' >/dev/null 2>&1; then
+            if _require_running; then
+                if _backup_targets_registered; then
+                    print_error "Could not read the backup history:"
+                    echo -e "${RED}${bh_out:0:300}${NC}"
+                else
+                    print_warn "This alert needs StartOS 0.4.3 or newer, which keeps a history of backup"
+                    print_warn "runs. This server runs StartOS $(_os_version), which notifies you itself"
+                    print_warn "when a backup completes or fails."
+                fi
+            fi
+            pause; return 1
+        fi
+        if [[ "$type" == "backup-ok" ]]; then
+            echo -e "  ${DIM}Sends one notification for each backup that finishes without errors:${NC}"
+            echo -e "  ${DIM}the target, when it finished, how long it took and how many services.${NC}"
+        else
+            echo -e "  ${DIM}Sends one notification for each backup that fails, or finishes with any${NC}"
+            echo -e "  ${DIM}service or volume reporting an error, with the error messages.${NC}"
+        fi
+        echo -e "  ${DIM}StartOS 0.4.3 records each finished backup in System → Backups → History but${NC}"
+        echo -e "  ${DIM}no longer sends a notification; this alert reads that history.${NC}"
+        echo -e "  ${DIM}A backup that never finishes is not reported here — a Backup staleness${NC}"
+        echo -e "  ${DIM}alert catches that.${NC}"
         echo ""
     fi
 
@@ -3825,6 +4249,9 @@ _monitor_install_flow() {
                 [[ "$threshold" =~ ^[0-9]+$ ]] && (( threshold >= 1 && threshold <= 365 )) && break
                 print_warn "Enter a whole number between 1 and 365."
             done
+            ;;
+        backup-ok|backup-failed)
+            threshold="0"
             ;;
         health)
             threshold="0"
@@ -3911,6 +4338,12 @@ _monitor_install_flow() {
             _pick_monitor_schedule CRON_SCHEDULE \
                 "Daily at 9 AM" "0 9 * * *" \
                 "Weekly (Mon 9 AM)" "0 9 * * 1" || return 1 ;;
+        backup-ok|backup-failed)
+            echo -e "\n  ${DIM}How soon after a backup finishes you hear about it.${NC}"
+            _pick_monitor_schedule CRON_SCHEDULE \
+                "Every 5 minutes" "*/5 * * * *" \
+                "Every 15 minutes" "*/15 * * * *" \
+                "Every 30 minutes" "*/30 * * * *" || return 1 ;;
         health)
             _pick_monitor_schedule CRON_SCHEDULE \
                 "Every 5 minutes" "*/5 * * * *" \
@@ -3925,7 +4358,16 @@ _monitor_install_flow() {
 
     # ── Step 4: Notification method ──────────────────────────────────────────
     local notify_cmd notify_sos notify_lvl
-    _pick_monitor_notify notify_cmd notify_sos notify_lvl "$cur_cmd" "$cur_sos" "$cur_lvl" || return 1
+    local new_lvl="warning"
+    case "$type" in backup-ok) new_lvl="info" ;; backup-failed) new_lvl="error" ;; esac
+    _pick_monitor_notify notify_cmd notify_sos notify_lvl "$cur_cmd" "$cur_sos" "$cur_lvl" "$new_lvl" || return 1
+
+    # ── Step 5 (new alerts): Name ────────────────────────────────────────────
+    if (( new_alert )); then
+        _pick_monitor_name name "$type" "$threshold" || return 1
+        inst="${type}-${name}"
+        label=$(_monitor_display "$type" "$name")
+    fi
 
     # ── Review ───────────────────────────────────────────────────────────────
     echo ""
@@ -3937,6 +4379,8 @@ _monitor_install_flow() {
         backup-age) echo -e "  ${BOLD}Threshold:${NC} ${threshold} day(s) since last backup"
                     echo -e "  ${BOLD}Target:${NC}    ${mon_target:-(services only)}"
                     echo -e "  ${BOLD}Excludes:${NC}  ${excludes:-(none)}" ;;
+        backup-ok)  echo -e "  ${BOLD}Trigger:${NC}   each backup that finishes without errors" ;;
+        backup-failed) echo -e "  ${BOLD}Trigger:${NC}   each backup that fails or reports an error" ;;
         health)     echo -e "  ${BOLD}Trigger:${NC}   failing health checks / not running (2 consecutive checks)" ;;
         drive)      echo -e "  ${BOLD}Threshold:${NC} ${threshold}% wear ${DIM}(critical warnings, spare, media errors always alert)${NC}" ;;
     esac
@@ -3944,8 +4388,13 @@ _monitor_install_flow() {
     [[ -n "$notify_cmd" ]] && echo -e "  ${BOLD}Shell:${NC}     ${notify_cmd}"
     [[ "$notify_sos" == "1" ]] && echo -e "  ${BOLD}StartOS:${NC}   ${notify_lvl} notification"
     echo ""
-    echo -e "  ${DIM}Re-alert policy: first detection, when the offender list changes, and at${NC}"
-    echo -e "  ${DIM}most one reminder per 24h while the condition persists. No recovery message.${NC}"
+    if [[ "$type" == "backup-ok" || "$type" == "backup-failed" ]]; then
+        echo -e "  ${DIM}One notification per backup run. A server restart within 30 minutes of a${NC}"
+        echo -e "  ${DIM}backup finishing can repeat its notification once.${NC}"
+    else
+        echo -e "  ${DIM}Re-alert policy: first detection, when the offender list changes, and at${NC}"
+        echo -e "  ${DIM}most one reminder per 24h while the condition persists. No recovery message.${NC}"
+    fi
     echo -e "  ${DIM}If the check itself fails 3 times in a row, you are told once.${NC}"
     echo ""
 
@@ -3979,6 +4428,8 @@ _monitor_list_display() {
         case "$type" in
             disk)       echo -e "     ${DIM}Threshold:${NC} ${thr}%" ;;
             backup-age) echo -e "     ${DIM}Threshold:${NC} ${thr} day(s)   ${DIM}Target:${NC} ${tgt:-(services only)}   ${DIM}Excludes:${NC} ${exc:-(none)}" ;;
+            backup-ok)  echo -e "     ${DIM}Trigger:${NC}   each backup that finishes without errors" ;;
+            backup-failed) echo -e "     ${DIM}Trigger:${NC}   each backup that fails or reports an error" ;;
             health)     echo -e "     ${DIM}Trigger:${NC}   unhealthy across 2 consecutive checks" ;;
             drive)      echo -e "     ${DIM}Threshold:${NC} ${thr}% wear   ${DIM}(critical warnings, spare, media errors always alert)${NC}" ;;
         esac
@@ -3998,7 +4449,7 @@ _monitor_list_display() {
     return 0
 }
 
-# Add flow: pick a type, name the instance, run the wizard.
+# Add flow: pick a type, run the wizard (which asks for the name last).
 _monitor_add_flow() {
     print_header
     print_section "Add an Alert"
@@ -4009,40 +4460,25 @@ _monitor_add_flow() {
     echo -e "    ${BOLD}2)${NC} Backup staleness alert"
     echo -e "    ${BOLD}3)${NC} Service health watchdog"
     echo -e "    ${BOLD}4)${NC} Drive health alert ${DIM}(NVMe SMART)${NC}"
+    echo -e "    ${BOLD}5)${NC} Backup succeeded alert ${DIM}(StartOS 0.4.3+)${NC}"
+    echo -e "    ${BOLD}6)${NC} Backup failed alert ${DIM}(StartOS 0.4.3+)${NC}"
     echo ""
     local t_choice type
     while true; do
-        _read t_choice "  Choice [1-4]: " || return 1
+        _read t_choice "  Choice [1-6]: " || return 1
         case "$t_choice" in
             1) type="disk";       break ;;
             2) type="backup-age"; break ;;
             3) type="health";     break ;;
             4) type="drive";      break ;;
-            *) print_warn "Enter 1-4." ;;
+            5) type="backup-ok";  break ;;
+            6) type="backup-failed"; break ;;
+            *) print_warn "Enter 1-6." ;;
         esac
     done
-    echo ""
-    echo -e "  ${DIM}Give this alert a name (e.g. warn50, crit85, daily).${NC}"
-    local name=""
-    while true; do
-        _read name "  Alert name: " || return 1
-        if [[ -z "$name" ]]; then
-            print_warn "Name cannot be empty."
-        elif ! [[ "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]*$ ]]; then
-            print_warn "Use only letters, numbers, and hyphens."
-        else
-            break
-        fi
-    done
-    if [[ -f "${_MONITOR_BIN_PREFIX}${type}-${name}" ]]; then
-        print_warn "A '${name}' alert of this type already exists — this will update it."
-        if ! confirm "Continue and update?"; then
-            [[ $_BACK -eq 1 ]] && return 1
-            print_info "Cancelled."
-            pause; return
-        fi
-    fi
-    _monitor_install_flow "$type" "$name" 0 || return 1
+    # The name is asked last, in _monitor_install_flow, once the settings it
+    # can describe are known.
+    _monitor_install_flow "$type" "" 0 || return 1
 }
 
 # Edit flow: pick an installed instance; legacy unnamed instances get a name
@@ -4232,6 +4668,7 @@ menu_alerts() {
         echo ""
         local inst_lines
         inst_lines=$(_monitor_installed)
+        echo -e "  ${BOLD}Installed on this server now:${NC}"
         if [[ -n "$inst_lines" ]]; then
             local t n p
             while IFS=$'\t' read -r t n p; do
@@ -4240,15 +4677,17 @@ menu_alerts() {
                 case "$t" in
                     disk)       desc="${thr}%" ;;
                     backup-age) desc="${thr}d, ${tgt:-?}" ;;
+                    backup-ok|backup-failed) desc="each backup run" ;;
                     health)     desc="2-check debounce" ;;
                     drive)      desc="${thr}% wear" ;;
                 esac
                 echo -e "    ${CYAN}•${NC} $(_monitor_display "$t" "$n")  ${DIM}(${desc})${NC}"
             done <<< "$inst_lines"
         else
-            echo -e "    ${DIM}(no alerts installed)${NC}"
+            echo -e "    ${DIM}(none)${NC}"
         fi
         echo ""
+        echo -e "  ${BOLD}What would you like to do?${NC}"
         echo -e "    ${CYAN}${BOLD}1)${NC} Add an alert"
         echo -e "    ${CYAN}${BOLD}2)${NC} Edit an alert"
         echo -e "    ${CYAN}${BOLD}3)${NC} List installed alerts ${DIM}(details)${NC}"
@@ -4802,7 +5241,8 @@ menu_documentation() {
                 echo -e "  ${BOLD}You can specify:${NC}"
                 echo ""
                 echo -e "    ${CYAN}•${NC} ${BOLD}Backup target${NC} — where to send the backup. You must have already"
-                echo -e "      created the target in the StartOS UI and manually tested it first."
+                echo -e "      created the target in the StartOS UI and manually tested it first"
+                echo -e "      (on StartOS 0.4.3 and newer: System → Backups, drives included)."
                 echo ""
                 echo -e "    ${CYAN}•${NC} ${BOLD}Services to back up${NC} — select specific services or all of them."
                 echo ""
@@ -4812,16 +5252,23 @@ menu_documentation() {
                 echo -e "    ${CYAN}•${NC} ${BOLD}Post-backup action${NC} — optionally run a shell command and/or create a"
                 echo -e "      StartOS notification. Enter the full command, e.g.:"
                 echo -e "      ${DIM}curl -d \"Backup started\" https://ntfy.sh/Your-Topic${NC}"
-                echo -e "      Since StartOS already notifies you when a backup completes, combining"
-                echo -e "      a kickoff notification with the completion one gives you elapsed time."
+                echo -e "      StartOS 0.4.2 and older notify you when a backup completes. StartOS 0.4.3"
+                echo -e "      and newer don't — add a ${BOLD}Backup succeeded${NC} and a ${BOLD}Backup failed${NC} alert"
+                echo -e "      (main menu → 10, Alerts) to be told how each backup went."
                 echo ""
                 echo -e "  ${BOLD}Password storage:${NC} your StartOS primary password is saved to a root-only"
                 echo -e "  file (${DIM}${_SECRET_DIR}/backup-pass-<target>${NC}, mode 600) — it does NOT appear"
                 echo -e "  in the crontab. It is briefly visible in the process list while a backup runs."
                 echo ""
-                echo -e "  ${BOLD}Physical drives:${NC} saved by filesystem UUID (${DIM}uuid-<UUID>${NC}), not by device"
-                echo -e "  name (${DIM}disk-/dev/sdb1${NC}), which can change on replug or reboot. The backup finds"
-                echo -e "  the drive by UUID each time, and fails if it is not connected."
+                echo -e "  ${BOLD}Physical drives:${NC} on StartOS 0.4.3 and newer, a drive added in System →"
+                echo -e "  Backups gets a permanent id, and schedules use it. Before 0.4.3 they are saved"
+                echo -e "  by filesystem UUID (${DIM}uuid-<UUID>${NC}), not by device name (${DIM}disk-/dev/sdb1${NC}),"
+                echo -e "  which can change on replug or reboot; the backup finds the drive by UUID each"
+                echo -e "  time, and fails if it is not connected. After updating to 0.4.3, add each such"
+                echo -e "  drive in System → Backups; startos-admin then offers to switch its schedules."
+                echo ""
+                echo -e "  When you remove or retarget a schedule, its password file is deleted once no"
+                echo -e "  cron entry uses it."
                 echo ""
                 pause ;;
             6)
@@ -4927,7 +5374,7 @@ menu_documentation() {
                 echo -e "  ${BOLD}start-cli authentication errors${NC}"
                 echo -e "  Some features require ${CYAN}start-cli${NC} to be authenticated."
                 echo -e "  If you see 'Failed to list packages', reconnect your SSH session"
-                echo -e "  and confirm ${CYAN}start-cli auth session list${NC} succeeds."
+                echo -e "  and confirm ${CYAN}start-cli db dump >/dev/null${NC} succeeds."
                 echo -e "  To check the server is up at all, run ${CYAN}start-cli state${NC}"
                 echo -e "  — it reports Running, Initializing, or Error and needs no auth."
                 echo ""
@@ -4995,8 +5442,8 @@ menu_documentation() {
                 print_header
                 print_section "Alerts"
                 echo ""
-                echo -e "  Four monitors that watch your server on a cron schedule and alert you"
-                echo -e "  via a shell command (e.g. webhook), a StartOS notification, or both:"
+                echo -e "  Monitors that watch your server on a cron schedule and alert you via a"
+                echo -e "  shell command (e.g. webhook), a StartOS notification, or both:"
                 echo ""
                 echo -e "    ${CYAN}•${NC} ${BOLD}Disk usage alert${NC} — fires when usage reaches your % threshold"
                 echo -e "    ${CYAN}•${NC} ${BOLD}Backup staleness alert${NC} — fires when any service has not been backed"
@@ -5013,6 +5460,11 @@ menu_documentation() {
                 echo -e "      new media errors — the dying-drive warning the StartOS UI lacks."
                 echo -e "      ${DIM}Reads SMART directly from the kernel (no packages installed).${NC}"
                 echo -e "      ${DIM}NVMe drives only; SATA/USB drives are not monitored.${NC}"
+                echo -e "    ${CYAN}•${NC} ${BOLD}Backup succeeded / Backup failed alerts${NC} — one notification per"
+                echo -e "      finished backup that succeeded, or that failed or reported an error,"
+                echo -e "      with the target, time and errors. ${DIM}StartOS 0.4.3+, which keeps these${NC}"
+                echo -e "      ${DIM}results in System → Backups → History instead of notifying you. A backup${NC}"
+                echo -e "      ${DIM}that never finishes is caught by the staleness alert, not these.${NC}"
                 echo ""
                 echo -e "  ${BOLD}Shell command contract:${NC} the alert text is provided in the ${CYAN}\$MSG${NC}"
                 echo -e "  environment variable. Example:  ${DIM}curl -d \"\$MSG\" https://ntfy.sh/Your-Topic${NC}"
@@ -5021,6 +5473,7 @@ menu_documentation() {
                 echo -e "  ${BOLD}Re-alert policy:${NC} alert on first detection, immediately when the list of"
                 echo -e "  affected services changes, and at most one reminder per 24h while the"
                 echo -e "  condition persists. ${YELLOW}No recovery (all-clear) message is sent.${NC}"
+                echo -e "  (The backup succeeded/failed alerts instead report each backup run once.)"
                 echo ""
                 echo -e "  Alert state is volatile — after a reboot, an ongoing condition re-alerts"
                 echo -e "  once."
@@ -5396,7 +5849,7 @@ _config_restore_flow() {
         fi
     done
     for mi in "${!mnames[@]}"; do
-        if ! [[ "${mnames[$mi]}" =~ ^(disk|backup-age|health|drive)(-[a-zA-Z0-9][a-zA-Z0-9-]*)?$ ]]; then
+        if ! [[ "${mnames[$mi]}" =~ ^(disk|backup-age|backup-ok|backup-failed|health|drive)(-[a-zA-Z0-9][a-zA-Z0-9-]*)?$ ]]; then
             print_error "Saved file contains an invalid alert monitor name: '${mnames[$mi]}'. Load aborted."
             pause; return
         fi
@@ -5405,6 +5858,35 @@ _config_restore_flow() {
             pause; return
         fi
     done
+
+    # ── StartOS 0.4.3+: drive schedules saved by filesystem UUID ──────────────
+    # 0.4.3 rejects the "disk-/dev/sdX" ids those schedules pass. Switch each
+    # to its drive's registered id now (password file renamed to match), so
+    # the loaded schedule works without a second restart. A drive not yet
+    # added in System → Backups keeps its line; startos-admin reminds at launch.
+    local -A lc_secret_rename=()
+    local lc_uuid_fixed=0 lc_uuid_missing=0
+    if [[ -n "$crontab_b64" ]] && _backup_targets_registered; then
+        local lc_cron lc_tlist
+        lc_cron=$(printf '%s' "$crontab_b64" | base64 -d)
+        if [[ "$lc_cron" == *'backup create "disk-$(readlink -e /dev/disk/by-uuid/'* ]] \
+           && lc_tlist=$(timeout 120 start-cli backup target list 2>/dev/null); then
+            local lc_out="" lc_line lc_new lc_keys lc_rc
+            while IFS= read -r lc_line; do
+                lc_rc=0
+                _backup_line_to_registered "$lc_line" "$lc_tlist" lc_new lc_keys || lc_rc=$?
+                if [[ $lc_rc -eq 0 ]]; then
+                    lc_out+="${lc_new}"$'\n'
+                    lc_secret_rename["backup-pass-${lc_keys% *}"]="backup-pass-${lc_keys#* }"
+                    (( lc_uuid_fixed++ )) || true
+                else
+                    [[ $lc_rc -eq 2 ]] && { (( lc_uuid_missing++ )) || true; }
+                    lc_out+="${lc_line}"$'\n'
+                fi
+            done <<< "$lc_cron"
+            crontab_b64=$(printf '%s' "${lc_out%$'\n'}" | base64 -w 0)
+        fi
+    fi
 
     # ── Show restore summary ──────────────────────────────────────────────────
     print_header
@@ -5418,6 +5900,10 @@ _config_restore_flow() {
         cron_count=$(printf '%s' "$crontab_b64" | base64 -d 2>/dev/null \
             | grep -c '^# startos-admin v' || true)
     echo -e "  ${BOLD}Cron entries:${NC} ${cron_count} startos-admin managed entries"
+    (( lc_uuid_fixed > 0 )) && \
+        echo -e "    ${DIM}• ${lc_uuid_fixed} drive backup schedule(s) switched to the drive's StartOS 0.4.3 id${NC}"
+    (( lc_uuid_missing > 0 )) && \
+        echo -e "    ${YELLOW}• ${lc_uuid_missing} drive backup schedule(s) need their drive added in System → Backups${NC}"
 
     echo -e "  ${BOLD}Forwarders:${NC}   ${pcount}"
     for pi in "${!pnames[@]}"; do
@@ -5517,6 +6003,7 @@ chmod 700 ${_SECRET_DIR}
         for si in "${!snames[@]}"; do
             local sn="${snames[$si]}"
             local sv="${svals[$si]}"
+            [[ -n "${lc_secret_rename[$sn]:-}" ]] && sn="${lc_secret_rename[$sn]}"
             chroot_body+="printf '%s' '${sv}' | base64 -d > ${_SECRET_DIR}/${sn}
 chmod 600 ${_SECRET_DIR}/${sn}
 "
@@ -5528,6 +6015,8 @@ chmod 600 ${_SECRET_DIR}/${sn}
     debug_log "Loading: crontab=${cron_count} entries, pollers=${pcount}"
 
     local chroot_exit=0
+    chroot_body+="${_SECRET_SWEEP_CMDS}
+"
     sudo /usr/lib/startos/scripts/chroot-and-upgrade << EOF || chroot_exit=$?
 ${chroot_body}exit
 EOF
@@ -5742,6 +6231,7 @@ menu_toggle_debug() {
 main_menu() {
     check_for_update
     _offer_monitor_rebuild
+    _offer_backup_target_upgrade
     while true; do
         print_header
         _status_block

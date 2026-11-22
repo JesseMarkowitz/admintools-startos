@@ -5,9 +5,17 @@
 >
 > | StartOS | startos-admin |
 > | --- | --- |
-> | 0.4.0.3 – 0.4.2 | v72 and newer (tested on 0.4.2) |
-> | 0.4.0 – 0.4.0.2 | v72 works except the **Backup staleness alert**, which needs 0.4.0.3 or newer — update StartOS |
+> | 0.4.3 | v73 and newer (tested on 0.4.3-rc.3) |
+> | 0.4.0.3 – 0.4.2.x | v72 and newer (v72 tested on 0.4.2) |
+> | 0.4.0 – 0.4.0.2 | v72 and newer, except the **Backup staleness alert**, which needs 0.4.0.3 or newer — update StartOS |
 > | 0.3.5.x | not supported |
+>
+> **StartOS 0.4.3** changed backups: targets are added in System → Backups (drives
+> included), and StartOS no longer sends a notification when a backup completes or
+> fails. v72 and older list every target as "(unknown)", and their drive schedules
+> and drive-watching staleness alerts stop working. v73 fixes these, offers at launch
+> to switch drive schedules to the drive's new StartOS id, and adds **Backup
+> succeeded** and **Backup failed** alerts to replace the lost notifications.
 >
 > v71 and older: the Backup staleness alert stops working on StartOS 0.4.1 and newer
 > (0.4.1 changed how backup passwords are passed to `start-cli`). v72 fixes it and
@@ -47,7 +55,7 @@ This tool is intended for StartOS Administrators who:
 <summary><strong>Requirements</strong></summary>
 
 - SSH access to your StartOS server as the Start9 user
-- StartOS 0.4.0.3 or newer (most recently tested on 0.4.2). On 0.4.0–0.4.0.2 everything except the Backup staleness alert works. StartOS 0.3.5.x is not supported.
+- StartOS 0.4.0.3 or newer (most recently tested on 0.4.3-rc.3). On 0.4.0–0.4.0.2 everything except the Backup staleness alert works. The Backup succeeded and Backup failed alerts need StartOS 0.4.3 or newer. StartOS 0.3.5.x is not supported.
 - sudo privileges (the Start9 user has these by default)
 - `start-cli` available and authenticated (preinstalled on StartOS; most features use it)
 - `jq`, `curl`, and `openssl` (all preinstalled on StartOS; the script checks at startup)
@@ -298,7 +306,7 @@ Use cases:
 <details>
 <summary><strong>5. Create a Backup Schedule</strong></summary>
 
-Creates a cron entry that triggers StartOS backups on a defined schedule using StartOS command line interface  `start-cli` and cron.  This requires the backup target(s) be configured (and preferably tested) in advance. For a full walkthrough, see [Automating StartOS Backups](BACKUP-GUIDE.md).
+Creates a cron entry that triggers StartOS backups on a defined schedule using StartOS command line interface  `start-cli` and cron.  This requires the backup target(s) be configured (and preferably tested) in advance — on StartOS 0.4.3 and newer, in System → Backups, which is also where drives are added; the wizard lists only targets added there. For a full walkthrough, see [Automating StartOS Backups](BACKUP-GUIDE.md).
 
 Options:
 
@@ -315,13 +323,15 @@ Configuration options:
   - Optional shell command — enter the full command, e.g.: `curl -d "Backup to CIFs-0 for Nextcloud and Vaultwarden started" https://ntfy.sh/StartOS-adjective-noun-Alerts`
   - Optional StartOS standard UI notification
 
-Your StartOS primary password is saved to a root-only file (`/root/.startos-admin/backup-pass-<target>`, mode 600) that the cron job reads at backup time — it does not appear in the crontab. If you change your StartOS password, edit the schedule and enter the new one. Deleting a schedule does not delete its password file; see [BACKUP-GUIDE.md](BACKUP-GUIDE.md) for how to remove it.
+Your StartOS primary password is saved to a root-only file (`/root/.startos-admin/backup-pass-<target>`, mode 600) that the cron job reads at backup time — it does not appear in the crontab. If you change your StartOS password, edit the schedule and enter the new one. When a schedule is deleted or moved to another target, its password file is deleted at the next restart the tool makes, once no cron entry (active or commented out) refers to it. v72 and older left these files behind; v73 removes them the first time it applies a change.
 
 A schedule that backs up only some services passes each one to `start-cli` as its own `--package-ids` flag. Versions before v70 joined them with commas instead (`--package-ids a,b`), which `start-cli` rejects, so a schedule with two or more selected services never ran — silently, since cron discards the error. **Edit an existing backup schedule** marks those entries; pick one and save it again to fix it.
 
-**Physical drives (USB etc.)** are saved by their filesystem UUID, shown as `uuid-<UUID>`, not by the device name StartOS lists them under (`disk-/dev/sdb1`). Device names change when drives are re-plugged or the server reboots — the same name can then point at a *different* drive — so the cron job looks the drive up by UUID each time it runs. If the drive is not connected, the backup fails rather than writing to another disk. Its password file is `/root/.startos-admin/backup-pass-uuid-<UUID>`. A drive with no filesystem UUID cannot be scheduled.
+**Physical drives (USB etc.)** — on StartOS 0.4.3 and newer, a drive added in System → Backups gets a permanent id (32 letters and digits), which StartOS ties to the drive's filesystem UUID; schedules use that id. Before 0.4.3, StartOS listed drives by device name (`disk-/dev/sdb1`), and device names change when drives are re-plugged or the server reboots — the same name can then point at a *different* drive. So on those versions a drive is saved by its filesystem UUID, shown as `uuid-<UUID>`, and the cron job looks it up by UUID each time it runs; if the drive is not connected, the backup fails rather than writing to another disk. A drive with no filesystem UUID cannot be scheduled.
 
-> **Note:** StartOS already generates a notification when a backup completes. Combining a kickoff notification with the completion notification can help estimate time it takes for backups to complete
+StartOS 0.4.3 rejects the `disk-/dev/…` names those `uuid-<UUID>` schedules pass. After updating to 0.4.3, add each such drive in System → Backups (a drive that already holds backups keeps them). At launch, startos-admin then lists the schedules it can switch to the drive's id and does it in one restart, along with the password file; it also lists any drive still to be added. Loading a configuration saved on an older StartOS does the same switch for drives that are already added.
+
+> **Note:** StartOS 0.4.2 and older generate a notification when a backup completes; combining a kickoff notification with it shows how long backups take. StartOS 0.4.3 and newer record each backup in System → Backups → History instead and send no notification — add a **Backup succeeded** and a **Backup failed** alert (10. Alerts) to be told.
 
 </details>
 
@@ -446,7 +456,7 @@ The queue is stored root-only at `/root/.startos-admin/staged-changes` (it can c
 <details>
 <summary><strong>10. Alerts</strong></summary>
 
-Four monitors that run on a cron schedule and alert you via a shell command (e.g. webhook), a StartOS notification, or both.
+Monitors that run on a cron schedule and alert you via a shell command (e.g. webhook), a StartOS notification, or both.
 
 Options:
 - Add an alert
@@ -458,15 +468,16 @@ Options:
 Alert types:
 
 - **Disk usage alert** — fires when disk usage reaches your percent threshold.
-- **Backup staleness alert** — fires when any service has not been backed up within your day threshold. Services that have never been backed up count as stale; you can exclude services that are intentionally not backed up. One message lists **all** stale services, e.g. `Backup staleness: 2 service(s) exceed 7 day(s): nextcloud (9 days), vaultwarden (never)`. It reads each service's last *successful* backup time, to any target, from the StartOS database (`packageData.<id>.lastBackup`, recorded from StartOS 0.4.0.3 on), so it needs no backup password. Optionally it can also watch one backup target and alert when that target has not received a backup within the threshold (read from `start-cli backup target list`, also without a password) — useful when you back up to more than one place and want to know if one of them stops, e.g. `...; backup target cifs-0 last received a backup 9 days ago`. A physical drive is stored by filesystem UUID (`uuid-<UUID>`), as for backup schedules, and is found under whatever device name it has that day. A watched target that is not connected or can't be reached counts as a failed check (see below); the per-service part still runs. Alerts made by v71 and older passed your backup password to `backup target info`, which StartOS 0.4.1 no longer accepts; v72 offers to rebuild them at launch.
+- **Backup staleness alert** — fires when any service has not been backed up within your day threshold. Services that have never been backed up count as stale; you can exclude services that are intentionally not backed up. One message lists **all** stale services, e.g. `Backup staleness: 2 service(s) exceed 7 day(s): nextcloud (9 days), vaultwarden (never)`. It reads each service's last *successful* backup time, to any target, from the StartOS database (`packageData.<id>.lastBackup`, recorded from StartOS 0.4.0.3 on), so it needs no backup password. Optionally it can also watch one backup target and alert when that target has not received a backup within the threshold (read from `start-cli backup target list`, also without a password) — useful when you back up to more than one place and want to know if one of them stops, e.g. `...; backup target cifs-0 last received a backup 9 days ago`. Messages name the target, e.g. `backup target cifs-0 (WinMini Daily) …`. On StartOS 0.4.3 and newer the target is one added in System → Backups; before 0.4.3 a physical drive is stored by filesystem UUID (`uuid-<UUID>`), as for backup schedules, and is found under whatever device name it has that day. An alert watching such a drive keeps working after the update to 0.4.3 once the drive is added in System → Backups. A watched target that is not connected, can't be reached, or (on 0.4.3) hasn't been added or was removed counts as a failed check (see below); the per-service part still runs. Alerts made by v71 and older passed your backup password to `backup target info`, which StartOS 0.4.1 no longer accepts; v72 offers to rebuild them at launch.
+- **Backup succeeded alert** and **Backup failed alert** (StartOS 0.4.3 and newer) — one notification for each finished backup, read from the backup history StartOS keeps in System → Backups → History. StartOS 0.4.3 stopped notifying you about backups, so these replace those notifications. The succeeded alert says where, when and how long, e.g. `Backup to WinMini Daily finished 2026-11-22 04:31 UTC after 31m: 19 service(s) backed up.` The failed alert reports a backup that stopped with an error, or that finished with any service or shared volume reporting an error, with the messages, e.g. `Backup to WinMini Weekly finished 2026-11-22 04:12 UTC with errors: bitcoind: No space left on device (os error 28)`. Default levels: info for succeeded, error for failed. Checked every 5, 15 or 30 minutes. A backup that hangs and never finishes produces no history entry, so neither alert fires — a Backup staleness alert catches that. Run ids already reported are kept in a volatile state file: after a restart, runs that finished more than 30 minutes before it count as already reported, so a restart within half an hour of a backup finishing can repeat its notification once.
 - **Service health watchdog** — fires when a service that should be running has failing health checks or is not running, only after the problem persists across two consecutive checks (avoids noise from restarts and updates).
 - **Drive health alert** — fires when an NVMe drive reports trouble in its SMART health log: any critical warning from the drive itself (reliability degraded, read-only mode, temperature out of safe range, spare below threshold), spare capacity below the drive's own threshold, wear (percentage of rated endurance used) at or past your percent threshold, or media errors appearing or increasing. This is the early warning the StartOS UI does not provide — it shows disk usage and temperature, but nothing warns you a drive is wearing out or failing. Reads the SMART log directly from the kernel via a built-in helper (no extra packages installed on your server); the setup wizard shows your drives' current readings. NVMe drives only — SATA/USB drives are not monitored. All drives are checked by one alert; the message names the affected drive, e.g. `Drive health: Samsung SSD 970 EVO Plus 2TB (/dev/nvme0): 91% of rated endurance used (alert threshold 90%)`.
 
 **Shell command contract:** the alert text is provided in the `$MSG` environment variable — e.g. `curl -d "$MSG" https://ntfy.sh/Your-Topic`. Commands run as root via cron (same trust level as your cron jobs).
 
-**Re-alert policy:** alert on first detection, immediately when the list of affected services changes, and at most one reminder per 24 hours while the condition persists. No recovery (all-clear) message is sent. Alert state is volatile — after a reboot, an ongoing condition re-alerts once.
+**Re-alert policy** (all but the backup succeeded/failed alerts, which report each backup once): alert on first detection, immediately when the list of affected services changes, and at most one reminder per 24 hours while the condition persists. No recovery (all-clear) message is sent. Alert state is volatile — after a reboot, an ongoing condition re-alerts once.
 
-**Startup skip:** the two monitors that read the system database (backup staleness, service health) check `start-cli state` first and skip the run while StartOS is initializing, logging `skipped — StartOS is still starting up`. Without this a reboot produces a `db dump` error in the log on every scheduled run until the server finishes coming up, since the initializing server serves no `db.*` methods.
+**Startup skip:** the monitors that read from StartOS (backup staleness, backup succeeded/failed, service health) check `start-cli state` first and skip the run while StartOS is initializing, logging `skipped — StartOS is still starting up`. Without this a reboot produces a `db dump` error in the log on every scheduled run until the server finishes coming up, since the initializing server serves no `db.*` methods.
 
 **When a check can't run:** an alert that can't do its check (StartOS unreachable or in diagnostic mode, `db dump` failing, an NVMe drive that won't answer, a watched backup target that is not connected) logs the error and counts it. After **3 failed runs in a row** it sends one notification through its usual route, e.g. `Backup Staleness Alert [daily]: the check has failed 3 times in a row, so this alert may miss problems until it is fixed. Last error: …`, then stays quiet until a run succeeds, which resets the count. A server that is still starting up doesn't count. The **List** view shows an alert whose check is currently failing. The count is volatile, like alert state.
 
@@ -489,7 +500,7 @@ Saves your installed cron jobs, notification forwarders, backup password files a
 - All root cron entries
 - All notification forwarder scripts (including embedded webhook URLs and schedules)
 - All scheduled-backup password files (root-only secrets, carried inside the encrypted file)
-- All alert monitor scripts (disk usage, backup staleness, service health, drive health)
+- All alert monitor scripts (disk usage, backup staleness, backup succeeded/failed, service health, drive health)
 
 **Load reinstalls** everything in a single reboot: cron jobs, notification forwarder scripts, backup password files, alert monitor scripts, and the `startos-admin` script itself (downloaded fresh from GitHub and **signature-verified** before install — if verification fails, the rest of the load proceeds but the script is not reinstalled).
 

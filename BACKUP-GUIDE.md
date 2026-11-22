@@ -37,9 +37,12 @@ use additional targets when you need independent recovery points.
 
 ## 1. Create and test a backup target
 
-In the StartOS web interface, open **System → Create Backup**. Add a physical
-drive or network-folder target, select it, and create a manual backup before
-you automate anything.
+In the StartOS web interface, open **System → Backups** (StartOS 0.4.3 and
+newer; **System → Create Backup** on earlier versions). Add a physical drive,
+network-folder or (0.4.3+) local-folder target, select it, and create a manual
+backup before you automate anything. On StartOS 0.4.3 and newer, a drive must
+be added here before the tool can schedule backups to it; a drive that already
+holds backups keeps them.
 
 Confirm all of the following:
 
@@ -76,11 +79,16 @@ and only run a version you trust.
 From the main menu, choose **5) Backup schedule**, then **1) Add a new backup
 schedule**. The wizard asks for:
 
-1. **Backup target** — select the target you tested in StartOS. A physical
-   drive is saved by its filesystem UUID (`uuid-<UUID>`), not its device name
-   (`disk-/dev/sdb1`), because device names change when drives are re-plugged
-   or the server reboots. The schedule finds the drive by UUID at backup time,
-   and fails rather than writing to a different disk if it is not connected.
+1. **Backup target** — select the target you tested in StartOS. Each is
+   listed with its name, kind and free space. On StartOS 0.4.3 and newer, a
+   drive has the permanent id StartOS gave it in System → Backups. On earlier
+   versions a physical drive is saved by its filesystem UUID (`uuid-<UUID>`),
+   not its device name (`disk-/dev/sdb1`), because device names change when
+   drives are re-plugged or the server reboots; the schedule finds the drive by
+   UUID at backup time, and fails rather than writing to a different disk if it
+   is not connected. After updating to 0.4.3, add such a drive in System →
+   Backups; startos-admin then offers at launch to switch its schedules to the
+   drive's new id.
 1. **StartOS primary password** — enter it at the hidden prompt. This is the
    password that encrypts the backup.
 1. **Services** — choose individual services or `all`.
@@ -91,9 +99,10 @@ schedule**. The wizard asks for:
    `0 4 * * *` in summer (EDT) or `0 5 * * *` in winter (EST); cron does not
    follow daylight saving for you. The wizard shows the server's current time
    to convert from.
-1. **Post-backup action** — optional. StartOS already posts a completion
-   notification; a separate kickoff notification or trusted webhook can make
-   it easier to notice a backup that takes unusually long.
+1. **Post-backup action** — optional. A kickoff notification or trusted
+   webhook can make it easier to notice a backup that takes unusually long.
+   StartOS 0.4.2 and older post a completion notification themselves; StartOS
+   0.4.3 and newer do not (see step 4).
 
 Review the summary carefully, then choose one of the following:
 
@@ -129,40 +138,32 @@ Keep the old password safely stored for restoring backups that it encrypted.
 
 After the scheduled time:
 
-1. Open the StartOS notification panel and review the backup-completion
-   report. Resolve any service failures rather than assuming a partial backup
-   is sufficient.
+1. Review the backup's report: on StartOS 0.4.3 and newer in **System →
+   Backups → History**, on earlier versions in the notification panel. Resolve
+   any service failures rather than assuming a partial backup is sufficient.
 1. Check that the target has the expected current backup.
 1. In Admin Tools, use **5) Backup schedule → 2) Edit an existing backup
    schedule** to review or change its target, services, schedule, password, or
    post-backup action.
+1. On StartOS 0.4.3 and newer, add **10) Alerts → 1) Add an alert → Backup
+   succeeded alert** and **Backup failed alert**. StartOS 0.4.3 no longer
+   notifies you when a backup finishes; these send one notification per
+   backup, with the errors when one fails.
 1. Optionally configure **10) Alerts → 1) Add an alert → Backup staleness
-   alert**. It checks the
-   dates stored on a selected target and can alert when a service has not been
-   backed up within your threshold.
+   alert**. It alerts when a service has not been backed up within your
+   threshold, and can also watch one target. It also catches a backup that
+   hangs and never finishes, which the succeeded/failed alerts cannot see.
 
 Use **7) Cron jobs** only to view or remove a schedule when necessary.
-Removing a schedule does not remove its password file. To remove a
-no-longer-needed password file, delete it inside StartOS persistence mode:
-
-```bash
-sudo /usr/lib/startos/scripts/chroot-and-upgrade
-rm /root/.startos-admin/backup-pass-<target>
-exit
-```
-
-The server restarts when you `exit`. A plain `sudo rm` outside persistence
-mode does not last: StartOS keeps the live system's changes in memory, so the
-file reappears at the next restart.
-
-Replace `<target>` with the target shown by the schedule — `cifs-0` for a
-network folder, or `uuid-<UUID>` for a physical drive. Do this only after
-confirming no other schedule or backup-staleness alert uses that target.
+When you remove a schedule, or move it to another target, its password file is
+deleted the next time the tool applies a change, once no cron entry (active or
+commented out) refers to it. Versions before v73 left these files behind; v73
+removes them the first time it applies a change.
 
 ## Recovering from a backup
 
-For an accidentally uninstalled service, use **System → Restore from Backup**
-in StartOS, select the backup target, enter the password that encrypted the
+For an accidentally uninstalled service, use **System → Backups** (StartOS
+0.4.3 and newer) or **System → Restore from Backup** (earlier versions) in StartOS, select the backup target, enter the password that encrypted the
 backup, select the service, and restore it.
 
 For a lost or corrupted StartOS data drive, use the StartOS initial-setup
