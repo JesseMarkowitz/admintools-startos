@@ -8,9 +8,11 @@
 #   Create:   4. StartOS notification     5. Backup schedule    6. Stay-alive curl
 #   Manage:   7. Cron jobs   8. Notification forwarders   9. Staged changes   10. Alerts
 #   Other:    11. Save / Load configuration   12. Documentation   13. Debug mode
-# CLI:        --version --help --update [--yes] --no-update-check | disk memory interfaces [svc]
+# CLI:        --version --help --update [--yes] --no-update-check | status server-info
+#             network services service domains interfaces disk memory cron forwarders
+#             alerts staged debug notify  (startos-admin --help)
 
-VERSION="73"   # integer — increment on each release
+VERSION="74"   # integer — increment on each release
 
 # Generated alert scripts carry MONITOR_FORMAT. Bump a type's format whenever
 # its generated script changes in a way installed alerts must pick up; at
@@ -74,12 +76,22 @@ _STAGED_FILE="${_SECRET_DIR}/staged-changes"
 _SECRET_SWEEP_CMDS="for __f in ${_SECRET_DIR}/backup-pass-*; do if [ -f \"\$__f\" ] && ! crontab -l 2>/dev/null | grep -qF \"\$__f\"; then rm -f \"\$__f\"; fi; done; true"
 # Single source of truth for the published script location.
 _REPO_RAW_URL="https://raw.githubusercontent.com/JesseMarkowitz/admintools-startos/refs/heads/main/startos-admin.sh"
-# Public key used to verify release signatures (startos-admin.sh.sig) before
-# any downloaded script is installed. See RELEASING.md in the repo.
-_UPDATE_PUBKEY="-----BEGIN PUBLIC KEY-----
-MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE6QTyEtKX+mGBZVQnD55TJkslhMap
-8qXTMWhsevn0ft1ltYVRL2IGM4ALSy+EhBEouByyTXiwmrvpYjc4qbX7KA==
------END PUBLIC KEY-----"
+# Release signing key. A downloaded script is installed only if its GPG
+# signature (startos-admin.sh.asc) was made by this key; see RELEASING.md.
+# Releases before v74 were checked against an older P-256 key and its
+# startos-admin.sh.sig. v74 and v75 carry both signatures so copies of v73
+# and older can still update.
+_UPDATE_GPG_FPR="84FF9BB7F3E85F913CCF438E1A64936712ACCC07"
+_UPDATE_GPG_KEY="-----BEGIN PGP PUBLIC KEY BLOCK-----
+
+mDMEawdjXBYJKwYBBAHaRw8BAQdAmYzCSU9H9eQoxT5c1psSvh/byyRuqpH72HaE
+7D2kKCC0OEplc3NlIE1hcmtvd2l0eiAocmVsZWFzZSBzaWduaW5nKSA8c3RhcnRv
+c0BtYXJrb3dpdHoubWU+iJAEExYKADgWIQSE/5u38+hfkTzPQ44aZJNnEqzMBwUC
+awdjXAIbAwULCQgHAgYVCgkICwIEFgIDAQIeAQIXgAAKCRAaZJNnEqzMB7UjAQCs
+I2lBnM3HHv5YgJMmIHzLiiPDqGWVvlGvtu/x1aaLXAD9FArHyIja892hlJGNe/J/
+5yH87YoZtogmHqXxxlsMLwI=
+=lEhq
+-----END PGP PUBLIC KEY BLOCK-----"
 
 # ─────────────────────────────────────────────
 # Navigation — "exit" / "back" support
@@ -571,21 +583,48 @@ _check_cron_percent() {
 # Returns: 0 = verified, 1 = download/network failure, 2 = BAD SIGNATURE.
 _fetch_verified_script() {
     local -n _fvs_path="$1"
-    local tmpdir
+    local tmpdir curl_rc=0
     tmpdir=$(mktemp -d) || return 1
-    if ! curl -fsSL --max-time 10 "$_REPO_RAW_URL" -o "${tmpdir}/startos-admin.sh" 2>/dev/null \
-       || ! curl -fsSL --max-time 10 "${_REPO_RAW_URL}.sig" -o "${tmpdir}/sig.b64" 2>/dev/null; then
+    if ! curl -fsSL --max-time 10 "$_REPO_RAW_URL" -o "${tmpdir}/startos-admin.sh" 2>/dev/null; then
         rm -rf "$tmpdir"
         return 1
     fi
-    printf '%s\n' "$_UPDATE_PUBKEY" > "${tmpdir}/pub.pem"
-    if ! base64 -d "${tmpdir}/sig.b64" > "${tmpdir}/sig.bin" 2>/dev/null \
-       || ! openssl dgst -sha256 -verify "${tmpdir}/pub.pem" \
-              -signature "${tmpdir}/sig.bin" "${tmpdir}/startos-admin.sh" >/dev/null 2>&1; then
+    curl -fsSL --max-time 10 "${_REPO_RAW_URL}.asc" -o "${tmpdir}/startos-admin.sh.asc" 2>/dev/null || curl_rc=$?
+    if [[ $curl_rc -ne 0 ]]; then
+        rm -rf "$tmpdir"
+        # 22 = the server answered with an error: the script is published
+        # without a signature. Anything else is a network problem.
+        [[ $curl_rc -eq 22 ]] && return 2
+        return 1
+    fi
+    if ! _gpg_verify_release "${tmpdir}/startos-admin.sh" "${tmpdir}/startos-admin.sh.asc" "$tmpdir"; then
         rm -rf "$tmpdir"
         return 2
     fi
     _fvs_path="${tmpdir}/startos-admin.sh"
+}
+
+# _gpg_verify_release <file> <signature.asc> <workdir>
+# True only if <signature.asc> is a good signature of <file> by the
+# primary key _UPDATE_GPG_FPR. Uses gpgv with a keyring holding only that
+# key, so nothing in root's own GnuPG keyring is trusted or touched.
+_gpg_verify_release() {
+    local file="$1" sig="$2" work="$3"
+    if ! command -v gpgv >/dev/null 2>&1; then
+        echo "gpgv is not installed, so the release signature can't be checked." >&2
+        return 1
+    fi
+    # Dearmor: drop the armor lines, any header lines, blank lines and the
+    # "=XXXX" checksum line, then decode the base64 body.
+    printf '%s\n' "$_UPDATE_GPG_KEY" \
+        | sed -e '/^-----/d' -e '/: /d' -e '/^[[:space:]]*$/d' -e '/^=/d' \
+        | base64 -d > "${work}/release-key.gpg" 2>/dev/null || return 1
+    local status
+    status=$(gpgv --homedir "$work" --status-fd 1 --keyring "${work}/release-key.gpg" \
+                  "$sig" "$file" 2>/dev/null) || return 1
+    # VALIDSIG <signing-key fpr> ... <primary-key fpr> (last field)
+    echo "$status" | awk -v fpr="$_UPDATE_GPG_FPR" \
+        '$1 == "[GNUPG:]" && $2 == "VALIDSIG" && $NF == fpr { ok = 1 } END { exit !ok }'
 }
 
 # Compute the HMAC-SHA256 of a config-backup ciphertext (hex output).
@@ -3878,53 +3917,77 @@ _monitor_rebuild_saved() {
 # in one restart. Skipped when that rebuild is already staged. Declining is
 # fine; the offer comes back next launch.
 _REBUILD_LABEL="Rebuild alerts for startos-admin v${VERSION}"
-_offer_monitor_rebuild() {
+
+# Plan the rebuild of every outdated alert, keeping each one's settings and
+# schedule. Sets the namerefs: $1 = command block, $2 = how many can be
+# rebuilt, $3 = one display line per outdated alert (newline-separated), $4 =
+# 1 if any predates v72, $5 = 1 if any backup staleness alert predates v73.
+# An alert with no cron line is listed but not rebuilt.
+_monitor_rebuild_plan() {
+    local -n _mrp_cmds="$1" _mrp_n="$2" _mrp_list="$3" _mrp_v72="$4" _mrp_v73="$5"
+    _mrp_cmds=""; _mrp_n=0; _mrp_list=""; _mrp_v72=0; _mrp_v73=0
     local lines
     lines=$(_monitor_outdated)
     [[ -n "$lines" ]] || return 0
-    if _staged_labels 2>/dev/null | grep -qF "$_REBUILD_LABEL"; then
-        return 0
-    fi
-
-    print_header
-    print_section "Alerts need updating"
-    echo ""
-    echo -e "  These alerts were installed by an older startos-admin:"
-    echo ""
-    local type name path fmt all_cmds="" n=0 skipped=0 any_v72=0 any_v73=0
+    local type name path fmt
     while IFS=$'\t' read -r type name path fmt; do
         local suffix="${path##"${_MONITOR_BIN_PREFIX}"}"
         local thr="" cmd="" sos="" lvl="" exc="" tgt="" sched
         _monitor_read_config "$path" thr cmd sos lvl exc tgt
         sched=$(_monitor_read_schedule "$suffix")
         local note=""
-        (( fmt < 2 )) && any_v72=1
-        [[ "$type" == "backup-age" ]] && (( fmt < 3 )) && any_v73=1
+        (( fmt < 2 )) && _mrp_v72=1
+        [[ "$type" == "backup-age" ]] && (( fmt < 3 )) && _mrp_v73=1
         if [[ "$type" == "backup-age" ]] && (( fmt < 2 )); then
             note=" ${YELLOW}— not working on StartOS 0.4.1 and newer${NC}"
         elif [[ "$type" == "backup-age" && -n "$tgt" ]] && _backup_targets_registered; then
             note=" ${YELLOW}— its target check needs this update on StartOS 0.4.3${NC}"
         fi
         if [[ -z "$sched" ]]; then
-            echo -e "    ${DIM}•${NC} $(_monitor_display "$type" "$name")${note} ${RED}(no cron schedule found — remove and re-add it under Alerts)${NC}"
-            (( skipped++ )) || true
+            _mrp_list+="    ${DIM}•${NC} $(_monitor_display "$type" "$name")${note} ${RED}(no cron schedule found — remove and re-add it under Alerts)${NC}"$'\n'
             continue
         fi
-        echo -e "    ${DIM}•${NC} $(_monitor_display "$type" "$name")${note}"
         local c=""
-        _monitor_install_cmds c "$type" "$thr" "$exc" "$cmd" "${sos:-0}" "${lvl:-warning}" "$sched" "$tgt" "$name" || { (( skipped++ )) || true; continue; }
-        all_cmds+="${all_cmds:+$'\n'}${c}"
-        (( n++ )) || true
+        _monitor_install_cmds c "$type" "$thr" "$exc" "$cmd" "${sos:-0}" "${lvl:-warning}" "$sched" "$tgt" "$name" || continue
+        _mrp_list+="    ${DIM}•${NC} $(_monitor_display "$type" "$name")${note}"$'\n'
+        _mrp_cmds+="${_mrp_cmds:+$'\n'}${c}"
+        _mrp_n=$(( _mrp_n + 1 ))
     done <<< "$lines"
-    echo ""
-    [[ $n -gt 0 ]] || { pause; return 0; }
+    return 0
+}
+
+# What a rebuild brings in, for the lists above. $1/$2 = the v72/v73 flags.
+_monitor_rebuild_reasons() {
     echo -e "  Rebuilding keeps each alert's settings and schedule, and brings in:"
-    if [[ $any_v72 -eq 1 ]]; then
+    if [[ "$1" -eq 1 ]]; then
         echo -e "    ${DIM}•${NC} Backup staleness alerts no longer use your backup password."
         echo -e "    ${DIM}•${NC} Every alert notifies you if its check fails ${BOLD}3 times in a row${NC}."
     fi
-    [[ $any_v73 -eq 1 ]] && \
+    [[ "$2" -eq 1 ]] && \
         echo -e "    ${DIM}•${NC} Backup staleness alerts understand StartOS 0.4.3's backup targets."
+    return 0
+}
+
+# At launch: offer to rebuild outdated alerts with their current settings, all
+# in one restart. Skipped when that rebuild is already staged. Declining is
+# fine; the offer comes back next launch.
+_offer_monitor_rebuild() {
+    [[ -n "$(_monitor_outdated)" ]] || return 0
+    if _staged_labels 2>/dev/null | grep -qF "$_REBUILD_LABEL"; then
+        return 0
+    fi
+    local all_cmds="" n=0 list="" any_v72=0 any_v73=0
+    _monitor_rebuild_plan all_cmds n list any_v72 any_v73
+
+    print_header
+    print_section "Alerts need updating"
+    echo ""
+    echo -e "  These alerts were installed by an older startos-admin:"
+    echo ""
+    printf '%s' "$list" | while IFS= read -r l; do echo -e "$l"; done
+    echo ""
+    [[ $n -gt 0 ]] || { pause; return 0; }
+    _monitor_rebuild_reasons "$any_v72" "$any_v73"
     if ! confirm "Rebuild ${n} alert(s) now?"; then
         _BACK=0
         print_info "Not rebuilt. You'll be asked again next time you start startos-admin."
@@ -4443,6 +4506,7 @@ _monitor_list_display() {
         if [[ " $(_monitor_outdated | cut -f3 | tr '\n' ' ') " == *" ${script} "* ]]; then
             echo -e "     ${YELLOW}Built by an older startos-admin — restart startos-admin to rebuild it.${NC}"
         fi
+        echo -e "     ${DIM}Id:${NC}        ${suffix}  ${DIM}(startos-admin alerts log ${suffix})${NC}"
         echo -e "     ${DIM}Log:${NC}       ${_MONITOR_DATA_PREFIX}${suffix}.log"
         echo ""
     done <<< "$lines"
@@ -4722,8 +4786,14 @@ menu_alerts() {
 
 # Display hostname, OS version, architecture, and last backup timestamp from DB.
 _db_server_info() {
-    local db="$1"
     print_header
+    _show_server_info "$1"
+    pause
+}
+
+# Body of Server Info, shared by the menu and `startos-admin server-info`.
+_show_server_info() {
+    local db="$1"
     print_section "Server Info"
     echo ""
 
@@ -4750,13 +4820,18 @@ _db_server_info() {
     echo -e "  ${BOLD}Platform:${NC}      $platform"
     echo -e "  ${BOLD}Last Backup:${NC}   $last_backup"
     echo ""
+}
+
+# Display server addresses, WiFi, gateways and DNS servers from DB.
+_db_network() {
+    print_header
+    _show_network "$1"
     pause
 }
 
-# Display Tor addresses, LAN/gateway IPs, WiFi, and DNS servers from DB.
-_db_network() {
+# Body of Network, shared by the menu and `startos-admin network`.
+_show_network() {
     local db="$1"
-    print_header
     print_section "Network"
     echo ""
 
@@ -4842,14 +4917,18 @@ _db_network() {
         echo -e "  ${CYAN}•${NC} $dns"
     done
     echo ""
-
-    pause
 }
 
 # List all installed services with running state and health-check status from DB.
 _db_svc_status() {
-    local db="$1"
     print_header
+    _show_svc_status "$1"
+    pause
+}
+
+# Body of Service Status, shared by the menu and `startos-admin services`.
+_show_svc_status() {
+    local db="$1"
     print_section "Service Status"
     echo ""
 
@@ -4878,8 +4957,6 @@ _db_svc_status() {
 
         echo ""
     done <<< "$svc_list"
-
-    pause
 }
 
 # Display full DB record for a single service selected by the user.
@@ -4908,9 +4985,15 @@ _db_svc_detail() {
         print_warn "Invalid choice."; sleep 1; return 0
     fi
 
-    local pkg="${svc_list[$((svc_choice - 1))]}"
-
     print_header
+    _show_svc_detail "$db" "${svc_list[$((svc_choice - 1))]}"
+    pause
+}
+
+# Body of Service Detail for one service, shared by the menu and
+# `startos-admin service <id>`.
+_show_svc_detail() {
+    local db="$1" pkg="$2"
     print_section "Service: $pkg"
     echo ""
 
@@ -4955,12 +5038,46 @@ _db_svc_detail() {
         done <<< "$deps"
     fi
     echo ""
-
-    pause
 }
 
+# jq helpers shared by _interfaces_tsv and _domains_tsv, prepended to their
+# programs. $a = one entry of a binding's addresses.available, $iface = one of
+# the binding's interfaces, $addrs = the binding's addresses object,
+# $gws = serverInfo.network.gateways.
+_JQ_ADDR_DEFS='
+  # mdns / private-domain carry metadata.gateways[], everything else gateway
+  def sa_gw($a): ($a.metadata.gateway // ($a.metadata.gateways // [])[0]);
+  # IPv6 in brackets
+  def sa_host($a): if $a.metadata.kind == "ipv6" then "[" + $a.hostname + "]" else $a.hostname end;
+  # URL from the ssl flag and the interface scheme; the scheme default port is
+  # left off, and query parameters (embedded certs/macaroons) are stripped.
+  def sa_url($a; $iface):
+    (if ($a.ssl and $iface.addressInfo.sslScheme != null) then $iface.addressInfo.sslScheme
+     elif ($a.ssl | not) and ($iface.addressInfo.scheme != null) then $iface.addressInfo.scheme
+     elif $a.ssl then "ssl"
+     else "tcp" end) as $proto |
+    (if ($proto == "https" and $a.port == 443) or ($proto == "http" and $a.port == 80)
+     then "" else ":" + ($a.port|tostring) end) as $portPart |
+    $proto + "://" + sa_host($a) + $portPart + (($iface.addressInfo.suffix // "") | split("?")[0]);
+  # Active = what the UI shows as switched on. A public IP:port is off unless
+  # listed in addresses.enabled; everything else (private IPs and domains) is
+  # on unless listed in addresses.disabled.
+  def sa_active($a; $addrs):
+    if ($a.public == true) and ($a.metadata.kind == "ipv4" or $a.metadata.kind == "ipv6") then
+      ($a.port == null) or
+      ((($addrs.enabled // []) | index(sa_host($a) + ":" + ($a.port|tostring))) != null)
+    else
+      (($addrs.disabled // []) | any(.[0] == $a.hostname and .[1] == ($a.port // 0))) | not
+    end;
+  # Gateway display name ("Wired connection 1", "StartTunnel", …), trimmed.
+  def sa_gwname($gws; $id):
+    if $id == null then "local"
+    else (($gws[$id].name // $gws[$id].ipInfo.name // $id) | gsub("^\\s+|\\s+$"; "")) end;
+'
+
 # Extract service interface URLs from a DB dump as TSV:
-# service<TAB>iface-name<TAB>type<TAB>network<TAB>url<TAB>active|inactive
+# service<TAB>iface-name<TAB>type<TAB>network<TAB>url<TAB>active|inactive<TAB>kind
+# kind is the address kind: ipv4, ipv6, mdns, public-domain or private-domain.
 # $1 = db dump JSON, $2 = JSON array of service ids to include.
 #
 # As of StartOS 0.4.0 there is no packageData.<pkg>.serviceInterfaces map;
@@ -4969,8 +5086,7 @@ _db_svc_detail() {
 # so the addresses for an interface are the enclosing binding's
 # addresses.available — no hostId lookup needed.
 _interfaces_tsv() {
-    echo "$1" | jq -r --argjson svcs "$2" '
-      # Gateway display names ("Wired connection 1", "StartTunnel", …)
+    echo "$1" | jq -r --argjson svcs "$2" "${_JQ_ADDR_DEFS}"'
       (.value.serverInfo.network.gateways // {}) as $gws |
       .value.packageData | to_entries[] |
       select(.key as $k | $svcs | index($k)) |
@@ -4982,47 +5098,218 @@ _interfaces_tsv() {
       ($binding.addresses // {}) as $addrs |
       ($binding.interfaces // {}) | to_entries[] |
       .value as $iface |
-      ($iface.addressInfo.suffix // "") as $suffix |
-      $iface.addressInfo.scheme as $scheme |
-      $iface.addressInfo.sslScheme as $sslScheme |
       ($addrs.available // [])[] as $a |
-      # mdns / private-domain carry metadata.gateways[], everything else gateway
-      ($a.metadata.gateway // ($a.metadata.gateways // [])[0]) as $gwId |
-      # Filter: skip loopback, internal bridge, link-local IPv6
+      sa_gw($a) as $gwId |
+      # Skip loopback, the internal bridge and link-local IPv6
       select($gwId | . != "lo" and . != "lxcbr0") |
       select(($a.metadata.kind == "ipv6" and ($a.hostname | startswith("fe80::"))) | not) |
-      # Wrap IPv6 in brackets
-      (if $a.metadata.kind == "ipv6" then "[" + $a.hostname + "]"
-       else $a.hostname end) as $host |
-      # Strip query params from suffix (hides embedded certs/macaroons)
-      ($suffix | split("?")[0]) as $safeSuffix |
-      # Build URL using ssl flag and interface scheme
-      (if ($a.ssl and $sslScheme != null) then $sslScheme
-       elif ($a.ssl | not) and ($scheme != null) then $scheme
-       elif $a.ssl then "ssl"
-       else "tcp"
-       end) as $proto |
-      # Omit the port when it is the scheme default
-      (if ($proto == "https" and $a.port == 443) or ($proto == "http" and $a.port == 80)
-       then "" else ":" + ($a.port|tostring) end) as $portPart |
-      ($proto + "://" + $host + $portPart + $safeSuffix) as $url |
-      # Network label
-      (if $gwId == null then "local"
-       else ($gws[$gwId].name // $gws[$gwId].ipInfo.name // $gwId)
-       end) as $net |
-      # Active = what the UI shows as switched on. A public IP:port is off
-      # unless listed in addresses.enabled; everything else (private IPs and
-      # domains) is on unless listed in addresses.disabled.
-      (($a.public == true) and ($a.metadata.kind == "ipv4" or $a.metadata.kind == "ipv6")) as $isPublicIp |
-      (if $isPublicIp then
-         ($a.port == null) or
-         ((($addrs.enabled // []) | index($host + ":" + ($a.port|tostring))) != null)
-       else
-         (($addrs.disabled // [])
-           | any(.[0] == $a.hostname and .[1] == ($a.port // 0))) | not
-       end) as $active |
-      "\($svc)\t\($iface.name)\t\($iface.type)\t\($net)\t\($url)\t\(if $active then "active" else "inactive" end)"
+      "\($svc)\t\($iface.name)\t\($iface.type)\t\(sa_gwname($gws; $gwId))\t\(sa_url($a; $iface))\t\(if sa_active($a; $addrs) then "active" else "inactive" end)\t\($a.metadata.kind // "unknown")"
     ' 2>/dev/null
+}
+
+# Every domain on the server — public and private, the StartOS web interface's
+# own included — as TSV, one row per domain and interface URL, sorted by domain:
+#   domain service interface url access gateway cert state resolver expected
+# access = public|private; cert = the certificate as the web UI names it
+# (Let's Encrypt, Root CA, Self signed, -); state = active|inactive (an address
+# switched off in the UI, or a domain whose bindings have no interface);
+# resolver = "public" (ask public DNS) or the gateway IPv4 the server's own DNS
+# answers on (private domains); expected = the IP(s) the name should resolve to.
+# The service column says "startos" for the web interface's domains.
+# $1 = db dump JSON, $2 = JSON array of service ids to include, $3 = 1 to
+# include the StartOS web interface.
+_domains_tsv() {
+    echo "$1" | jq -r --argjson svcs "$2" --argjson withos "${3:-1}" "${_JQ_ADDR_DEFS}"'
+      def ipv4s($gw): [($gw.ipInfo.subnets // [])[] | select(test("^[0-9]+\\.")) | split("/")[0]];
+      def certname($a; $b; $host):
+        if ($a.ssl | not) then "-"
+        elif ($b.options.addSsl == null) then (if $b.options.secure.ssl == true then "Self signed" else "-" end)
+        elif $a.metadata.kind != "public-domain" then "Root CA"
+        else ($host.publicDomains[$a.hostname].acme // null) as $u |
+          if $u == null then "Root CA"
+          elif $u == "https://acme-v02.api.letsencrypt.org/directory" then "Let'"'"'s Encrypt"
+          elif $u == "https://acme-staging-v02.api.letsencrypt.org/directory" then "Let'"'"'s Encrypt (Staging)"
+          else $u end
+        end;
+      (.value.serverInfo.network.gateways // {}) as $gws |
+      ( (if $withos == 1 then [{svc: "startos", host: (.value.serverInfo.network.host // {})}] else [] end)
+        + [ .value.packageData | to_entries[] | select(.key as $k | $svcs | index($k)) |
+            .key as $s | (.value.hosts // {}) | to_entries[] | {svc: $s, host: .value} ] )
+      | [ .[] | .svc as $svc | .host as $host |
+          ( [ ($host.publicDomains // {}) | to_entries[] |
+                {d: .key, access: "public", gws: [.value.gateway]} ]
+            + [ ($host.privateDomains // {}) | to_entries[] | select(.key | endswith(".local") | not) |
+                {d: .key, access: "private", gws: (.value | if type == "array" then . else [] end)} ] )[] as $dom |
+          ($dom.gws | map(sa_gwname($gws; .)) | join(",")) as $gwnames |
+          (if $dom.access == "public"
+             then {resolver: "public", expected: ([$dom.gws[] | $gws[.].ipInfo.wanIp // empty] | unique | join(","))}
+             else (ipv4s($gws[$dom.gws[0] // ""] // {})) as $ips |
+                  {resolver: ($ips[0] // "-"), expected: ($ips | join(","))}
+           end) as $dns |
+          [ ($host.bindings // {}) | to_entries[] | .value as $b |
+            select($b.enabled != false) |
+            ($b.addresses // {}) as $addrs |
+            ($addrs.available // [])[] as $a |
+            select($a.hostname == $dom.d and ($a.metadata.kind == "public-domain" or $a.metadata.kind == "private-domain")) |
+            ($b.interfaces // {}) | to_entries[] | .value as $iface |
+            {iface: $iface.name, url: sa_url($a; $iface), cert: certname($a; $b; $host),
+             state: (if sa_active($a; $addrs) then "active" else "inactive" end)} ] as $rows |
+          (if ($rows | length) == 0 then [{iface: "-", url: "-", cert: "-", state: "inactive"}] else $rows end)[] |
+          [$dom.d, $svc, .iface, .url, $dom.access, (if $gwnames == "" then "-" else $gwnames end),
+           .cert, .state, $dns.resolver, (if $dns.expected == "" then "-" else $dns.expected end)] ]
+      | unique | sort_by(.[0], .[1], .[2], .[3]) | .[] | @tsv
+    ' 2>/dev/null
+}
+
+# A records for $1, comma-separated (empty if none), then a tab and the
+# resolver that answered. $2 = "public" to ask public DNS (1.1.1.1, then
+# 9.9.9.9, then this server's own resolver), or an IP to ask that server.
+# Returns 1 if no resolver answered or dig is missing.
+_dns_lookup_a() {
+    local name="$1" via="$2" out="" srv
+    command -v dig >/dev/null 2>&1 || return 1
+    [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+    local -a servers=()
+    if [[ "$via" == "public" ]]; then servers=(1.1.1.1 9.9.9.9 system)
+    else servers=("$via"); fi
+    for srv in "${servers[@]}"; do
+        if [[ "$srv" == "system" ]]; then
+            out=$(dig +short +time=3 +tries=1 A "$name" 2>/dev/null) || continue
+        else
+            out=$(dig +short +time=3 +tries=1 A "$name" "@${srv}" 2>/dev/null) || continue
+        fi
+        printf '%s\t%s\n' "$(grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' <<< "$out" | sort -u | paste -sd, -)" "$srv"
+        return 0
+    done
+    return 1
+}
+
+# _domains_tsv plus a DNS check of every domain, as TSV:
+#   domain service interface url access gateway cert state dns resolved expected resolver
+# dns = ok (resolves to an expected IP) | elsewhere (resolves, but not to one)
+#     | missing (no A record) | unchecked (no expected IP known, or no
+#     resolver answered); resolved = the A records found ("-" if none);
+# resolver = who answered (1.1.1.1, 9.9.9.9, system, or the gateway IP).
+# Lookups run in parallel, one per distinct domain and resolver.
+_domains_report() {
+    local rows
+    rows=$(_domains_tsv "$@") || rows=""
+    [[ -n "$rows" ]] || return 0
+    local tmp
+    tmp=$(mktemp -d) || return 1
+    local -A job=()
+    local d svc ifc url acc gw cert st via exp key n=0
+    while IFS=$'\t' read -r d svc ifc url acc gw cert st via exp; do
+        key="${d}|${via}"
+        [[ -n "${job[$key]:-}" ]] && continue
+        n=$(( n + 1 )); job[$key]=$n
+        [[ "$via" == "-" ]] && continue
+        ( _dns_lookup_a "$d" "$via" > "${tmp}/${n}" 2>/dev/null || true ) &
+    done <<< "$rows"
+    wait
+    while IFS=$'\t' read -r d svc ifc url acc gw cert st via exp; do
+        local res="" ans="" by="-" dns="unchecked"
+        res=$(cat "${tmp}/${job[${d}|${via}]}" 2>/dev/null) || res=""
+        if [[ -n "$res" ]]; then
+            ans="${res%%$'\t'*}"; by="${res#*$'\t'}"
+            if [[ -z "$ans" ]]; then
+                dns="missing"
+            elif [[ "$exp" != "-" ]]; then
+                dns="elsewhere"
+                local ip
+                for ip in ${ans//,/ }; do
+                    [[ ",${exp}," == *",${ip},"* ]] && { dns="ok"; break; }
+                done
+            fi
+        fi
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$d" "$svc" "$ifc" "$url" "$acc" "$gw" "$cert" "$st" "$dns" "${ans:--}" "$exp" "$by"
+    done <<< "$rows"
+    rm -rf "$tmp"
+}
+
+# Print the domain report grouped by domain (menu and `startos-admin domains`
+# on a terminal). $1 = output of _domains_report.
+_show_domains() {
+    local report="$1"
+    print_section "Domains"
+    echo ""
+    if [[ -z "$report" ]]; then
+        print_info "No domains are set up on this server."
+        echo -e "  ${DIM}Domains are added to a service's interface in the StartOS web UI.${NC}"
+        echo ""
+        return 0
+    fi
+    echo -e "  ${DIM}Public domains are looked up in public DNS (1.1.1.1) and should point at their${NC}"
+    echo -e "  ${DIM}gateway's public IP. Private domains are answered by this server's own DNS, for${NC}"
+    echo -e "  ${DIM}devices that use this server as their DNS server.${NC}"
+    echo ""
+    local prev="" n_dom=0 n_ok=0 n_bad=0 n_unk=0
+    local d svc ifc url acc gw cert st dns ans exp by
+    while IFS=$'\t' read -r d svc ifc url acc gw cert st dns ans exp by; do
+        if [[ "$d" != "$prev" ]]; then
+            [[ -n "$prev" ]] && echo ""
+            prev="$d"; n_dom=$(( n_dom + 1 ))
+            echo -e "  ${BOLD}${d}${NC}  ${DIM}${acc} · ${gw}${NC}"
+            local via_note=""
+            [[ "$acc" == "public" && "$by" != "1.1.1.1" && "$by" != "-" ]] && via_note=" ${DIM}(answered by ${by})${NC}"
+            case "$dns" in
+                ok)
+                    n_ok=$(( n_ok + 1 ))
+                    if [[ "$acc" == "public" ]]; then
+                        echo -e "    ${GREEN}DNS ✓${NC} points to ${ans}${via_note}"
+                    else
+                        echo -e "    ${GREEN}DNS ✓${NC} this server answers ${ans} on ${gw}"
+                    fi ;;
+                elsewhere)
+                    n_bad=$(( n_bad + 1 ))
+                    echo -e "    ${YELLOW}DNS ✗ points to ${ans}, not ${exp}${NC}${via_note}"
+                    [[ "$acc" == "public" ]] && \
+                        echo -e "      ${DIM}${exp} is the public IP of ${gw}. A proxy or CDN in front of the domain also shows here.${NC}" ;;
+                missing)
+                    n_bad=$(( n_bad + 1 ))
+                    if [[ "$acc" == "public" && "$exp" == "-" ]]; then
+                        echo -e "    ${RED}DNS ✗ no A record${NC}${via_note} ${DIM}— and StartOS doesn't know ${gw}'s public IP${NC}"
+                    elif [[ "$acc" == "public" ]]; then
+                        echo -e "    ${RED}DNS ✗ no A record${NC}${via_note} ${DIM}— add one pointing to ${exp}${NC}"
+                    else
+                        echo -e "    ${RED}DNS ✗ this server's DNS on ${gw} does not answer for it${NC}"
+                    fi ;;
+                *)
+                    n_unk=$(( n_unk + 1 ))
+                    if [[ "$exp" == "-" ]]; then
+                        echo -e "    ${DIM}DNS not checked — StartOS doesn't know ${gw}'s public IP${NC}"
+                    else
+                        echo -e "    ${DIM}DNS not checked — no DNS server answered${NC}"
+                    fi ;;
+            esac
+        fi
+        if [[ "$url" == "-" ]]; then
+            echo -e "    ${DIM}${svc}  (no interface uses this domain)${NC}"
+        elif [[ "$st" == "active" ]]; then
+            printf "    %-16s %-20s %-44s ${DIM}%s${NC}\n" "$svc" "$ifc" "$url" "$cert"
+        else
+            printf "    ${DIM}%-16s %-20s %-44s %s  (off)${NC}\n" "$svc" "$ifc" "$url" "$cert"
+        fi
+    done <<< "$report"
+    echo ""
+    local summary="${n_dom} domain(s) · ${GREEN}${n_ok} DNS ok${NC}"
+    (( n_bad > 0 )) && summary+=" · ${YELLOW}${n_bad} need attention${NC}"
+    (( n_unk > 0 )) && summary+=" · ${DIM}${n_unk} not checked${NC}"
+    echo -e "  ${summary}"
+    echo ""
+}
+
+# System Data → Domains: every domain on the server, with a DNS check.
+_db_domains() {
+    local db="$1"
+    print_header
+    print_info "Checking DNS for every domain..."
+    local report
+    report=$(_domains_report "$db" "$(echo "$db" | jq -c '.value.packageData | keys')" 1)
+    print_header
+    _show_domains "$report"
+    pause
 }
 
 # Display service interfaces (URLs) extracted from DB for selected services.
@@ -5081,7 +5368,7 @@ _db_interfaces() {
         print_info "No interfaces found for selected services."
     else
         local prev_svc=""
-        while IFS=$'\t' read -r svc iname itype net url active; do
+        while IFS=$'\t' read -r svc iname itype net url active _kind; do
             if [[ "$svc" != "$prev_svc" ]]; then
                 [[ -n "$prev_svc" ]] && echo ""
                 echo -e "  ${BOLD}${svc}${NC}"
@@ -5131,6 +5418,7 @@ menu_db_dump() {
         echo -e "    ${CYAN}${BOLD}3)${NC} Service Status"
         echo -e "    ${CYAN}${BOLD}4)${NC} Service Detail"
         echo -e "    ${CYAN}${BOLD}5)${NC} Service Interfaces"
+        echo -e "    ${CYAN}${BOLD}6)${NC} Domains  ${DIM}(with a DNS check)${NC}"
         echo ""
         echo -e "    ${DIM}0) Back${NC}"
         echo ""
@@ -5141,8 +5429,9 @@ menu_db_dump() {
             3) _db_svc_status   "$db_json" ;;
             4) _db_svc_detail   "$db_json" || return 1 ;;
             5) _db_interfaces   "$db_json" || return 1 ;;
+            6) _db_domains      "$db_json" ;;
             0) return ;;
-            *) print_warn "Enter 0-5." ; sleep 1 ;;
+            *) print_warn "Enter 0-6." ; sleep 1 ;;
         esac
     done
 }
@@ -5347,6 +5636,12 @@ menu_documentation() {
                 echo -e "    ${CYAN}•${NC} ${BOLD}Network${NC}        — LAN/WAN addresses, WiFi, gateway IPs, DNS servers"
                 echo -e "    ${CYAN}•${NC} ${BOLD}Service Status${NC} — all services with running/stopped state and health checks"
                 echo -e "    ${CYAN}•${NC} ${BOLD}Service Detail${NC} — full detail for a single service"
+                echo -e "    ${CYAN}•${NC} ${BOLD}Service Interfaces${NC} — every address of every interface, for chosen services"
+                echo -e "    ${CYAN}•${NC} ${BOLD}Domains${NC}        — every domain on the server (the web UI's own included),"
+                echo -e "      the interfaces that use it, its gateway and certificate, and a DNS check:"
+                echo -e "      public domains are looked up in public DNS (1.1.1.1, then 9.9.9.9) and should"
+                echo -e "      point at their gateway's public IP; private domains should be answered by"
+                echo -e "      this server's own DNS on their gateway."
                 echo ""
                 pause ;;
             13)
@@ -5424,15 +5719,31 @@ menu_documentation() {
                 echo -e "    ${CYAN}startos-admin --update${NC}             check for a signed update (does NOT install)"
                 echo -e "    ${CYAN}startos-admin --update --yes${NC}       install a verified update ${RED}(SERVER RESTARTS)${NC}"
                 echo ""
-                echo -e "  ${BOLD}Data commands${NC} (plain output, suitable for scripts):"
+                echo -e "  ${BOLD}Show${NC} (read-only; plain output when piped):"
                 echo ""
-                echo -e "    ${CYAN}startos-admin disk${NC}                 disk usage by service"
-                echo -e "    ${CYAN}startos-admin memory${NC}               memory usage by service"
-                echo -e "    ${CYAN}startos-admin interfaces${NC}           all service interface URLs (tab-separated)"
-                echo -e "    ${CYAN}startos-admin interfaces nextcloud${NC} interfaces for one service"
+                echo -e "    ${CYAN}startos-admin status${NC}               the server status from the menu header"
+                echo -e "    ${CYAN}startos-admin server-info${NC}          System data → Server Info"
+                echo -e "    ${CYAN}startos-admin network${NC}              System data → Network"
+                echo -e "    ${CYAN}startos-admin services${NC}             System data → Service Status"
+                echo -e "    ${CYAN}startos-admin service nextcloud${NC}    System data → Service Detail"
+                echo -e "    ${CYAN}startos-admin domains${NC}              every domain + DNS check (tab-separated)"
+                echo -e "    ${CYAN}startos-admin domains --names${NC}      just the domain names"
+                echo -e "    ${CYAN}startos-admin interfaces [svc]${NC}     interface URLs (tab-separated)"
+                echo -e "    ${CYAN}startos-admin disk${NC} / ${CYAN}memory${NC}        usage by service"
+                echo -e "    ${CYAN}startos-admin cron list${NC}            the root crontab"
+                echo -e "    ${CYAN}startos-admin forwarders list${NC}      / ${CYAN}forwarders log <name>${NC}"
+                echo -e "    ${CYAN}startos-admin alerts list${NC}          / ${CYAN}alerts log <id>${NC}"
+                echo -e "    ${CYAN}startos-admin staged list${NC}          staged changes, numbered"
                 echo ""
-                echo -e "  ${BOLD}--update exit codes:${NC}  0 up to date · 10 update available ·"
-                echo -e "  1 network failure · 3 signature verification failure"
+                echo -e "  ${BOLD}Change:${NC}"
+                echo ""
+                echo -e "    ${CYAN}startos-admin notify info \"Title\" \"Message\"${NC}   send a StartOS notification"
+                echo -e "    ${CYAN}startos-admin debug on|off${NC}         debug mode (until the next restart)"
+                echo -e "    ${CYAN}startos-admin staged drop 2${NC}        / ${CYAN}staged clear${NC}"
+                echo -e "    ${CYAN}startos-admin alerts rebuild${NC}       stage the rebuild of outdated alerts"
+                echo -e "    ${CYAN}startos-admin staged apply --yes${NC}   apply staged changes ${RED}(SERVER RESTARTS)${NC}"
+                echo ""
+                echo -e "  ${CYAN}startos-admin --help${NC} lists every option and the exit codes."
                 echo ""
                 echo -e "  Updates installed via ${CYAN}--update --yes${NC} are signature-verified first, and"
                 echo -e "  include any staged changes in the same restart."
@@ -5956,8 +6267,18 @@ _config_restore_flow() {
         print_error "Downloaded script FAILED signature verification — startos-admin will NOT be reinstalled."
         print_warn "This may indicate a compromised repository. The rest of the load will proceed."
     else
-        print_warn "Could not download the latest script — startos-admin will NOT be reinstalled."
-        print_warn "Re-run the install command from the README after the load completes."
+        # Offline: install the copy that is running now (what the README's
+        # install command just downloaded), unless it is already the
+        # installed one.
+        local _self
+        _self=$(realpath "$0" 2>/dev/null || echo "$0")
+        if [[ "$_self" != "/usr/local/bin/startos-admin" && -f "$_self" ]]; then
+            print_warn "Could not download the latest script — installing this copy (v${VERSION}) instead."
+            script_b64=$(base64 -w 0 < "$_self")
+        else
+            print_warn "Could not download the latest script — startos-admin will NOT be reinstalled."
+            print_warn "Re-run the install command from the README after the load completes."
+        fi
     fi
 
     # ── Build and run chroot session ──────────────────────────────────────────
@@ -6079,12 +6400,27 @@ check_for_update() {
     _script_path=$(realpath "$0" 2>/dev/null || echo "$0")
     if [[ "$_script_path" != "/usr/local/bin/startos-admin" ]]; then
         echo ""
-        print_info "This script is not yet installed persistently."
-        print_info "Installing to /usr/local/bin/startos-admin lets you run 'startos-admin' from anywhere."
-        print_info "Tip: If you plan to load a saved configuration right now, decline this —"
-        print_info "     the Load option installs the script persistently as part of the same reboot."
+        print_info "This script is not installed on this server yet."
+        echo -e "  ${DIM}Installing puts it at /usr/local/bin/startos-admin, so 'startos-admin' runs from anywhere.${NC}"
         echo ""
-        if confirm "Install persistently to /usr/local/bin/startos-admin now?"; then
+        echo -e "    ${CYAN}${BOLD}1)${NC} Install it  ${DIM}(server restarts)${NC}"
+        echo -e "    ${CYAN}${BOLD}2)${NC} Load a saved configuration  ${DIM}(installs it too, in the same restart)${NC}"
+        echo -e "    ${CYAN}${BOLD}3)${NC} Not now  ${DIM}(go to the menu without installing)${NC}"
+        echo ""
+        local _fr_choice=""
+        while true; do
+            _read _fr_choice "  Choice [1-3]: " || { _BACK=0; _fr_choice=3; }
+            case "$_fr_choice" in
+                1|2|3) break ;;
+                *) print_warn "Enter 1, 2 or 3." ;;
+            esac
+        done
+        if [[ "$_fr_choice" == "2" ]]; then
+            _config_restore_flow || true
+            _BACK=0
+            return 0
+        fi
+        if [[ "$_fr_choice" == "1" ]]; then
             _warn_restart "after the script is installed."
             if ! confirm "Proceed? (server will restart automatically)"; then
                 [[ $_BACK -eq 1 ]] && { _BACK=0; }
@@ -6321,14 +6657,46 @@ Usage:
   startos-admin --no-update-check   Skip the startup update check this launch
   startos-admin --update            Check for a signed update (does NOT install)
   startos-admin --update --yes      Install a verified update (SERVER RESTARTS)
-  startos-admin disk                Disk usage by service (plain text)
-  startos-admin memory              Memory usage by service (plain text)
-  startos-admin interfaces [svc]    Service interface URLs (tab-separated:
-                                    service, interface, type, network, url)
 
-Exit codes for --update:
-  0 = up to date    10 = update available (not installed)
-  1 = network/download failure    3 = signature verification failure
+Show (read-only):
+  startos-admin status              Server status (the menu's header lines)
+  startos-admin server-info         Hostname, version, architecture, last backup
+  startos-admin network             Addresses, WiFi, gateways, DNS servers
+  startos-admin services            Every service's state and health checks
+  startos-admin service <id>        One service: status, backup, health, dependencies
+  startos-admin domains [svc]       Every domain, with a DNS check (tab-separated:
+                                    domain, service, interface, url, access,
+                                    gateway, cert, state, dns, resolved,
+                                    expected, resolver). 'startos' = the web UI
+  startos-admin domains --names     Just the domain names, one per line
+  startos-admin interfaces [svc]    Service interface URLs (tab-separated:
+                                    service, interface, type, network, url,
+                                    state, kind)
+  startos-admin disk                Disk usage by service
+  startos-admin memory              Memory usage by service
+  startos-admin cron list           The root crontab
+  startos-admin forwarders list     Installed notification forwarders
+  startos-admin forwarders log <name> [lines]
+  startos-admin alerts list         Installed alerts (with their ids)
+  startos-admin alerts log <id> [lines]
+  startos-admin staged list         Staged changes, numbered
+  startos-admin debug               Debug mode: on or off
+
+Change:
+  startos-admin notify [--service <id>] <info|success|warning|error> <title> <message>
+                                    Send a StartOS notification now
+  startos-admin debug on|off        Debug mode (until the next restart)
+  startos-admin staged drop <n>[,<n>...]   Remove staged change(s)
+  startos-admin staged clear        Remove all staged changes
+  startos-admin alerts rebuild      Stage the rebuild of alerts made by an older
+                                    startos-admin (settings kept)
+  startos-admin alerts rebuild --apply --yes   ...and apply it now (SERVER RESTARTS)
+  startos-admin staged apply --yes  Apply all staged changes (SERVER RESTARTS)
+
+Exit codes: 0 = done    1 = failed    2 = usage error
+  --update:          10 = update available (not installed)
+                     1 = network/download failure    3 = signature verification failure
+  staged apply:      10 = not applied (no --yes); the changes are listed
 EOF
 }
 
@@ -6397,19 +6765,75 @@ _cli_memory() {
     exit 0
 }
 
-_cli_interfaces() {
-    local svc="${1:-}"
-    local db
-    if ! db=$(start-cli db dump 2>&1); then
+# CLI output goes to scripts and files as often as to a terminal: no color
+# codes unless stdout is a terminal.
+_cli_plain_if_piped() {
+    [[ -t 1 ]] && return 0
+    GREEN=""; RED=""; YELLOW=""; BLUE=""; CYAN=""; BOLD=""; DIM=""; NC=""
+}
+
+# Usage error: message, then the usage summary, both on stderr; exit 2.
+_cli_usage_error() {
+    echo "ERROR: $1" >&2
+    echo "Run 'startos-admin --help' for usage." >&2
+    exit 2
+}
+
+# Database dump for a CLI command into nameref $1, or exit 1 saying why.
+_cli_db() {
+    local -n _cd_out="$1"
+    if ! _cd_out=$(start-cli db dump 2>&1); then
         local st
         st=$(_startos_state)
         if [[ "$st" != "Running" ]]; then
-            echo "ERROR: StartOS is not running (state: ${st}); interfaces are unavailable." >&2
+            echo "ERROR: StartOS is not running (state: ${st}); its database is unavailable." >&2
         else
-            echo "ERROR: 'start-cli db dump' failed: ${db}" >&2
+            echo "ERROR: 'start-cli db dump' failed: ${_cd_out}" >&2
         fi
         exit 1
     fi
+}
+
+# Exit 1 unless service $2 is installed (db dump in $1).
+_cli_need_service() {
+    if ! echo "$1" | jq -e --arg s "$2" '.value.packageData | has($s)' >/dev/null 2>&1; then
+        echo "ERROR: no installed service with id '${2}'." >&2
+        echo "Installed: $(echo "$1" | jq -r '.value.packageData | keys | join(" ")')" >&2
+        exit 1
+    fi
+}
+
+_cli_status() {
+    _status_block
+    exit 0
+}
+
+# server-info | network | services — the System Data views.
+_cli_db_view() {
+    local db
+    _cli_db db
+    case "$1" in
+        server-info) _show_server_info "$db" ;;
+        network)     _show_network     "$db" ;;
+        services)    _show_svc_status  "$db" ;;
+    esac
+    exit 0
+}
+
+_cli_service() {
+    local svc="${1:-}"
+    [[ -n "$svc" ]] || _cli_usage_error "'service' needs a service id, e.g. startos-admin service nextcloud"
+    local db
+    _cli_db db
+    _cli_need_service "$db" "$svc"
+    _show_svc_detail "$db" "$svc"
+    exit 0
+}
+
+_cli_interfaces() {
+    local svc="${1:-}"
+    local db
+    _cli_db db
     local jq_filter
     if [[ -n "$svc" ]]; then
         jq_filter=$(printf '%s' "$svc" | jq -R . | jq -sc .)
@@ -6426,6 +6850,250 @@ _cli_interfaces() {
         exit 0
     fi
     printf '%s\n' "$out"
+    exit 0
+}
+
+# domains [--names] [svc] — every domain with its DNS check, tab-separated
+# (see _domains_report), or with --names just the names, one per line.
+# "startos" as the service selects the web interface's own domains.
+_cli_domains() {
+    local want_names=0 svc="" a
+    for a in "$@"; do
+        case "$a" in
+            --names) want_names=1 ;;
+            -*)      _cli_usage_error "unknown option for 'domains': $a" ;;
+            *)       [[ -z "$svc" ]] || _cli_usage_error "'domains' takes at most one service id"
+                     svc="$a" ;;
+        esac
+    done
+    local db
+    _cli_db db
+    local svcs withos=1
+    if [[ -z "$svc" ]]; then
+        svcs=$(echo "$db" | jq -c '.value.packageData | keys')
+    elif [[ "$svc" == "startos" ]]; then
+        svcs='[]'
+    else
+        _cli_need_service "$db" "$svc"
+        svcs=$(printf '%s' "$svc" | jq -R . | jq -sc .); withos=0
+    fi
+    if (( want_names )); then
+        _domains_tsv "$db" "$svcs" "$withos" | cut -f1 | sort -u
+    else
+        _domains_report "$db" "$svcs" "$withos"
+    fi
+    exit 0
+}
+
+# cron list — the root crontab as installed (comments included).
+_cli_cron() {
+    [[ "${1:-}" == "list" ]] || _cli_usage_error "usage: startos-admin cron list"
+    local out rc=0
+    out=$(sudo crontab -u root -l 2>&1) || rc=$?
+    if (( rc != 0 )); then
+        grep -qi "no crontab for" <<< "$out" && exit 0
+        echo "ERROR: could not read the root crontab: ${out}" >&2
+        exit 1
+    fi
+    local pending
+    pending=$(_staged_count)
+    (( pending > 0 )) && echo "Note: ${pending} staged change(s) pending — not in this list until applied." >&2
+    printf '%s\n' "$out"
+    exit 0
+}
+
+# Validate a log line count ($1, default 50) into nameref $2.
+_cli_lines_arg() {
+    local -n _cla_out="$2"
+    _cla_out="${1:-50}"
+    [[ "$_cla_out" =~ ^[0-9]+$ ]] && (( _cla_out >= 1 && _cla_out <= 100000 )) \
+        || _cli_usage_error "line count must be a number from 1 to 100000"
+}
+
+# forwarders list | log <name> [lines]
+_cli_forwarders() {
+    case "${1:-}" in
+        list)
+            _poller_list_display || true
+            exit 0 ;;
+        log)
+            local name="${2:-}" lines
+            [[ -n "$name" ]] || _cli_usage_error "usage: startos-admin forwarders log <name> [lines]"
+            _cli_lines_arg "${3:-}" lines
+            if ! [[ "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]*$ ]] || [[ ! -f "${_POLLER_BIN_PREFIX}${name}" ]]; then
+                echo "ERROR: no forwarder named '${name}'. See: startos-admin forwarders list" >&2
+                exit 1
+            fi
+            local log_file="${_POLLER_LOG_PREFIX}${name}.log"
+            if [[ ! -f "$log_file" ]]; then
+                echo "No log yet: ${log_file} (the forwarder may not have run since the last restart)." >&2
+                exit 0
+            fi
+            tail -n "$lines" "$log_file"
+            exit 0 ;;
+        *) _cli_usage_error "usage: startos-admin forwarders list | log <name> [lines]" ;;
+    esac
+}
+
+# alerts list | log <id> [lines] | rebuild [--apply --yes]
+_cli_alerts() {
+    case "${1:-}" in
+        list)
+            _monitor_list_display || true
+            exit 0 ;;
+        log)
+            local id="${2:-}" lines
+            [[ -n "$id" ]] || _cli_usage_error "usage: startos-admin alerts log <id> [lines]   (ids: startos-admin alerts list)"
+            _cli_lines_arg "${3:-}" lines
+            if ! _monitor_installed | cut -f3 | grep -qxF "${_MONITOR_BIN_PREFIX}${id}"; then
+                echo "ERROR: no alert with id '${id}'. See the Id lines in: startos-admin alerts list" >&2
+                exit 1
+            fi
+            local log_file="${_MONITOR_DATA_PREFIX}${id}.log"
+            if [[ ! -f "$log_file" ]]; then
+                echo "No log yet: ${log_file} (the alert may not have run since the last restart)." >&2
+                exit 0
+            fi
+            tail -n "$lines" "$log_file"
+            exit 0 ;;
+        rebuild)
+            shift
+            local apply=0 yes=0 a
+            for a in "$@"; do
+                case "$a" in
+                    --apply) apply=1 ;;
+                    --yes)   yes=1 ;;
+                    *) _cli_usage_error "unknown option for 'alerts rebuild': $a" ;;
+                esac
+            done
+            (( apply && ! yes )) && _cli_usage_error "--apply restarts the server; add --yes to confirm"
+            if [[ -z "$(_monitor_outdated)" ]]; then
+                echo "All installed alerts are up to date."
+                exit 0
+            fi
+            if _staged_labels 2>/dev/null | grep -qF "$_REBUILD_LABEL"; then
+                echo "The rebuild is already staged. Apply it with: startos-admin staged apply --yes"
+                exit 0
+            fi
+            local cmds="" n=0 list="" v72=0 v73=0
+            _monitor_rebuild_plan cmds n list v72 v73
+            echo "Built by an older startos-admin:"
+            printf '%s' "$list" | while IFS= read -r l; do echo -e "$l"; done
+            if (( n == 0 )); then
+                echo "Nothing can be rebuilt (see above)." >&2
+                exit 1
+            fi
+            _monitor_rebuild_reasons "$v72" "$v73"
+            if (( apply )); then
+                local pending chroot_exit=0
+                pending=$(_staged_count)
+                (( pending > 0 )) && echo "Including ${pending} staged change(s) in the same restart."
+                _staged_run_chroot "$cmds" || chroot_exit=$?
+                if (( chroot_exit == 0 )); then
+                    echo "Rebuilt ${n} alert(s). Server restarting."
+                    exit 0
+                fi
+                echo "ERROR: chroot-and-upgrade failed (exit ${chroot_exit}). Nothing was applied." >&2
+                exit 1
+            fi
+            _stage_change "$_REBUILD_LABEL (${n})" "$cmds"
+            echo "Staged the rebuild of ${n} alert(s). Apply with: startos-admin staged apply --yes (server restarts)"
+            exit 0 ;;
+        *) _cli_usage_error "usage: startos-admin alerts list | log <id> [lines] | rebuild [--apply --yes]" ;;
+    esac
+}
+
+# debug [on|off] — show or set debug mode (this boot only, as in the menu).
+_cli_debug() {
+    case "${1:-}" in
+        "")  [[ -f "$_DEBUG_FLAG_FILE" ]] && echo "on" || echo "off"; exit 0 ;;
+        on)  sudo mkdir -p "$(dirname "$_DEBUG_FLAG_FILE")" && sudo touch "$_DEBUG_FLAG_FILE" \
+                 || { echo "ERROR: could not create ${_DEBUG_FLAG_FILE}." >&2; exit 1; }
+             echo "Debug mode on."; exit 0 ;;
+        off) sudo rm -f "$_DEBUG_FLAG_FILE" \
+                 || { echo "ERROR: could not remove ${_DEBUG_FLAG_FILE}." >&2; exit 1; }
+             echo "Debug mode off."; exit 0 ;;
+        *)   _cli_usage_error "usage: startos-admin debug [on|off]" ;;
+    esac
+}
+
+# staged list | apply [--yes] | drop <n>[,<n>…] | clear
+_cli_staged() {
+    local n
+    n=$(_staged_count)
+    case "${1:-}" in
+        list)
+            (( n > 0 )) && _staged_labels
+            exit 0 ;;
+        apply)
+            if (( n == 0 )); then echo "No staged changes."; exit 0; fi
+            if [[ "${2:-}" != "--yes" ]]; then
+                _staged_labels
+                echo "Run 'startos-admin staged apply --yes' to apply ${n} change(s) (SERVER RESTARTS)."
+                exit 10
+            fi
+            local chroot_exit=0
+            _staged_run_chroot "" || chroot_exit=$?
+            if (( chroot_exit == 0 )); then
+                echo "Applied ${n} staged change(s). Server restarting."
+                exit 0
+            fi
+            echo "ERROR: chroot-and-upgrade failed (exit ${chroot_exit}). Staged changes remain queued." >&2
+            exit 1 ;;
+        drop)
+            local drop_sel="${2:-}" part
+            [[ -n "$drop_sel" ]] || _cli_usage_error "usage: startos-admin staged drop <n>[,<n>...]   (numbers from: staged list)"
+            local -a nums=() parts=()
+            IFS=',' read -ra parts <<< "$drop_sel"
+            for part in "${parts[@]}"; do
+                part="${part// /}"
+                [[ "$part" =~ ^[0-9]+$ ]] && (( part >= 1 && part <= n )) \
+                    || { echo "ERROR: '${part}' is not a staged change number (1-${n})." >&2; exit 1; }
+                nums+=("$part")
+            done
+            local csv
+            csv=$(printf '%s\n' "${nums[@]}" | sort -nu | paste -sd, -)
+            _staged_delete "$csv"
+            echo "Dropped staged change(s) ${csv}. Nothing was applied."
+            exit 0 ;;
+        clear)
+            _staged_clear
+            echo "Cleared ${n} staged change(s). Nothing was applied."
+            exit 0 ;;
+        *) _cli_usage_error "usage: startos-admin staged list | apply [--yes] | drop <n>[,<n>...] | clear" ;;
+    esac
+}
+
+# notify [--service <id>] <info|success|warning|error> <title> <message>
+_cli_notify() {
+    local svc=""
+    if [[ "${1:-}" == "--service" ]]; then
+        svc="${2:-}"
+        [[ -n "$svc" ]] || _cli_usage_error "--service needs a service id"
+        shift 2
+    fi
+    [[ $# -eq 3 ]] || _cli_usage_error "usage: startos-admin notify [--service <id>] <info|success|warning|error> <title> <message>"
+    local level="$1" title="$2" body="$3"
+    case "$level" in
+        info|success|warning|error) ;;
+        *) _cli_usage_error "level must be info, success, warning or error" ;;
+    esac
+    [[ -n "$title" && -n "$body" ]] || _cli_usage_error "title and message must not be empty"
+    local -a pkg_args=()
+    if [[ -n "$svc" ]]; then
+        # start-cli accepts any package id here, so a typo would post a
+        # notification for a service that doesn't exist.
+        local db
+        _cli_db db
+        _cli_need_service "$db" "$svc"
+        pkg_args=(--package "$svc")
+    fi
+    local out
+    if ! out=$(start-cli notification create "${pkg_args[@]}" "$level" "$title" "$body" 2>&1); then
+        echo "ERROR: 'start-cli notification create' failed: ${out}" >&2
+        exit 1
+    fi
+    echo "Notification created."
     exit 0
 }
 
@@ -6454,7 +7122,18 @@ case "${1:-}" in
     --update)          _cli_update "${2:-}" ;;
     disk)              _cli_disk ;;
     memory)            _cli_memory ;;
-    interfaces)        _cli_interfaces "${2:-}" ;;
+    interfaces)        _cli_plain_if_piped; _cli_interfaces "${2:-}" ;;
+    status)            _cli_plain_if_piped; _cli_status ;;
+    server-info|network|services)
+                       _cli_plain_if_piped; _cli_db_view "$1" ;;
+    service)           _cli_plain_if_piped; _cli_service "${2:-}" ;;
+    domains)           _cli_plain_if_piped; shift; _cli_domains "$@" ;;
+    cron)              _cli_plain_if_piped; _cli_cron "${2:-}" ;;
+    forwarders)        _cli_plain_if_piped; shift; _cli_forwarders "$@" ;;
+    alerts)            _cli_plain_if_piped; shift; _cli_alerts "$@" ;;
+    staged)            _cli_plain_if_piped; shift; _cli_staged "$@" ;;
+    debug)             _cli_plain_if_piped; _cli_debug "${2:-}" ;;
+    notify)            _cli_plain_if_piped; shift; _cli_notify "$@" ;;
     *)
         echo "Unknown option: $1" >&2
         echo "" >&2

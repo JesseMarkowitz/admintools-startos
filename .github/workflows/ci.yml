@@ -22,10 +22,28 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Verify startos-admin.sh.sig against embedded public key
+      - name: Verify startos-admin.sh.asc against the GPG key embedded in the script
+        # What v74 and newer check before installing an update.
         run: |
-          awk '/^_UPDATE_PUBKEY="/,/^-----END PUBLIC KEY-----"$/' startos-admin.sh \
-            | sed 's/^_UPDATE_PUBKEY="//; s/"$//' > pub.pem
-          openssl pkey -pubin -in pub.pem -noout
+          fpr=$(sed -n 's/^_UPDATE_GPG_FPR="\([0-9A-F]*\)"$/\1/p' startos-admin.sh)
+          test -n "$fpr"
+          awk '/^_UPDATE_GPG_KEY="/,/^-----END PGP PUBLIC KEY BLOCK-----"$/' startos-admin.sh \
+            | sed 's/^_UPDATE_GPG_KEY="//; s/"$//' \
+            | sed -e '/^-----/d' -e '/: /d' -e '/^[[:space:]]*$/d' -e '/^=/d' \
+            | base64 -d > release-key.gpg
+          mkdir -m 700 gnupg
+          gpgv --homedir gnupg --status-fd 1 --keyring "$PWD/release-key.gpg" \
+            startos-admin.sh.asc startos-admin.sh | tee status.txt
+          awk -v fpr="$fpr" '$2 == "VALIDSIG" && $NF == fpr { ok = 1 } END { exit !ok }' status.txt
+      - name: Verify startos-admin.sh.sig against the old P-256 key
+        # What v73 and older check. Keep this step through v75; v76 and
+        # later are signed with the GPG key only.
+        run: |
+          cat > old-pub.pem <<'PEM'
+          -----BEGIN PUBLIC KEY-----
+          MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE6QTyEtKX+mGBZVQnD55TJkslhMap
+          8qXTMWhsevn0ft1ltYVRL2IGM4ALSy+EhBEouByyTXiwmrvpYjc4qbX7KA==
+          -----END PUBLIC KEY-----
+          PEM
           base64 -d startos-admin.sh.sig > sig.bin
-          openssl dgst -sha256 -verify pub.pem -signature sig.bin startos-admin.sh
+          openssl dgst -sha256 -verify old-pub.pem -signature sig.bin startos-admin.sh

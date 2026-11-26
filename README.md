@@ -5,7 +5,7 @@
 >
 > | StartOS | startos-admin |
 > | --- | --- |
-> | 0.4.3 | v73 and newer (tested on 0.4.3-rc.3) |
+> | 0.4.3 | v73 and newer (v74 tested on 0.4.3) |
 > | 0.4.0.3 – 0.4.2.x | v72 and newer (v72 tested on 0.4.2) |
 > | 0.4.0 – 0.4.0.2 | v72 and newer, except the **Backup staleness alert**, which needs 0.4.0.3 or newer — update StartOS |
 > | 0.3.5.x | not supported |
@@ -55,7 +55,7 @@ This tool is intended for StartOS Administrators who:
 <summary><strong>Requirements</strong></summary>
 
 - SSH access to your StartOS server as the Start9 user
-- StartOS 0.4.0.3 or newer (most recently tested on 0.4.3-rc.3). On 0.4.0–0.4.0.2 everything except the Backup staleness alert works. The Backup succeeded and Backup failed alerts need StartOS 0.4.3 or newer. StartOS 0.3.5.x is not supported.
+- StartOS 0.4.0.3 or newer (most recently tested on 0.4.3). On 0.4.0–0.4.0.2 everything except the Backup staleness alert works. The Backup succeeded and Backup failed alerts need StartOS 0.4.3 or newer. StartOS 0.3.5.x is not supported.
 - sudo privileges (the Start9 user has these by default)
 - `start-cli` available and authenticated (preinstalled on StartOS; most features use it)
 - `jq`, `curl`, and `openssl` (all preinstalled on StartOS; the script checks at startup)
@@ -76,7 +76,8 @@ Key risks and cautions:
 - **Root-level impact:** If you run this script as `root` (or via `sudo`), it can modify system state (e.g., write to `/usr/local/bin`, create/edit cron entries, create state files, make outbound HTTP requests). Mistakes or malicious changes could cause system damage or data loss.
 - **Not formally vetted or approved:** This project has **not** been heavily security-audited, formally reviewed, or approved by Start9/StartOS. It may contain bugs or unsafe assumptions.
 - **Backup password storage:** When you schedule a backup, your StartOS primary password is stored in a root-only file (`/root/.startos-admin/backup-pass-<target>`, mode 600) that the cron job reads at backup time. It does **not** appear in the crontab. It **is** included, encrypted, in a saved configuration file (see *Save / Load Configuration*), so protect that file and its passphrase accordingly. Residual exposure: the password is briefly visible in the process list (`ps`) while a backup is running, and the file remains if you later delete the backup cron entry. To remove it permanently, delete it inside persistence mode (`chroot-and-upgrade`) as described in [BACKUP-GUIDE.md](BACKUP-GUIDE.md) — a plain `sudo rm` is undone at the next restart. Backups scheduled with versions ≤ 56 still have the password inline in the crontab — edit the schedule once to migrate it to the new format. Backup staleness alerts no longer use a password (v72); a password file stored for an older alert stays until you remove it, and a backup schedule to the same target still uses it.
-- **Update integrity verification:** Updates and configuration-load downloads are verified against a signature (`startos-admin.sh.sig`) using a public key embedded in the script before anything is installed. A script that fails verification is never installed. Trust is anchored at first install (review the script you initially download); a compromised repository cannot push executable code without the private signing key, which is not stored in the repository.
+- **Update integrity verification:** Updates and configuration-load downloads are checked against a GPG signature (`startos-admin.sh.asc`) before anything is installed, using `gpgv` and the public key embedded in the script: GPG `84FF9BB7F3E85F913CCF438E1A64936712ACCC07`, "Jesse Markowitz (release signing)". A script that fails verification is never installed. Trust is anchored at first install (review the script you initially download); a compromised repository cannot push executable code without the private signing key, which is not stored in the repository.
+  - Versions before v74 check an older key's signature (`startos-admin.sh.sig`) instead. v74 and v75 carry both signatures, so an older copy updates normally. A copy still on v73 or older when v76 is released will report a signature failure: reinstall it once with the command under Install.
 - **Input validation:** Webhook/stay-alive URLs and keyword filters are restricted to conservative character sets, and notification titles/messages are shell-escaped, so user input cannot inject commands into the root crontab or generated forwarder scripts. `%` is rejected in values that end up in cron lines (cron treats it as a newline).
 - **Alert/post-action shell commands run as root:** commands you configure for alerts and post-backup/cron actions execute as root via cron, by design. Only enter commands you trust — they have the same power as anything else you run with sudo.
 - **Outbound webhook/URL risk:** Features that `curl` a URL or POST to a webhook can leak metadata (timestamps, service names, notification text). Only use endpoints you trust, and prefer HTTPS.
@@ -99,12 +100,13 @@ SSH into your StartOS server and run:
 <pre><code>curl -fsSL https://raw.githubusercontent.com/JesseMarkowitz/admintools-startos/refs/heads/main/startos-admin.sh -o startos-admin.sh && chmod +x startos-admin.sh && ./startos-admin.sh</code></pre>
 
 This will download the script from github, set it to executable and run it the first time.
-On first run:
+On first run it sees it is not installed yet and asks what to do:
 
-- The script checks GitHub for a newer version.
-- If a newer version exists, you will be prompted to install the newer version persistently. Downloaded updates are signature-verified against a public key embedded in the script before they are installed.
-- Persistent installation places the script at: `/usr/local/bin/startos-admin`
-- Also, if it was not run from the persistent installed location (such as on first run as part of curl command above) it will offer to install persistently.
+1. **Install it** — copies the script to `/usr/local/bin/startos-admin`. The server restarts once.
+2. **Load a saved configuration** — goes straight to Load (see *11. Save / Load Configuration*): copy your saved file to the server, enter its passphrase, and everything comes back in one restart, the script included. Use this after a reflash, or after a StartOS update removed what the tool had installed.
+3. **Not now** — opens the menu without installing.
+
+Once it is installed, each launch checks GitHub for a newer version and offers to install it. Downloaded updates are signature-verified against the public key embedded in the script before they are installed (see *Update integrity verification* above).
 
 After the persistent install, run:
 
@@ -127,14 +129,45 @@ startos-admin --help              Usage summary
 startos-admin --no-update-check   Skip the startup update check this launch
 startos-admin --update            Check for a signed update (does NOT install)
 startos-admin --update --yes      Install a verified update (SERVER RESTARTS)
-startos-admin disk                Disk usage by service (plain text)
-startos-admin memory              Memory usage by service (plain text)
+
+Show (read-only):
+startos-admin status              Server status (the menu's header lines)
+startos-admin server-info         System data → Server Info
+startos-admin network             System data → Network
+startos-admin services            System data → Service Status
+startos-admin service <id>        System data → Service Detail, for one service
+startos-admin domains [svc]       Every domain, with a DNS check (tab-separated)
+startos-admin domains --names     Just the domain names, one per line
 startos-admin interfaces [svc]    Service interface URLs (tab-separated)
+startos-admin disk                Disk usage by service
+startos-admin memory              Memory usage by service
+startos-admin cron list           The root crontab
+startos-admin forwarders list     Installed notification forwarders
+startos-admin forwarders log <name> [lines]
+startos-admin alerts list         Installed alerts, each with its id
+startos-admin alerts log <id> [lines]
+startos-admin staged list         Staged changes, numbered
+startos-admin debug               Debug mode: on or off
+
+Change:
+startos-admin notify [--service <id>] <info|success|warning|error> <title> <message>
+startos-admin debug on|off        Debug mode (until the next restart)
+startos-admin staged drop <n>[,<n>...]
+startos-admin staged clear
+startos-admin alerts rebuild      Stage the rebuild of alerts made by an older startos-admin
+startos-admin alerts rebuild --apply --yes   ...and apply it now (SERVER RESTARTS)
+startos-admin staged apply --yes  Apply all staged changes (SERVER RESTARTS)
 ```
 
-`--update` exit codes: `0` up to date · `10` update available (not installed) · `1` network failure · `3` signature verification failure. Updates installed with `--update --yes` are signature-verified first and include any staged changes in the same restart.
+Exit codes: `0` done · `1` failed · `2` usage error. `--update` also uses `10` update available (not installed) and `3` signature verification failure; `staged apply` without `--yes` lists the changes and exits `10`. Updates installed with `--update --yes` are signature-verified first and include any staged changes in the same restart. Nothing on the command line restarts the server without `--yes`.
 
-The data commands print plain/tab-separated output suitable for monitoring scripts, e.g. `startos-admin interfaces vaultwarden | grep StartTunnel`. The `interfaces` columns are `service`, `interface name`, `type`, `network`, `url`, `active|inactive`.
+Output is plain text without color codes when piped, so it suits monitoring scripts, e.g. `startos-admin interfaces vaultwarden | grep StartTunnel`. Logs print their last 50 lines unless you give a count.
+
+The `interfaces` columns are `service`, `interface name`, `type`, `network`, `url`, `active|inactive`, `kind` (`ipv4`, `ipv6`, `mdns`, `public-domain` or `private-domain`; added in v74, so scripts that read the first six columns keep working).
+
+The `domains` columns are `domain`, `service` (`startos` for the web interface's own domains), `interface`, `url`, `access` (`public`/`private`), `gateway`, `cert`, `state` (`active`/`inactive`), `dns` (`ok`, `elsewhere`, `missing` or `unchecked`), `resolved` (the A records found), `expected`, `resolver`. There is one row per domain and interface URL; `startos-admin domains | awk -F'\t' '$9 != "ok"'` lists the problems.
+
+The commands that change things (creating backup schedules, forwarders, alerts and cron jobs, Save / Load) are menu-only.
 
 </details>
 
@@ -233,6 +266,13 @@ Sub-options:
 **4) Service Detail** — deep view of a single service: status, started time, last backup, registry, health checks, and dependencies. Last backup is the service's last *successful* backup to any target; StartOS records it from 0.4.0.3 on.
 
 **5) Service Interfaces** — displays all externally reachable URLs for one or more services. Select individual services (comma-separated) or all at once.
+
+**6) Domains** — every domain on the server in one list, so you don't have to open each service's interfaces in the web UI. It covers public and private domains on every service, plus the StartOS web interface's own. Each domain shows its access (public or private), its gateway, and every interface that uses it with the URL, the certificate (as the web UI names it: Let's Encrypt, Root CA, Self signed) and whether the address is switched on. A domain added to a host but used by no interface is still listed.
+
+Every domain's DNS is checked each time:
+- **Public domains** are looked up in public DNS (Cloudflare's 1.1.1.1, then Quad9's 9.9.9.9, then the server's own resolver if neither answers) and should resolve to the public IP StartOS records for their gateway. *DNS ✓* means it does; *points to X, not Y* means the name resolves somewhere else (expected when a proxy or CDN sits in front of it); *no A record* means the name doesn't resolve at all.
+- **Private domains** are answered by StartOS's own DNS server, on the gateway the domain is assigned to, and only for devices that use this server as their DNS server. The check asks that DNS server directly.
+- The lookups ask for IPv4 (A) records only. The domain names are sent to the public resolver; they are public names already.
 
 For each interface, shows:
 - Interface type (`ui`, `api`, `p2p`)
@@ -523,9 +563,10 @@ scp ./startos-config-backup.enc start9@<server-ip>:/tmp/
 **Post-reflash load workflow:**
 1. SSH into the fresh server
 2. Download `startos-admin.sh` (see Install section above)
-3. Run it — when prompted to install persistently, you may decline; the Load step installs the latest version as part of the same reboot
-4. Navigate to **11) Save / Load configuration → 2) Load configuration**
-5. Follow the prompts; server restarts once with everything loaded
+3. Run it and choose **2) Load a saved configuration** (or, from the menu, **11) Save / Load configuration → 2) Load configuration**)
+4. Follow the prompts; server restarts once with everything loaded, startos-admin included
+
+Load installs the latest published startos-admin, signature-verified. If the server can't download it, Load installs the copy you are running instead.
 
 </details>
 
